@@ -1,0 +1,16 @@
+{
+  "name": "disc2-stream",
+  "version": "1.0.0",
+  "description": "Aplicativo desktop leve para transmissão de tela em até 1080p 60fps estilo Discord",
+  "main": "src/main.js",
+  "scripts": {
+    "start": "node launch.js"
+  },
+  "dependencies": {
+    "peerjs": "^1.5.4",
+    "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "electron": "^35.0.0"
+  }
+}
