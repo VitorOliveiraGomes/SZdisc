@@ -1,0 +1,26 @@
+[package]
+name = "disc2"
+version = "2.0.0"
+edition = "2021"
+description = "Aplicativo nativo ultra-leve em Rust para transmissao de tela em 1080p 60fps"
+
+[dependencies]
+eframe = { version = "0.29", default-features = false, features = ["glow", "default_fonts"] }
+egui = "0.29"
+jpeg-encoder = "0.6"
+zune-jpeg = "0.4"
+winapi = { version = "0.3", features = [
+  "winuser",
+  "wingdi",
+  "windef",
+  "processthreadsapi",
+  "psapi",
+  "libloaderapi"
+] }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = true
+panic = "abort"

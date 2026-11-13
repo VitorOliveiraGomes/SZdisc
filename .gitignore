@@ -1,6 +1,4 @@
-node_modules/
-dist/
-out/
+/target/
 *.log
 .DS_Store
 Thumbs.db
