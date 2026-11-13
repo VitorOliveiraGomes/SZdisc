@@ -20,6 +20,13 @@ use winapi::um::winuser::{
 
 const DI_NORMAL: UINT = 0x0003;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SourceCategory {
+    Application,
+    Browser,
+    Screen,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum CaptureSourceKind {
     Monitor {
@@ -38,15 +45,16 @@ pub enum CaptureSourceKind {
 pub struct CaptureSource {
     pub id: String,
     pub name: String,
-    pub is_screen: bool,
+    pub subtitle: String,
+    pub category: SourceCategory,
     pub kind: CaptureSourceKind,
 }
 
 pub struct RawFrame {
     pub width: u32,
     pub height: u32,
-    pub rgb: Vec<u8>,   // RGB24 para encoder JPEG rápido
-    pub rgba: Vec<u8>,  // RGBA32 para prévia local na GPU (quando ativa)
+    pub rgb: Vec<u8>,
+    pub rgba: Vec<u8>,
 }
 
 unsafe extern "system" fn monitor_enum_proc(
@@ -63,18 +71,19 @@ unsafe extern "system" fn monitor_enum_proc(
         let rc = info.rcMonitor;
         let w = rc.right - rc.left;
         let h = rc.bottom - rc.top;
-        let idx = list.len() + 1;
+        let idx = list.iter().filter(|s| s.category == SourceCategory::Screen).count() + 1;
         let is_primary = (info.dwFlags & 1) != 0;
         let label = if is_primary {
-            format!("Tela {} (Principal — {}x{})", idx, w, h)
+            format!("Tela {} (Principal)", idx)
         } else {
-            format!("Tela {} ({}x{})", idx, w, h)
+            format!("Tela {}", idx)
         };
 
         list.push(CaptureSource {
             id: format!("screen:{}", idx),
             name: label,
-            is_screen: true,
+            subtitle: format!("Monitor Completo • {}×{}", w, h),
+            category: SourceCategory::Screen,
             kind: CaptureSourceKind::Monitor {
                 index: idx,
                 left: rc.left,
@@ -85,6 +94,62 @@ unsafe extern "system" fn monitor_enum_proc(
         });
     }
     TRUE
+}
+
+fn classify_window_title(raw_title: &str, w: i32, h: i32) -> (String, String, SourceCategory) {
+    let browser_suffixes = [
+        (" - Google Chrome", "Google Chrome"),
+        (" — Mozilla Firefox", "Mozilla Firefox"),
+        (" - Microsoft​ Edge", "Microsoft Edge"),
+        (" - Microsoft Edge", "Microsoft Edge"),
+        (" - Brave", "Brave Browser"),
+        (" - Opera", "Opera"),
+        (" - Vivaldi", "Vivaldi"),
+    ];
+
+    for (suffix, browser_name) in browser_suffixes {
+        if let Some(stripped) = raw_title.strip_suffix(suffix) {
+            let clean_tab = if stripped.trim().is_empty() {
+                raw_title.to_string()
+            } else {
+                stripped.trim().to_string()
+            };
+            return (
+                clean_tab,
+                format!("🌐 {} • {}×{}", browser_name, w, h),
+                SourceCategory::Browser,
+            );
+        }
+    }
+
+    let lower = raw_title.to_lowercase();
+    if lower.contains("google chrome")
+        || lower.contains("microsoft edge")
+        || lower.contains("mozilla firefox")
+        || lower.contains("brave")
+        || lower.contains("opera")
+    {
+        return (
+            raw_title.to_string(),
+            format!("🌐 Navegador Web • {}×{}", w, h),
+            SourceCategory::Browser,
+        );
+    }
+
+    // Separa nome do documento e nome do aplicativo se houver " - "
+    if let Some((left, right)) = raw_title.rsplit_once(" - ") {
+        return (
+            left.trim().to_string(),
+            format!("🎮 {} • {}×{}", right.trim(), w, h),
+            SourceCategory::Application,
+        );
+    }
+
+    (
+        raw_title.to_string(),
+        format!("🪟 Aplicativo • {}×{}", w, h),
+        SourceCategory::Application,
+    )
 }
 
 unsafe extern "system" fn window_enum_proc(hwnd: HWND, lparam: LPARAM) -> BOOL {
@@ -113,6 +178,8 @@ unsafe extern "system" fn window_enum_proc(hwnd: HWND, lparam: LPARAM) -> BOOL {
         || title == "Settings"
         || title == "Configurações"
         || title == "Windows Input Experience"
+        || title.starts_with("DISC2")
+        || title.starts_with("SZdisc")
     {
         return TRUE;
     }
@@ -123,15 +190,18 @@ unsafe extern "system" fn window_enum_proc(hwnd: HWND, lparam: LPARAM) -> BOOL {
     }
     let w = rect.right - rect.left;
     let h = rect.bottom - rect.top;
-    if w < 120 || h < 80 {
+    if w < 140 || h < 90 {
         return TRUE;
     }
+
+    let (clean_name, subtitle, category) = classify_window_title(&title, w, h);
 
     let list = &mut *(lparam as *mut Vec<CaptureSource>);
     list.push(CaptureSource {
         id: format!("window:{}", hwnd as usize),
-        name: format!("{} ({}x{})", title, w, h),
-        is_screen: false,
+        name: clean_name,
+        subtitle,
+        category,
         kind: CaptureSourceKind::Window {
             hwnd: hwnd as usize,
         },
@@ -154,12 +224,19 @@ pub fn list_capture_sources() -> Vec<CaptureSource> {
     sources
 }
 
+/// Gera uma miniatura RGBA rápida para o seletor visual de telas/aplicativos/guias estilo Discord
+pub fn capture_thumbnail_rgba(source: &CaptureSource, thumb_w: u32, thumb_h: u32) -> Option<(u32, u32, Vec<u8>)> {
+    let frame = capture_frame(source, thumb_w, thumb_h, true, false)?;
+    Some((frame.width, frame.height, frame.rgba))
+}
+
 /// Captura um quadro da tela ou janela selecionada já escalado para `(target_w, target_h)`
 pub fn capture_frame(
     source: &CaptureSource,
     target_w: u32,
     target_h: u32,
     need_rgba_preview: bool,
+    draw_cursor: bool,
 ) -> Option<RawFrame> {
     unsafe {
         match source.kind {
@@ -179,6 +256,7 @@ pub fn capture_frame(
                 target_h,
                 false,
                 need_rgba_preview,
+                draw_cursor,
             ),
             CaptureSourceKind::Window { hwnd } => {
                 let hwnd_ptr = hwnd as HWND;
@@ -198,6 +276,7 @@ pub fn capture_frame(
                     target_h,
                     true,
                     need_rgba_preview,
+                    draw_cursor,
                 )
             }
         }
@@ -214,12 +293,12 @@ unsafe fn capture_region(
     target_h: u32,
     is_window: bool,
     need_rgba_preview: bool,
+    draw_cursor: bool,
 ) -> Option<RawFrame> {
     if src_w <= 0 || src_h <= 0 {
         return None;
     }
 
-    // Calcula dimensões mantendo proporção dentro do limite (ex: 1920x1080, 1280x720, etc.)
     let scale_x = target_w as f32 / src_w as f32;
     let scale_y = target_h as f32 / src_h as f32;
     let scale = scale_x.min(scale_y).min(1.0);
@@ -253,12 +332,10 @@ unsafe fn capture_region(
     let old_obj = SelectObject(mem_dc, bmp as *mut _);
 
     if is_window && !hwnd.is_null() {
-        // Captura em tamanho original e reduz caso necessário
         let full_dc = CreateCompatibleDC(src_dc);
         let full_bmp = CreateCompatibleBitmap(src_dc, src_w, src_h);
         let old_full = SelectObject(full_dc, full_bmp as *mut _);
 
-        // PW_RENDERFULLCONTENT = 0x00000002 (captura janelas aceleradas por DirectX/OpenGL/DWM)
         let ok = PrintWindow(hwnd, full_dc, 2);
         if ok == FALSE {
             BitBlt(full_dc, 0, 0, src_w, src_h, src_dc, 0, 0, SRCCOPY);
@@ -316,14 +393,15 @@ unsafe fn capture_region(
             );
         }
 
-        // Desenha o cursor do mouse na posição correspondente
-        let mut ci: CURSORINFO = zeroed();
-        ci.cbSize = size_of::<CURSORINFO>() as DWORD;
-        if GetCursorInfo(&mut ci) != 0 && (ci.flags & CURSOR_SHOWING) != 0 {
-            let cx = ((ci.ptScreenPos.x - src_left) as f32 * scale) as i32;
-            let cy = ((ci.ptScreenPos.y - src_top) as f32 * scale) as i32;
-            if cx >= 0 && cy >= 0 && cx < out_w as i32 && cy < out_h as i32 {
-                DrawIconEx(mem_dc, cx, cy, ci.hCursor, 0, 0, 0, null_mut(), DI_NORMAL);
+        if draw_cursor {
+            let mut ci: CURSORINFO = zeroed();
+            ci.cbSize = size_of::<CURSORINFO>() as DWORD;
+            if GetCursorInfo(&mut ci) != 0 && (ci.flags & CURSOR_SHOWING) != 0 {
+                let cx = ((ci.ptScreenPos.x - src_left) as f32 * scale) as i32;
+                let cy = ((ci.ptScreenPos.y - src_top) as f32 * scale) as i32;
+                if cx >= 0 && cy >= 0 && cx < out_w as i32 && cy < out_h as i32 {
+                    DrawIconEx(mem_dc, cx, cy, ci.hCursor, 0, 0, 0, null_mut(), DI_NORMAL);
+                }
             }
         }
     }
@@ -331,7 +409,7 @@ unsafe fn capture_region(
     let mut bmi: BITMAPINFO = zeroed();
     bmi.bmiHeader.biSize = size_of::<BITMAPINFOHEADER>() as DWORD;
     bmi.bmiHeader.biWidth = out_w as i32;
-    bmi.bmiHeader.biHeight = -(out_h as i32); // Top-down DIB
+    bmi.bmiHeader.biHeight = -(out_h as i32);
     bmi.bmiHeader.biPlanes = 1;
     bmi.bmiHeader.biBitCount = 32;
     bmi.bmiHeader.biCompression = BI_RGB;
@@ -396,7 +474,6 @@ unsafe fn capture_region(
     })
 }
 
-/// Retorna o uso atual de RAM (Working Set) do processo em MB
 pub fn get_process_ram_mb() -> f32 {
     unsafe {
         let mut pmc: PROCESS_MEMORY_COUNTERS = zeroed();
