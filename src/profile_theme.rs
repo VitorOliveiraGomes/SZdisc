@@ -241,6 +241,7 @@ pub struct UserCustomization {
     pub border_stroke_width: f32,
     pub ui_scale: f32,
     pub show_cursor_in_stream: bool,
+    pub saved_rooms: Vec<String>,
 }
 
 impl Default for UserCustomization {
@@ -279,6 +280,11 @@ impl Default for UserCustomization {
             border_stroke_width: 1.0,
             ui_scale: 1.0,
             show_cursor_in_stream: true,
+            saved_rooms: vec![
+                "Sala Geral #1".to_string(),
+                "Sala de Jogos".to_string(),
+                "Cinema & Vídeos".to_string(),
+            ],
         };
         s.apply_preset_colors(ThemePreset::DiscordDark);
         s
@@ -430,8 +436,15 @@ impl UserCustomization {
 
     pub fn save_to_disk(&self) {
         let cfg_path = get_user_config_path();
+        let rooms_joined = self
+            .saved_rooms
+            .iter()
+            .map(|r| r.replace(';', "").replace('\n', "").trim().to_string())
+            .filter(|r| !r.is_empty())
+            .collect::<Vec<_>>()
+            .join(";");
         let content = format!(
-            "account_created={}\nusername_login={}\ndisplay_name={}\nuser_tag={}\ncustom_status={}\nbio={}\npresence={}\navatar_image_path={}\nbanner_image_path={}\navatar_bg={},{},{}\nbanner_bg={},{},{}\nbanner_bg_2={},{},{}\nname_color_rgb={},{},{}\nring_color_rgb={},{},{}\navatar_ring_glow={}\nring_thickness={}\nbadge_1080p={}\nbadge_rust={}\nbadge_gamer={}\nbadge_crown={}\ncustom_badge_enabled={}\ncustom_badge_text={}\ncustom_badge_rgb={},{},{}\ntheme_preset={}\naccent_rgb={},{},{}\nbg_sidebar_rgb={},{},{}\nbg_stage_rgb={},{},{}\nbg_card_rgb={},{},{}\ntext_rgb={},{},{}\ncorner_radius={}\nborder_stroke_width={}\nui_scale={}\nshow_cursor_in_stream={}\n",
+            "account_created={}\nusername_login={}\ndisplay_name={}\nuser_tag={}\ncustom_status={}\nbio={}\npresence={}\navatar_image_path={}\nbanner_image_path={}\navatar_bg={},{},{}\nbanner_bg={},{},{}\nbanner_bg_2={},{},{}\nname_color_rgb={},{},{}\nring_color_rgb={},{},{}\navatar_ring_glow={}\nring_thickness={}\nbadge_1080p={}\nbadge_rust={}\nbadge_gamer={}\nbadge_crown={}\ncustom_badge_enabled={}\ncustom_badge_text={}\ncustom_badge_rgb={},{},{}\ntheme_preset={}\naccent_rgb={},{},{}\nbg_sidebar_rgb={},{},{}\nbg_stage_rgb={},{},{}\nbg_card_rgb={},{},{}\ntext_rgb={},{},{}\ncorner_radius={}\nborder_stroke_width={}\nui_scale={}\nshow_cursor_in_stream={}\nsaved_rooms={}\n",
             self.account_created,
             self.username_login.replace('\n', " "),
             self.display_name.replace('\n', " "),
@@ -464,7 +477,8 @@ impl UserCustomization {
             self.corner_radius,
             self.border_stroke_width,
             self.ui_scale,
-            self.show_cursor_in_stream
+            self.show_cursor_in_stream,
+            rooms_joined
         );
         let _ = fs::write(cfg_path, content);
     }
@@ -561,6 +575,16 @@ impl UserCustomization {
                 "border_stroke_width" => cfg.border_stroke_width = v.parse().unwrap_or(1.0),
                 "ui_scale" => cfg.ui_scale = v.parse().unwrap_or(1.0),
                 "show_cursor_in_stream" => cfg.show_cursor_in_stream = v == "true",
+                "saved_rooms" => {
+                    let parsed: Vec<String> = v
+                        .split(';')
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty())
+                        .collect();
+                    if !parsed.is_empty() {
+                        cfg.saved_rooms = parsed;
+                    }
+                }
                 _ => {}
             }
         }
