@@ -16,6 +16,7 @@ winapi = { version = "0.3", features = [
   "windef",
   "winbase",
   "winnt",
+  "handleapi",
   "processthreadsapi",
   "psapi",
   "libloaderapi",
@@ -27,6 +28,7 @@ winapi = { version = "0.3", features = [
   "combaseapi",
   "objbase",
   "mmsystem",
+  "mmeapi",
   "mmreg"
 ] }
 

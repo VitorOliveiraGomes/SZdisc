@@ -10,16 +10,15 @@ use winapi::shared::guiddef::GUID;
 use winapi::shared::minwindef::{BYTE, DWORD, UINT, WORD};
 use winapi::shared::mmreg::{WAVEFORMATEX, WAVE_FORMAT_PCM};
 use winapi::shared::winerror::S_OK;
-use winapi::um::audioclient::{
-    IAudioCaptureClient, IAudioClient, AUDCLNT_BUFFERFLAGS_SILENT, AUDCLNT_SHAREMODE_SHARED,
-    AUDCLNT_STREAMFLAGS_LOOPBACK,
-};
-use winapi::um::combaseapi::{CoCreateInstance, CoInitializeEx, CoTaskMemFree, CLSCTX_ALL};
+use winapi::um::audioclient::{IAudioCaptureClient, IAudioClient, AUDCLNT_BUFFERFLAGS_SILENT};
+use winapi::um::audiosessiontypes::{AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_LOOPBACK};
+use winapi::um::combaseapi::{CoCreateInstance, CoInitializeEx, CLSCTX_ALL};
 use winapi::um::mmdeviceapi::{eConsole, eRender, IMMDevice, IMMDeviceEnumerator};
-use winapi::um::mmsystem::{
+use winapi::um::mmeapi::{
     waveOutClose, waveOutOpen, waveOutPrepareHeader, waveOutReset, waveOutUnprepareHeader,
-    waveOutWrite, CALLBACK_NULL, HWAVEOUT, MMSYSERR_NOERROR, WAVEHDR, WAVE_MAPPER,
+    waveOutWrite,
 };
+use winapi::um::mmsystem::{CALLBACK_NULL, HWAVEOUT, MMSYSERR_NOERROR, WAVEHDR, WAVE_MAPPER};
 use winapi::um::objbase::COINIT_MULTITHREADED;
 
 pub const AUDIO_SAMPLE_RATE: u32 = 24000;
@@ -218,7 +217,7 @@ pub fn spawn_system_audio_loopback<F>(
 
 /// Reprodutor de áudio de baixa latência para quem está assistindo à transmissão
 pub struct StreamAudioPlayer {
-    tx: SyncSender<Vec<u8>>,
+    pub tx: SyncSender<Vec<u8>>,
     pub volume_percent: Arc<AtomicU32>,
     pub muted: Arc<AtomicBool>,
     stop_flag: Arc<AtomicBool>,
