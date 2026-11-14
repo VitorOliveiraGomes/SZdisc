@@ -9,28 +9,28 @@ use std::time::{Duration, Instant};
 
 use zune_jpeg::JpegDecoder;
 
+use crate::audio::StreamAudioPlayer;
+
 pub const DEFAULT_STREAM_PORT: u16 = 47830;
 pub const LAN_DISCOVERY_PORT: u16 = 47831;
 const FRAME_MAGIC: &[u8; 4] = b"DSC2";
+const AUDIO_MAGIC: &[u8; 4] = b"AUD2";
 
 #[derive(Clone, Debug)]
 pub struct DiscoveredRoom {
     pub host_name: String,
     pub addr: String,
     pub res_label: String,
-    pub viewer_count: usize,
     pub last_seen: Instant,
 }
 
 pub struct DecodedRemoteFrame {
     pub width: u32,
     pub height: u32,
-    pub target_fps: u8,
     pub byte_len: usize,
     pub rgba: Vec<u8>,
 }
 
-/// Descobre o IP local principal (LAN / VPN) sem precisar conectar à internet
 pub fn get_local_ip() -> String {
     if let Ok(sock) = UdpSocket::bind("0.0.0.0:0") {
         if sock.connect("8.8.8.8:80").is_ok() {
@@ -46,7 +46,6 @@ pub fn get_local_ip() -> String {
     "127.0.0.1".to_string()
 }
 
-/// Escuta anúncios UDP de salas abertas na rede local / VPN
 pub fn start_lan_discovery_listener() -> Arc<Mutex<HashMap<String, DiscoveredRoom>>> {
     let rooms: Arc<Mutex<HashMap<String, DiscoveredRoom>>> = Arc::new(Mutex::new(HashMap::new()));
     let rooms_clone = Arc::clone(&rooms);
@@ -62,13 +61,11 @@ pub fn start_lan_discovery_listener() -> Arc<Mutex<HashMap<String, DiscoveredRoo
         loop {
             if let Ok((len, src)) = sock.recv_from(&mut buf) {
                 if let Ok(msg) = std::str::from_utf8(&buf[..len]) {
-                    // Formato: DISC2|port|host_name|res_label|viewers
                     let parts: Vec<&str> = msg.split('|').collect();
-                    if parts.len() >= 5 && parts[0] == "DISC2" {
+                    if parts.len() >= 4 && parts[0] == "DISC2" {
                         let port = parts[1];
                         let host_name = parts[2].to_string();
                         let res_label = parts[3].to_string();
-                        let viewer_count = parts[4].parse::<usize>().unwrap_or(0);
                         let addr = format!("{}:{}", src.ip(), port);
 
                         if let Ok(mut map) = rooms_clone.lock() {
@@ -78,7 +75,6 @@ pub fn start_lan_discovery_listener() -> Arc<Mutex<HashMap<String, DiscoveredRoo
                                     host_name,
                                     addr,
                                     res_label,
-                                    viewer_count,
                                     last_seen: Instant::now(),
                                 },
                             );
@@ -87,7 +83,6 @@ pub fn start_lan_discovery_listener() -> Arc<Mutex<HashMap<String, DiscoveredRoo
                 }
             }
 
-            // Remove salas antigas (> 6s sem sinal)
             if let Ok(mut map) = rooms_clone.lock() {
                 map.retain(|_, v| v.last_seen.elapsed() < Duration::from_secs(6));
             }
@@ -97,10 +92,8 @@ pub fn start_lan_discovery_listener() -> Arc<Mutex<HashMap<String, DiscoveredRoo
     rooms
 }
 
-/// Servidor de transmissão ultra-leve para enviar quadros JPEG a múltiplos espectadores em tempo real
 pub struct StreamHostServer {
     pub listen_addr: String,
-    pub port: u16,
     stop_flag: Arc<AtomicBool>,
     viewers: Arc<Mutex<Vec<SyncSender<Arc<Vec<u8>>>>>>,
     pub viewer_count: Arc<AtomicUsize>,
@@ -120,7 +113,8 @@ impl StreamHostServer {
             }
         }
 
-        let listener = bound_listener.ok_or_else(|| "Não foi possível abrir porta TCP local".to_string())?;
+        let listener =
+            bound_listener.ok_or_else(|| "Não foi possível abrir porta TCP local".to_string())?;
         let _ = listener.set_nonblocking(true);
 
         let ip = get_local_ip();
@@ -131,7 +125,6 @@ impl StreamHostServer {
         let viewer_count = Arc::new(AtomicUsize::new(0));
         let bytes_sent_per_sec = Arc::new(AtomicU32::new(0));
 
-        // Thread aceitando conexões de espectadores
         let stop_accept = Arc::clone(&stop_flag);
         let viewers_accept = Arc::clone(&viewers);
         let count_accept = Arc::clone(&viewer_count);
@@ -143,8 +136,8 @@ impl StreamHostServer {
                         let _ = stream.set_nodelay(true);
                         let _ = stream.set_write_timeout(Some(Duration::from_millis(800)));
 
-                        // Canal com buffer de apenas 2 quadros para nunca acumular atraso (latência zero)
-                        let (tx, rx) = sync_channel::<Arc<Vec<u8>>>(2);
+                        // Fila curta (vídeo + áudio de baixa latência)
+                        let (tx, rx) = sync_channel::<Arc<Vec<u8>>>(8);
                         if let Ok(mut list) = viewers_accept.lock() {
                             list.push(tx);
                             count_accept.store(list.len(), Ordering::Relaxed);
@@ -168,7 +161,6 @@ impl StreamHostServer {
             }
         });
 
-        // Thread anunciando a sala via UDP Broadcast na Rede / VPN
         let stop_udp = Arc::clone(&stop_flag);
         let count_udp = Arc::clone(&viewer_count);
         thread::spawn(move || {
@@ -181,7 +173,8 @@ impl StreamHostServer {
                         .unwrap_or_else(|_| "1080p 60fps".to_string());
                     let c = count_udp.load(Ordering::Relaxed);
                     let payload = format!("DISC2|{}|{}|{}|{}", bound_port, host_name, label, c);
-                    let _ = udp.send_to(payload.as_bytes(), ("255.255.255.255", LAN_DISCOVERY_PORT));
+                    let _ =
+                        udp.send_to(payload.as_bytes(), ("255.255.255.255", LAN_DISCOVERY_PORT));
                     thread::sleep(Duration::from_millis(1500));
                 }
             }
@@ -189,7 +182,6 @@ impl StreamHostServer {
 
         Ok(Self {
             listen_addr,
-            port: bound_port,
             stop_flag,
             viewers,
             viewer_count,
@@ -206,7 +198,6 @@ impl StreamHostServer {
             return;
         }
 
-        // Monta cabeçalho compacto de 13 bytes + payload JPEG
         let payload_len = jpeg_bytes.len() as u32;
         let mut packet = Vec::with_capacity(13 + jpeg_bytes.len());
         packet.extend_from_slice(FRAME_MAGIC);
@@ -220,7 +211,36 @@ impl StreamHostServer {
 
         list.retain(|tx| match tx.try_send(Arc::clone(&shared_packet)) {
             Ok(_) => true,
-            Err(std::sync::mpsc::TrySendError::Full(_)) => true, // Descarta quadro se espectador estiver lento
+            Err(std::sync::mpsc::TrySendError::Full(_)) => true,
+            Err(std::sync::mpsc::TrySendError::Disconnected(_)) => false,
+        });
+
+        self.viewer_count.store(list.len(), Ordering::Relaxed);
+    }
+
+    pub fn broadcast_audio(&self, pcm_bytes: &[u8]) {
+        let mut list = match self.viewers.lock() {
+            Ok(g) => g,
+            Err(_) => return,
+        };
+        if list.is_empty() {
+            return;
+        }
+
+        let payload_len = pcm_bytes.len() as u32;
+        let mut packet = Vec::with_capacity(13 + pcm_bytes.len());
+        packet.extend_from_slice(AUDIO_MAGIC);
+        packet.extend_from_slice(&0u16.to_le_bytes());
+        packet.extend_from_slice(&0u16.to_le_bytes());
+        packet.push(0);
+        packet.extend_from_slice(&payload_len.to_le_bytes());
+        packet.extend_from_slice(pcm_bytes);
+
+        let shared_packet = Arc::new(packet);
+
+        list.retain(|tx| match tx.try_send(Arc::clone(&shared_packet)) {
+            Ok(_) => true,
+            Err(std::sync::mpsc::TrySendError::Full(_)) => true,
             Err(std::sync::mpsc::TrySendError::Disconnected(_)) => false,
         });
 
@@ -242,17 +262,21 @@ impl Drop for StreamHostServer {
     }
 }
 
-/// Cliente Espectador (Conecta ao Host e decodifica os quadros em tempo real)
 pub struct StreamViewerClient {
     pub remote_addr: String,
     pub connected: Arc<AtomicBool>,
     pub stop_flag: Arc<AtomicBool>,
     pub frame_rx: Receiver<DecodedRemoteFrame>,
     pub error_msg: Arc<Mutex<Option<String>>>,
+    pub audio_player: StreamAudioPlayer,
 }
 
 impl StreamViewerClient {
-    pub fn connect(raw_target: &str) -> Self {
+    pub fn connect(
+        raw_target: &str,
+        volume_percent: Arc<AtomicU32>,
+        muted: Arc<AtomicBool>,
+    ) -> Self {
         let addr_str = if raw_target.contains(':') {
             raw_target.trim().to_string()
         } else {
@@ -263,11 +287,13 @@ impl StreamViewerClient {
         let stop_flag = Arc::new(AtomicBool::new(false));
         let error_msg = Arc::new(Mutex::new(None));
         let (tx, rx) = sync_channel::<DecodedRemoteFrame>(2);
+        let audio_player = StreamAudioPlayer::start(volume_percent, muted);
 
         let conn_flag = Arc::clone(&connected);
         let stop_clone = Arc::clone(&stop_flag);
         let err_clone = Arc::clone(&error_msg);
         let target_copy = addr_str.clone();
+        let audio_tx = audio_player_sender_clone(&audio_player);
 
         thread::spawn(move || {
             let sock_addr: SocketAddr = match target_copy.parse() {
@@ -299,13 +325,10 @@ impl StreamViewerClient {
                 if stream.read_exact(&mut header).is_err() {
                     break;
                 }
-                if &header[0..4] != FRAME_MAGIC {
-                    break;
-                }
 
+                let magic = &header[0..4];
                 let width = u16::from_le_bytes([header[4], header[5]]) as u32;
                 let height = u16::from_le_bytes([header[6], header[7]]) as u32;
-                let target_fps = header[8];
                 let payload_len =
                     u32::from_le_bytes([header[9], header[10], header[11], header[12]]) as usize;
 
@@ -313,32 +336,36 @@ impl StreamViewerClient {
                     break;
                 }
 
-                let mut jpeg_buf = vec![0u8; payload_len];
-                if stream.read_exact(&mut jpeg_buf).is_err() {
+                let mut payload = vec![0u8; payload_len];
+                if stream.read_exact(&mut payload).is_err() {
                     break;
                 }
 
-                // Decodifica JPEG em RGB via zune-jpeg (SIMD ultra rápido)
-                let mut decoder = JpegDecoder::new(&jpeg_buf);
-                if let Ok(rgb) = decoder.decode() {
-                    let pixel_count = (width * height) as usize;
-                    if rgb.len() >= pixel_count * 3 {
-                        let mut rgba = vec![0u8; pixel_count * 4];
-                        for i in 0..pixel_count {
-                            rgba[i * 4] = rgb[i * 3];
-                            rgba[i * 4 + 1] = rgb[i * 3 + 1];
-                            rgba[i * 4 + 2] = rgb[i * 3 + 2];
-                            rgba[i * 4 + 3] = 255;
-                        }
+                if magic == FRAME_MAGIC {
+                    let mut decoder = JpegDecoder::new(&payload);
+                    if let Ok(rgb) = decoder.decode() {
+                        let pixel_count = (width * height) as usize;
+                        if rgb.len() >= pixel_count * 3 {
+                            let mut rgba = vec![0u8; pixel_count * 4];
+                            for i in 0..pixel_count {
+                                rgba[i * 4] = rgb[i * 3];
+                                rgba[i * 4 + 1] = rgb[i * 3 + 1];
+                                rgba[i * 4 + 2] = rgb[i * 3 + 2];
+                                rgba[i * 4 + 3] = 255;
+                            }
 
-                        let _ = tx.try_send(DecodedRemoteFrame {
-                            width,
-                            height,
-                            target_fps,
-                            byte_len: payload_len,
-                            rgba,
-                        });
+                            let _ = tx.try_send(DecodedRemoteFrame {
+                                width,
+                                height,
+                                byte_len: payload_len,
+                                rgba,
+                            });
+                        }
                     }
+                } else if magic == AUDIO_MAGIC {
+                    let _ = audio_tx.try_send(payload);
+                } else {
+                    break;
                 }
             }
 
@@ -351,12 +378,24 @@ impl StreamViewerClient {
             stop_flag,
             frame_rx: rx,
             error_msg,
+            audio_player,
         }
     }
 
     pub fn stop(&self) {
         self.stop_flag.store(true, Ordering::Relaxed);
         self.connected.store(false, Ordering::Relaxed);
+        self.audio_player.stop();
+    }
+}
+
+fn audio_player_sender_clone(player: &StreamAudioPlayer) -> SyncSender<Vec<u8>> {
+    player.clone_sender()
+}
+
+impl StreamAudioPlayer {
+    pub fn clone_sender(&self) -> SyncSender<Vec<u8>> {
+        self.tx.clone()
     }
 }
 

@@ -1,5 +1,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod audio;
 mod capture;
 mod network;
 mod profile_theme;
@@ -11,6 +12,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use audio::spawn_system_audio_loopback;
 use capture::{
     capture_frame, capture_thumbnail_rgba, get_process_ram_mb, list_capture_sources, CaptureSource,
     SourceCategory,
@@ -24,7 +26,9 @@ use network::{
     start_lan_discovery_listener, DiscoveredRoom, StreamHostServer, StreamViewerClient,
 };
 use profile_theme::{
-    draw_discord_avatar, draw_discord_profile_card, PresenceStatus, ThemePreset, UserCustomization,
+    draw_discord_avatar, draw_discord_profile_card, load_banner_texture,
+    load_circular_avatar_texture, pick_image_file_dialog, PresenceStatus, ThemePreset,
+    UserCustomization,
 };
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -78,6 +82,7 @@ struct LiveStreamConfig {
     jpeg_quality: AtomicU8,
     eco_hide_preview: AtomicBool,
     draw_cursor: AtomicBool,
+    share_system_audio: Arc<AtomicBool>,
     active_source: Mutex<Option<CaptureSource>>,
 }
 
@@ -90,22 +95,30 @@ struct LocalPreviewFrame {
 struct Disc2App {
     // Personalização do Perfil e do Aplicativo
     custom: UserCustomization,
+    user_avatar_tex: Option<TextureHandle>,
+    user_banner_tex: Option<TextureHandle>,
     show_settings_modal: bool,
     settings_tab: SettingsTab,
     show_profile_popup: bool,
 
-    // Seletor de Tela estilo Discord (Modal com Miniaturas)
+    // Seletor de Tela estilo Discord (Modal com Miniaturas + Pesquisa)
     show_share_modal: bool,
     share_tab: SourceCategory,
+    share_search_query: String,
     sources: Vec<CaptureSource>,
     source_thumbnails: HashMap<String, TextureHandle>,
     selected_source_idx: usize,
 
-    // Qualidade da Transmissão (Padrão: 1080p 60fps, alterável em tempo real)
+    // Qualidade da Transmissão e Áudio
     res_preset: ResolutionPreset,
     fps_preset: u8,
     jpeg_quality: u8,
+    share_audio_enabled: bool,
     eco_hide_preview: bool,
+
+    // Volume de recepção (Assistindo)
+    viewer_volume_percent: Arc<AtomicU32>,
+    viewer_audio_muted: Arc<AtomicBool>,
 
     // Estado de Transmissão Local (Host)
     is_sharing: bool,
@@ -139,7 +152,20 @@ impl Disc2App {
         let custom = UserCustomization::load_from_disk();
         custom.apply_to_egui(&cc.egui_ctx);
 
+        let user_avatar_tex = if !custom.avatar_image_path.is_empty() {
+            load_circular_avatar_texture(&cc.egui_ctx, &custom.avatar_image_path)
+        } else {
+            None
+        };
+
+        let user_banner_tex = if !custom.banner_image_path.is_empty() {
+            load_banner_texture(&cc.egui_ctx, &custom.banner_image_path)
+        } else {
+            None
+        };
+
         let sources = list_capture_sources();
+        let share_system_audio = Arc::new(AtomicBool::new(true));
         let stream_config = Arc::new(LiveStreamConfig {
             target_w: AtomicU32::new(1920),
             target_h: AtomicU32::new(1080),
@@ -147,23 +173,30 @@ impl Disc2App {
             jpeg_quality: AtomicU8::new(78),
             eco_hide_preview: AtomicBool::new(false),
             draw_cursor: AtomicBool::new(custom.show_cursor_in_stream),
+            share_system_audio,
             active_source: Mutex::new(sources.first().cloned()),
         });
 
         Self {
             custom,
+            user_avatar_tex,
+            user_banner_tex,
             show_settings_modal: false,
             settings_tab: SettingsTab::Profile,
             show_profile_popup: false,
             show_share_modal: false,
-            share_tab: SourceCategory::Screen,
+            share_tab: SourceCategory::Application,
+            share_search_query: String::new(),
             sources,
             source_thumbnails: HashMap::new(),
             selected_source_idx: 0,
             res_preset: ResolutionPreset::P1080,
             fps_preset: 60,
             jpeg_quality: 78,
+            share_audio_enabled: true,
             eco_hide_preview: false,
+            viewer_volume_percent: Arc::new(AtomicU32::new(100)),
+            viewer_audio_muted: Arc::new(AtomicBool::new(false)),
             is_sharing: false,
             stream_config,
             capture_stop_flag: None,
@@ -191,6 +224,10 @@ impl Disc2App {
 
     fn open_share_picker(&mut self, ctx: &Context) {
         self.refresh_sources_and_thumbnails(ctx);
+        // Se a aba atual estiver vazia, seleciona automaticamente uma aba que tenha fontes
+        if !self.sources.iter().any(|s| s.category == self.share_tab) {
+            self.share_tab = SourceCategory::Screen;
+        }
         self.show_share_modal = true;
     }
 
@@ -243,6 +280,9 @@ impl Disc2App {
         self.stream_config
             .draw_cursor
             .store(self.custom.show_cursor_in_stream, Ordering::Relaxed);
+        self.stream_config
+            .share_system_audio
+            .store(self.share_audio_enabled, Ordering::Relaxed);
 
         if let Some(src) = self.sources.get(self.selected_source_idx).cloned() {
             if let Ok(mut guard) = self.stream_config.active_source.lock() {
@@ -251,7 +291,13 @@ impl Disc2App {
         }
 
         if let Ok(mut lbl) = self.host_res_label.lock() {
-            *lbl = format!("{} {}fps", self.res_preset.short_label(), self.fps_preset);
+            let audio_tag = if self.share_audio_enabled { " 🔊" } else { "" };
+            *lbl = format!(
+                "{} {}fps{}",
+                self.res_preset.short_label(),
+                self.fps_preset,
+                audio_tag
+            );
         }
     }
 
@@ -285,6 +331,14 @@ impl Disc2App {
 
         let stop_flag = Arc::new(AtomicBool::new(false));
         self.capture_stop_flag = Some(Arc::clone(&stop_flag));
+
+        // Inicia a captura de áudio do sistema (WASAPI Loopback) junto com a transmissão
+        let audio_stop = Arc::clone(&stop_flag);
+        let audio_enabled = Arc::clone(&self.stream_config.share_system_audio);
+        let server_for_audio = Arc::clone(&server);
+        spawn_system_audio_loopback(audio_stop, audio_enabled, move |pcm_bytes| {
+            server_for_audio.broadcast_audio(pcm_bytes);
+        });
 
         let (preview_tx, preview_rx) = sync_channel::<LocalPreviewFrame>(2);
         self.local_preview_rx = Some(preview_rx);
@@ -367,7 +421,7 @@ impl Disc2App {
 
         self.is_sharing = true;
         self.show_share_modal = false;
-        self.show_toast(format!("Transmitindo em {}!", addr_msg));
+        self.show_toast(format!("Transmitindo vídeo e áudio em {}!", addr_msg));
     }
 
     fn stop_sharing(&mut self) {
@@ -388,7 +442,11 @@ impl Disc2App {
         self.stop_sharing();
         self.stop_watching();
 
-        let client = StreamViewerClient::connect(&addr);
+        let client = StreamViewerClient::connect(
+            &addr,
+            Arc::clone(&self.viewer_volume_percent),
+            Arc::clone(&self.viewer_audio_muted),
+        );
         self.show_toast(format!("Conectando a {}...", client.remote_addr));
         self.viewer_client = Some(client);
     }
@@ -428,11 +486,11 @@ impl Disc2App {
             .collapsible(false)
             .resizable(false)
             .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
-            .fixed_size(Vec2::new(760.0, 520.0))
+            .fixed_size(Vec2::new(780.0, 545.0))
             .frame(
                 egui::Frame::none()
                     .fill(card_bg)
-                    .rounding(Rounding::same(12.0))
+                    .rounding(Rounding::same(self.custom.corner_radius.max(10.0)))
                     .stroke(Stroke::new(1.5_f32, accent))
                     .inner_margin(egui::Margin::same(18.0)),
             )
@@ -447,7 +505,7 @@ impl Disc2App {
                         );
                         ui.label(
                             RichText::new(
-                                "Selecione um aplicativo/jogo, uma guia do navegador (Google Chrome/Edge/etc.) ou a tela inteira",
+                                "Selecione um aplicativo/jogo, uma guia do navegador (Chrome, Edge, Brave, Opera, Firefox) ou a tela inteira",
                             )
                             .size(12.0)
                             .color(Color32::from_rgb(181, 186, 193)),
@@ -466,7 +524,6 @@ impl Disc2App {
 
                 ui.add_space(10.0);
 
-                // Abas estilo Discord: Aplicativos | Guias do Navegador | Telas Inteiras
                 let count_apps = self
                     .sources
                     .iter()
@@ -483,6 +540,7 @@ impl Disc2App {
                     .filter(|s| s.category == SourceCategory::Screen)
                     .count();
 
+                // Barra de Abas + Pesquisa Rápida de Janela/App
                 egui::Frame::none()
                     .fill(sidebar_bg)
                     .rounding(Rounding::same(8.0))
@@ -496,7 +554,7 @@ impl Disc2App {
                                 ),
                                 (
                                     SourceCategory::Browser,
-                                    format!("🌐 Guias do Google / Navegador ({})", count_browsers),
+                                    format!("🌐 Guias / Navegadores ({})", count_browsers),
                                 ),
                                 (
                                     SourceCategory::Screen,
@@ -508,7 +566,7 @@ impl Disc2App {
                                 let active = self.share_tab == cat;
                                 let btn = egui::Button::new(
                                     RichText::new(label)
-                                        .size(12.5)
+                                        .size(12.0)
                                         .strong()
                                         .color(if active {
                                             Color32::WHITE
@@ -517,23 +575,39 @@ impl Disc2App {
                                         }),
                                 )
                                 .fill(if active { accent } else { Color32::TRANSPARENT })
-                                .min_size(Vec2::new(220.0, 30.0));
+                                .min_size(Vec2::new(180.0, 29.0));
 
                                 if ui.add(btn).clicked() {
                                     self.select_first_in_category(cat);
                                 }
                             }
+
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                ui.add(
+                                    egui::TextEdit::singleline(&mut self.share_search_query)
+                                        .hint_text("🔍 Filtrar app/janela...")
+                                        .desired_width(155.0),
+                                );
+                            });
                         });
                     });
 
                 ui.add_space(10.0);
 
-                // Grade de Cards com Miniaturas Reais (3 colunas igual ao Discord)
+                let q_lower = self.share_search_query.trim().to_lowercase();
                 let filtered_indices: Vec<usize> = self
                     .sources
                     .iter()
                     .enumerate()
-                    .filter(|(_, s)| s.category == self.share_tab)
+                    .filter(|(_, s)| {
+                        if !q_lower.is_empty() {
+                            s.name.to_lowercase().contains(&q_lower)
+                                || s.subtitle.to_lowercase().contains(&q_lower)
+                                || s.exe_name.to_lowercase().contains(&q_lower)
+                        } else {
+                            s.category == self.share_tab
+                        }
+                    })
                     .map(|(i, _)| i)
                     .collect();
 
@@ -541,7 +615,7 @@ impl Disc2App {
 
                 egui::ScrollArea::vertical()
                     .id_salt("modal_sources_grid")
-                    .max_height(280.0)
+                    .max_height(285.0)
                     .show(ui, |ui| {
                         if filtered_indices.is_empty() {
                             ui.vertical_centered(|ui| {
@@ -549,10 +623,10 @@ impl Disc2App {
                                 ui.label(
                                     RichText::new(match self.share_tab {
                                         SourceCategory::Browser => {
-                                            "Nenhum navegador aberto no momento (abra o Google Chrome, Edge, Brave ou Firefox e clique em Atualizar)."
+                                            "Nenhuma janela de navegador detectada. Abra o Google Chrome, Edge, Brave, Opera ou Firefox e clique em '↻ Atualizar Miniaturas'."
                                         }
                                         SourceCategory::Application => {
-                                            "Nenhum outro aplicativo aberto encontrado."
+                                            "Nenhum aplicativo encontrado com esse filtro."
                                         }
                                         SourceCategory::Screen => "Nenhum monitor encontrado.",
                                     })
@@ -572,10 +646,10 @@ impl Disc2App {
                                         let border_col = if is_selected {
                                             accent
                                         } else {
-                                            Color32::from_rgba_unmultiplied(255, 255, 255, 18)
+                                            Color32::from_rgba_unmultiplied(255, 255, 255, 20)
                                         };
                                         let card_fill = if is_selected {
-                                            sidebar_bg. linear_multiply(1.25)
+                                            sidebar_bg.linear_multiply(1.28)
                                         } else {
                                             sidebar_bg
                                         };
@@ -589,32 +663,39 @@ impl Disc2App {
                                             ))
                                             .inner_margin(egui::Margin::same(7.0))
                                             .show(ui, |ui| {
-                                                ui.set_width(222.0);
+                                                ui.set_width(226.0);
                                                 ui.vertical(|ui| {
                                                     if let Some(tex) =
                                                         self.source_thumbnails.get(&src.id)
                                                     {
                                                         ui.image((
                                                             tex.id(),
-                                                            Vec2::new(222.0, 124.0),
+                                                            Vec2::new(226.0, 124.0),
                                                         ));
                                                     } else {
                                                         let (r, _) = ui.allocate_exact_size(
-                                                            Vec2::new(222.0, 124.0),
+                                                            Vec2::new(226.0, 124.0),
                                                             egui::Sense::hover(),
                                                         );
                                                         ui.painter().rect_filled(
                                                             r,
                                                             Rounding::same(5.0),
-                                                            Color32::from_rgb(12, 13, 15),
+                                                            Color32::from_rgb(15, 16, 20),
+                                                        );
+                                                        ui.painter().text(
+                                                            r.center(),
+                                                            egui::Align2::CENTER_CENTER,
+                                                            &src.exe_name,
+                                                            FontId::proportional(13.0),
+                                                            Color32::from_rgb(148, 155, 164),
                                                         );
                                                     }
 
                                                     ui.add_space(5.0);
-                                                    let short_title = if src.name.chars().count() > 27
+                                                    let short_title = if src.name.chars().count() > 28
                                                     {
                                                         let s: String =
-                                                            src.name.chars().take(26).collect();
+                                                            src.name.chars().take(27).collect();
                                                         format!("{}…", s)
                                                     } else {
                                                         src.name.clone()
@@ -653,7 +734,7 @@ impl Disc2App {
 
                 ui.add_space(10.0);
 
-                // Painel de Qualidade da Transmissão estilo Discord
+                // Painel de Qualidade + Áudio da Transmissão estilo Discord
                 egui::Frame::none()
                     .fill(sidebar_bg)
                     .rounding(Rounding::same(8.0))
@@ -684,7 +765,7 @@ impl Disc2App {
                             ui.separator();
 
                             ui.label(
-                                RichText::new("Taxa de Quadros:")
+                                RichText::new("Quadros:")
                                     .size(12.0)
                                     .strong()
                                     .color(Color32::from_rgb(181, 186, 193)),
@@ -699,6 +780,13 @@ impl Disc2App {
                                 }
                             }
 
+                            ui.separator();
+
+                            ui.checkbox(
+                                &mut self.share_audio_enabled,
+                                RichText::new("🔊 Compartilhar Áudio").size(12.0).strong(),
+                            );
+
                             ui.with_layout(
                                 egui::Layout::right_to_left(egui::Align::Center),
                                 |ui| {
@@ -709,7 +797,7 @@ impl Disc2App {
                                             .color(Color32::WHITE),
                                     )
                                     .fill(Color32::from_rgb(35, 165, 90))
-                                    .min_size(Vec2::new(135.0, 32.0));
+                                    .min_size(Vec2::new(125.0, 32.0));
 
                                     if ui.add(go_btn).clicked() {
                                         double_clicked_go_live = true;
@@ -725,7 +813,7 @@ impl Disc2App {
             });
     }
 
-    // ======================== MODAL DE PERSONALIZAÇÃO (PERFIL + TEMA DO APP) ========================
+    // ======================== MODAL DE PERSONALIZAÇÃO LIVRE (PERFIL COM FOTO + TEMA DO APP) ========================
     fn render_settings_modal(&mut self, ctx: &Context) {
         if !self.show_settings_modal {
             return;
@@ -736,25 +824,24 @@ impl Disc2App {
         let sidebar_bg = self.custom.sidebar_color();
         let mut theme_changed = false;
 
-        egui::Window::new("⚙️ Personalização do Perfil e Aparência (Estilo Discord)")
+        egui::Window::new("⚙️ Personalização Livre do Perfil e do Aplicativo")
             .collapsible(false)
             .resizable(false)
             .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
-            .fixed_size(Vec2::new(760.0, 490.0))
+            .fixed_size(Vec2::new(810.0, 540.0))
             .frame(
                 egui::Frame::none()
                     .fill(card_bg)
-                    .rounding(Rounding::same(12.0))
+                    .rounding(Rounding::same(self.custom.corner_radius.max(10.0)))
                     .stroke(Stroke::new(1.5_f32, accent))
                     .inner_margin(egui::Margin::same(16.0)),
             )
             .show(ctx, |ui| {
-                // Topo do Modal
                 ui.horizontal(|ui| {
                     let tabs = [
-                        (SettingsTab::Profile, "👤 Meu Perfil Discord"),
-                        (SettingsTab::Appearance, "🎨 Temas e Cores do App"),
-                        (SettingsTab::Stream, "⚡ Captura e Performance"),
+                        (SettingsTab::Profile, "👤 Meu Perfil & Foto"),
+                        (SettingsTab::Appearance, "🎨 Cores e Estilo do App"),
+                        (SettingsTab::Stream, "🔊 Áudio e Transmissão"),
                     ];
                     for (tab, label) in tabs {
                         let active = self.settings_tab == tab;
@@ -769,7 +856,7 @@ impl Disc2App {
                                 }),
                         )
                         .fill(if active { accent } else { sidebar_bg })
-                        .min_size(Vec2::new(180.0, 32.0));
+                        .min_size(Vec2::new(185.0, 32.0));
 
                         if ui.add(btn).clicked() {
                             self.settings_tab = tab;
@@ -787,224 +874,377 @@ impl Disc2App {
 
                 ui.add_space(10.0);
                 ui.separator();
-                ui.add_space(10.0);
+                ui.add_space(8.0);
 
                 ui.columns(2, |cols| {
-                    // Coluna da Esquerda: Controles de Edição
-                    match self.settings_tab {
-                        SettingsTab::Profile => {
-                            cols[0].label(
-                                RichText::new("PERSONALIZAR SEU PERFIL")
-                                    .size(11.0)
-                                    .strong()
-                                    .color(Color32::from_rgb(148, 155, 164)),
-                            );
-                            cols[0].add_space(6.0);
-
-                            cols[0].horizontal(|ui| {
-                                ui.label("Nome:");
-                                ui.add(
-                                    egui::TextEdit::singleline(&mut self.custom.display_name)
-                                        .desired_width(150.0),
+                    egui::ScrollArea::vertical()
+                        .id_salt("settings_left_scroll")
+                        .max_height(430.0)
+                        .show(&mut cols[0], |ui| match self.settings_tab {
+                            SettingsTab::Profile => {
+                                ui.label(
+                                    RichText::new("FOTO DE PERFIL E IMAGEM DE BANNER")
+                                        .size(11.0)
+                                        .strong()
+                                        .color(Color32::from_rgb(148, 155, 164)),
                                 );
-                                ui.label("Tag:");
-                                ui.add(
-                                    egui::TextEdit::singleline(&mut self.custom.user_tag)
-                                        .desired_width(70.0),
-                                );
-                            });
+                                ui.add_space(4.0);
 
-                            cols[0].add_space(6.0);
-                            cols[0].label("Recado / Status Personalizado:");
-                            cols[0].add(
-                                egui::TextEdit::singleline(&mut self.custom.custom_status)
-                                    .desired_width(f32::INFINITY),
-                            );
-
-                            cols[0].add_space(6.0);
-                            cols[0].label("Sobre Mim (Bio do Perfil):");
-                            cols[0].add(
-                                egui::TextEdit::multiline(&mut self.custom.bio)
-                                    .desired_rows(2)
-                                    .desired_width(f32::INFINITY),
-                            );
-
-                            cols[0].add_space(8.0);
-                            cols[0].horizontal(|ui| {
-                                ui.label("Status de Presença:");
-                                egui::ComboBox::from_id_salt("presence_combo")
-                                    .selected_text(self.custom.presence.label())
-                                    .show_ui(ui, |ui| {
-                                        for p in [
-                                            PresenceStatus::Online,
-                                            PresenceStatus::Idle,
-                                            PresenceStatus::DoNotDisturb,
-                                            PresenceStatus::Invisible,
-                                        ] {
-                                            ui.selectable_value(&mut self.custom.presence, p, p.label());
+                                ui.horizontal_wrapped(|ui| {
+                                    if ui.button("📷 Escolher Foto de Perfil...").clicked() {
+                                        if let Some(path) = pick_image_file_dialog() {
+                                            if let Some(tex) =
+                                                load_circular_avatar_texture(ctx, &path)
+                                            {
+                                                self.user_avatar_tex = Some(tex);
+                                                self.custom.avatar_image_path = path;
+                                                self.custom.save_to_disk();
+                                            }
                                         }
-                                    });
-                            });
+                                    }
+                                    if self.user_avatar_tex.is_some()
+                                        && ui.small_button("🗑️ Remover Foto").clicked()
+                                    {
+                                        self.user_avatar_tex = None;
+                                        self.custom.avatar_image_path.clear();
+                                        self.custom.save_to_disk();
+                                    }
+                                });
 
-                            cols[0].add_space(8.0);
-                            cols[0].horizontal(|ui| {
-                                ui.label("Cor do Avatar:");
-                                ui.color_edit_button_srgb(&mut self.custom.avatar_bg);
-                                ui.add_space(12.0);
-                                ui.label("Cor do Banner:");
-                                ui.color_edit_button_srgb(&mut self.custom.banner_bg);
-                            });
+                                ui.add_space(4.0);
+                                ui.horizontal_wrapped(|ui| {
+                                    if ui.button("🖼️ Escolher Imagem de Banner...").clicked() {
+                                        if let Some(path) = pick_image_file_dialog() {
+                                            if let Some(tex) = load_banner_texture(ctx, &path) {
+                                                self.user_banner_tex = Some(tex);
+                                                self.custom.banner_image_path = path;
+                                                self.custom.save_to_disk();
+                                            }
+                                        }
+                                    }
+                                    if self.user_banner_tex.is_some()
+                                        && ui.small_button("🗑️ Remover Banner").clicked()
+                                    {
+                                        self.user_banner_tex = None;
+                                        self.custom.banner_image_path.clear();
+                                        self.custom.save_to_disk();
+                                    }
+                                });
 
-                            cols[0].add_space(6.0);
-                            cols[0].checkbox(
-                                &mut self.custom.avatar_ring_glow,
-                                "Anel Neon em volta do Avatar",
-                            );
+                                ui.add_space(10.0);
+                                ui.separator();
+                                ui.add_space(6.0);
 
-                            cols[0].add_space(8.0);
-                            cols[0].label(
-                                RichText::new("INSÍGNIAS DO PERFIL (BADGES)")
-                                    .size(11.0)
-                                    .strong()
-                                    .color(Color32::from_rgb(148, 155, 164)),
-                            );
-                            cols[0].horizontal_wrapped(|ui| {
-                                ui.checkbox(&mut self.custom.badge_crown, "👑 Host");
-                                ui.checkbox(&mut self.custom.badge_1080p, "⚡ 1080p60");
-                                ui.checkbox(&mut self.custom.badge_rust, "🦀 Rust");
-                                ui.checkbox(&mut self.custom.badge_gamer, "🎮 Pro");
-                            });
-                        }
+                                ui.label(
+                                    RichText::new("IDENTIDADE E STATUS")
+                                        .size(11.0)
+                                        .strong()
+                                        .color(Color32::from_rgb(148, 155, 164)),
+                                );
+                                ui.horizontal(|ui| {
+                                    ui.label("Nome:");
+                                    ui.add(
+                                        egui::TextEdit::singleline(&mut self.custom.display_name)
+                                            .desired_width(135.0),
+                                    );
+                                    ui.label("Cor:");
+                                    ui.color_edit_button_srgb(&mut self.custom.name_color_rgb);
+                                    ui.label("Tag:");
+                                    ui.add(
+                                        egui::TextEdit::singleline(&mut self.custom.user_tag)
+                                            .desired_width(60.0),
+                                    );
+                                });
 
-                        SettingsTab::Appearance => {
-                            cols[0].label(
-                                RichText::new("TEMAS DO APLICATIVO")
-                                    .size(11.0)
-                                    .strong()
-                                    .color(Color32::from_rgb(148, 155, 164)),
-                            );
-                            cols[0].add_space(6.0);
+                                ui.add_space(4.0);
+                                ui.label("Recado / Status Personalizado:");
+                                ui.add(
+                                    egui::TextEdit::singleline(&mut self.custom.custom_status)
+                                        .desired_width(f32::INFINITY),
+                                );
 
-                            for preset in [
-                                ThemePreset::DiscordDark,
-                                ThemePreset::MidnightOled,
-                                ThemePreset::CyberpunkNeon,
-                                ThemePreset::EmeraldGamer,
-                                ThemePreset::CrimsonRuby,
-                                ThemePreset::ArcticOcean,
-                            ] {
-                                let is_sel = self.custom.theme_preset == preset;
-                                if cols[0].selectable_label(is_sel, preset.label()).clicked() {
-                                    self.custom.apply_preset_colors(preset);
-                                    theme_changed = true;
-                                }
+                                ui.add_space(4.0);
+                                ui.label("Sobre Mim (Bio):");
+                                ui.add(
+                                    egui::TextEdit::multiline(&mut self.custom.bio)
+                                        .desired_rows(2)
+                                        .desired_width(f32::INFINITY),
+                                );
+
+                                ui.add_space(6.0);
+                                ui.horizontal(|ui| {
+                                    ui.label("Presença:");
+                                    egui::ComboBox::from_id_salt("presence_combo")
+                                        .selected_text(self.custom.presence.label())
+                                        .show_ui(ui, |ui| {
+                                            for p in [
+                                                PresenceStatus::Online,
+                                                PresenceStatus::Idle,
+                                                PresenceStatus::DoNotDisturb,
+                                                PresenceStatus::Invisible,
+                                            ] {
+                                                ui.selectable_value(
+                                                    &mut self.custom.presence,
+                                                    p,
+                                                    p.label(),
+                                                );
+                                            }
+                                        });
+                                });
+
+                                ui.add_space(8.0);
+                                ui.label(
+                                    RichText::new("CORES DO CARD E ANEL DO AVATAR")
+                                        .size(11.0)
+                                        .strong()
+                                        .color(Color32::from_rgb(148, 155, 164)),
+                                );
+                                ui.horizontal(|ui| {
+                                    ui.label("Fundo Avatar:");
+                                    ui.color_edit_button_srgb(&mut self.custom.avatar_bg);
+                                    ui.label("Gradiente Banner:");
+                                    ui.color_edit_button_srgb(&mut self.custom.banner_bg);
+                                    ui.color_edit_button_srgb(&mut self.custom.banner_bg_2);
+                                });
+
+                                ui.horizontal(|ui| {
+                                    ui.checkbox(&mut self.custom.avatar_ring_glow, "Anel Neon:");
+                                    ui.color_edit_button_srgb(&mut self.custom.ring_color_rgb);
+                                    ui.add(
+                                        egui::Slider::new(
+                                            &mut self.custom.ring_thickness,
+                                            0.5..=4.5,
+                                        )
+                                        .suffix(" px"),
+                                    );
+                                });
+
+                                ui.add_space(8.0);
+                                ui.label(
+                                    RichText::new("INSÍGNIAS (BADGES) E BADGE CUSTOMIZADA")
+                                        .size(11.0)
+                                        .strong()
+                                        .color(Color32::from_rgb(148, 155, 164)),
+                                );
+                                ui.horizontal_wrapped(|ui| {
+                                    ui.checkbox(&mut self.custom.badge_crown, "👑 Host");
+                                    ui.checkbox(&mut self.custom.badge_1080p, "⚡ 1080p60");
+                                    ui.checkbox(&mut self.custom.badge_rust, "🦀 Rust");
+                                    ui.checkbox(&mut self.custom.badge_gamer, "🎮 Pro");
+                                });
+
+                                ui.horizontal(|ui| {
+                                    ui.checkbox(
+                                        &mut self.custom.custom_badge_enabled,
+                                        "Badge Livre:",
+                                    );
+                                    ui.add(
+                                        egui::TextEdit::singleline(
+                                            &mut self.custom.custom_badge_text,
+                                        )
+                                        .desired_width(110.0),
+                                    );
+                                    ui.color_edit_button_srgb(&mut self.custom.custom_badge_rgb);
+                                });
                             }
 
-                            cols[0].add_space(10.0);
-                            cols[0].label(
-                                RichText::new("CORES PERSONALIZADAS")
-                                    .size(11.0)
-                                    .strong()
-                                    .color(Color32::from_rgb(148, 155, 164)),
-                            );
-                            cols[0].horizontal(|ui| {
-                                ui.label("Destaque:");
-                                if ui.color_edit_button_srgb(&mut self.custom.accent_rgb).changed() {
-                                    self.custom.theme_preset = ThemePreset::Custom;
-                                    theme_changed = true;
-                                }
-                                ui.label("Barra Lateral:");
-                                if ui
-                                    .color_edit_button_srgb(&mut self.custom.bg_sidebar_rgb)
-                                    .changed()
-                                {
-                                    self.custom.theme_preset = ThemePreset::Custom;
-                                    theme_changed = true;
-                                }
-                            });
+                            SettingsTab::Appearance => {
+                                ui.label(
+                                    RichText::new("TEMAS PREDEFINIDOS")
+                                        .size(11.0)
+                                        .strong()
+                                        .color(Color32::from_rgb(148, 155, 164)),
+                                );
+                                ui.add_space(4.0);
 
-                            cols[0].horizontal(|ui| {
-                                ui.label("Palco:");
-                                if ui.color_edit_button_srgb(&mut self.custom.bg_stage_rgb).changed() {
-                                    self.custom.theme_preset = ThemePreset::Custom;
-                                    theme_changed = true;
-                                }
-                                ui.label("Painéis:");
-                                if ui.color_edit_button_srgb(&mut self.custom.bg_card_rgb).changed() {
-                                    self.custom.theme_preset = ThemePreset::Custom;
-                                    theme_changed = true;
-                                }
-                            });
-
-                            cols[0].add_space(8.0);
-                            cols[0].horizontal(|ui| {
-                                ui.label("Arredondamento:");
-                                if ui
-                                    .add(egui::Slider::new(&mut self.custom.corner_radius, 0.0..=14.0).suffix(" px"))
-                                    .changed()
-                                {
-                                    theme_changed = true;
-                                }
-                            });
-
-                            cols[0].horizontal(|ui| {
-                                ui.label("Escala da Interface:");
-                                for (scale, lbl) in [(0.95_f32, "Compacta"), (1.0_f32, "Padrão"), (1.08_f32, "Grande")] {
-                                    let active = (self.custom.ui_scale - scale).abs() < 0.02;
-                                    if ui.selectable_label(active, lbl).clicked() {
-                                        self.custom.ui_scale = scale;
+                                for preset in [
+                                    ThemePreset::DiscordDark,
+                                    ThemePreset::MidnightOled,
+                                    ThemePreset::CyberpunkNeon,
+                                    ThemePreset::EmeraldGamer,
+                                    ThemePreset::CrimsonRuby,
+                                    ThemePreset::ArcticOcean,
+                                ] {
+                                    let is_sel = self.custom.theme_preset == preset;
+                                    if ui.selectable_label(is_sel, preset.label()).clicked() {
+                                        self.custom.apply_preset_colors(preset);
                                         theme_changed = true;
                                     }
                                 }
-                            });
-                        }
 
-                        SettingsTab::Stream => {
-                            cols[0].label(
-                                RichText::new("PREFERÊNCIAS DE TRANSMISSÃO")
-                                    .size(11.0)
-                                    .strong()
-                                    .color(Color32::from_rgb(148, 155, 164)),
-                            );
-                            cols[0].add_space(8.0);
+                                ui.add_space(10.0);
+                                ui.separator();
+                                ui.add_space(6.0);
 
-                            if cols[0]
-                                .checkbox(
-                                    &mut self.custom.show_cursor_in_stream,
-                                    "Mostrar cursor do mouse na transmissão de tela",
-                                )
-                                .changed()
-                            {
-                                self.sync_live_config();
+                                ui.label(
+                                    RichText::new("PERSONALIZAÇÃO LIVRE DE CORES")
+                                        .size(11.0)
+                                        .strong()
+                                        .color(Color32::from_rgb(148, 155, 164)),
+                                );
+                                ui.horizontal(|ui| {
+                                    ui.label("Destaque:");
+                                    if ui
+                                        .color_edit_button_srgb(&mut self.custom.accent_rgb)
+                                        .changed()
+                                    {
+                                        self.custom.theme_preset = ThemePreset::Custom;
+                                        theme_changed = true;
+                                    }
+                                    ui.label("Texto Principal:");
+                                    if ui
+                                        .color_edit_button_srgb(&mut self.custom.text_rgb)
+                                        .changed()
+                                    {
+                                        self.custom.theme_preset = ThemePreset::Custom;
+                                        theme_changed = true;
+                                    }
+                                });
+
+                                ui.horizontal(|ui| {
+                                    ui.label("Barra Lateral:");
+                                    if ui
+                                        .color_edit_button_srgb(&mut self.custom.bg_sidebar_rgb)
+                                        .changed()
+                                    {
+                                        self.custom.theme_preset = ThemePreset::Custom;
+                                        theme_changed = true;
+                                    }
+                                    ui.label("Palco Central:");
+                                    if ui
+                                        .color_edit_button_srgb(&mut self.custom.bg_stage_rgb)
+                                        .changed()
+                                    {
+                                        self.custom.theme_preset = ThemePreset::Custom;
+                                        theme_changed = true;
+                                    }
+                                });
+
+                                ui.horizontal(|ui| {
+                                    ui.label("Painéis / Cards:");
+                                    if ui
+                                        .color_edit_button_srgb(&mut self.custom.bg_card_rgb)
+                                        .changed()
+                                    {
+                                        self.custom.theme_preset = ThemePreset::Custom;
+                                        theme_changed = true;
+                                    }
+                                });
+
+                                ui.add_space(8.0);
+                                ui.label(
+                                    RichText::new("GEOMETRIA E ESCALA DO APP")
+                                        .size(11.0)
+                                        .strong()
+                                        .color(Color32::from_rgb(148, 155, 164)),
+                                );
+                                ui.horizontal(|ui| {
+                                    ui.label("Cantos Arredondados:");
+                                    if ui
+                                        .add(
+                                            egui::Slider::new(
+                                                &mut self.custom.corner_radius,
+                                                0.0..=16.0,
+                                            )
+                                            .suffix(" px"),
+                                        )
+                                        .changed()
+                                    {
+                                        theme_changed = true;
+                                    }
+                                });
+
+                                ui.horizontal(|ui| {
+                                    ui.label("Espessura da Borda:");
+                                    if ui
+                                        .add(
+                                            egui::Slider::new(
+                                                &mut self.custom.border_stroke_width,
+                                                0.5..=3.0,
+                                            )
+                                            .suffix(" px"),
+                                        )
+                                        .changed()
+                                    {
+                                        theme_changed = true;
+                                    }
+                                });
+
+                                ui.horizontal(|ui| {
+                                    ui.label("Zoom da Interface:");
+                                    if ui
+                                        .add(
+                                            egui::Slider::new(
+                                                &mut self.custom.ui_scale,
+                                                0.90..=1.15,
+                                            ),
+                                        )
+                                        .changed()
+                                    {
+                                        theme_changed = true;
+                                    }
+                                });
                             }
 
-                            cols[0].add_space(6.0);
-                            cols[0].checkbox(
-                                &mut self.eco_hide_preview,
-                                "Modo Jogo (Ocultar prévia local para poupar GPU)",
-                            );
+                            SettingsTab::Stream => {
+                                ui.label(
+                                    RichText::new("ÁUDIO E CAPTURA DE TELA")
+                                        .size(11.0)
+                                        .strong()
+                                        .color(Color32::from_rgb(148, 155, 164)),
+                                );
+                                ui.add_space(6.0);
 
-                            cols[0].add_space(10.0);
-                            cols[0].label(
-                                RichText::new(
-                                    "Dica: Você pode alterar entre 1080p, 720p, 480p e 360p e entre 60, 30 e 15 FPS diretamente no topo do palco a qualquer momento, mesmo com a transmissão aberta.",
-                                )
-                                .size(11.5)
-                                .color(Color32::from_rgb(160, 166, 174)),
-                            );
-                        }
-                    }
+                                if ui
+                                    .checkbox(
+                                        &mut self.share_audio_enabled,
+                                        "🔊 Transmitir áudio do sistema (WASAPI Loopback)",
+                                    )
+                                    .changed()
+                                {
+                                    self.sync_live_config();
+                                }
+
+                                ui.add_space(6.0);
+                                if ui
+                                    .checkbox(
+                                        &mut self.custom.show_cursor_in_stream,
+                                        "🖱️ Mostrar cursor do mouse na transmissão",
+                                    )
+                                    .changed()
+                                {
+                                    self.sync_live_config();
+                                }
+
+                                ui.add_space(6.0);
+                                if ui
+                                    .checkbox(
+                                        &mut self.eco_hide_preview,
+                                        "🎮 Modo Jogo (Ocultar prévia local enquanto transmite)",
+                                    )
+                                    .changed()
+                                {
+                                    self.sync_live_config();
+                                }
+                            }
+                        });
 
                     // Coluna da Direita: Prévia ao Vivo do Card de Perfil Estilo Discord
                     cols[1].vertical_centered(|ui| {
                         ui.label(
-                            RichText::new("PRÉVIA DO SEU PERFIL NO APP")
+                            RichText::new("PRÉVIA DO SEU PERFIL AO VIVO")
                                 .size(11.0)
                                 .strong()
                                 .color(Color32::from_rgb(148, 155, 164)),
                         );
                         ui.add_space(8.0);
-                        draw_discord_profile_card(ui, &self.custom, self.is_sharing);
+                        draw_discord_profile_card(
+                            ui,
+                            &self.custom,
+                            self.user_avatar_tex.as_ref(),
+                            self.user_banner_tex.as_ref(),
+                            self.is_sharing,
+                        );
                     });
                 });
             });
@@ -1091,7 +1331,7 @@ impl eframe::App for Disc2App {
             .show(ctx, |ui| {
                 // Rodapé fixo do Perfil de Usuário (igual à barra inferior do Discord)
                 egui::TopBottomPanel::bottom("discord_user_footer")
-                    .exact_height(60.0)
+                    .exact_height(62.0)
                     .frame(
                         egui::Frame::none()
                             .fill(Color32::from_rgb(
@@ -1103,15 +1343,11 @@ impl eframe::App for Disc2App {
                     )
                     .show_inside(ui, |ui| {
                         ui.horizontal_centered(|ui| {
-                            let initial = self.custom.display_name.chars().next().unwrap_or('U');
                             draw_discord_avatar(
                                 ui,
-                                36.0,
-                                initial,
-                                self.custom.avatar_color(),
-                                self.custom.presence,
-                                self.custom.avatar_ring_glow,
-                                accent,
+                                38.0,
+                                &self.custom,
+                                self.user_avatar_tex.as_ref(),
                             );
 
                             let name_resp = ui
@@ -1120,11 +1356,11 @@ impl eframe::App for Disc2App {
                                         RichText::new(&self.custom.display_name)
                                             .strong()
                                             .size(13.0)
-                                            .color(Color32::WHITE),
+                                            .color(self.custom.name_color()),
                                     );
                                     let sub = if self.is_sharing {
                                         format!(
-                                            "🔴 Ao Vivo {} {}fps",
+                                            "🔴 {} {}fps",
                                             self.res_preset.short_label(),
                                             self.fps_preset
                                         )
@@ -1133,7 +1369,7 @@ impl eframe::App for Disc2App {
                                     } else {
                                         self.custom.presence.label().to_string()
                                     };
-                                    let short_sub: String = sub.chars().take(21).collect();
+                                    let short_sub: String = sub.chars().take(20).collect();
                                     ui.label(
                                         RichText::new(short_sub)
                                             .size(10.5)
@@ -1152,7 +1388,7 @@ impl eframe::App for Disc2App {
                                 |ui| {
                                     if ui
                                         .button("⚙️")
-                                        .on_hover_text("Personalizar Perfil e Tema do App")
+                                        .on_hover_text("Personalizar Perfil, Foto e Tema do App")
                                         .clicked()
                                     {
                                         self.show_settings_modal = true;
@@ -1173,11 +1409,10 @@ impl eframe::App for Disc2App {
                 egui::Frame::none()
                     .inner_margin(egui::Margin::same(12.0))
                     .show(ui, |ui| {
-                        // Cabeçalho da Sidebar
                         ui.horizontal(|ui| {
                             ui.colored_label(accent, RichText::new("● SZdisc").strong().size(17.0));
                             ui.label(
-                                RichText::new("Rust Screen")
+                                RichText::new("Rust Native")
                                     .size(11.0)
                                     .color(Color32::from_rgb(148, 155, 164)),
                             );
@@ -1197,7 +1432,6 @@ impl eframe::App for Disc2App {
                         ui.separator();
                         ui.add_space(8.0);
 
-                        // Botão Principal de Compartilhar Tela (abre o modal visual estilo Discord)
                         let share_label = if self.is_sharing {
                             "🖥️ Trocar Tela / Aplicativo / Guia"
                         } else {
@@ -1276,7 +1510,6 @@ impl eframe::App for Disc2App {
 
                         ui.add_space(12.0);
 
-                        // Participantes / Canal de Transmissão
                         ui.label(
                             RichText::new("NO PALCO AGORA")
                                 .size(10.5)
@@ -1291,16 +1524,11 @@ impl eframe::App for Disc2App {
                             .inner_margin(egui::Margin::same(8.0))
                             .show(ui, |ui| {
                                 ui.horizontal(|ui| {
-                                    let initial =
-                                        self.custom.display_name.chars().next().unwrap_or('U');
                                     draw_discord_avatar(
                                         ui,
-                                        30.0,
-                                        initial,
-                                        self.custom.avatar_color(),
-                                        self.custom.presence,
-                                        self.custom.avatar_ring_glow,
-                                        accent,
+                                        32.0,
+                                        &self.custom,
+                                        self.user_avatar_tex.as_ref(),
                                     );
                                     ui.vertical(|ui| {
                                         ui.label(
@@ -1310,7 +1538,7 @@ impl eframe::App for Disc2App {
                                             ))
                                             .strong()
                                             .size(12.5)
-                                            .color(Color32::WHITE),
+                                            .color(self.custom.name_color()),
                                         );
                                         let src_name = self
                                             .sources
@@ -1355,7 +1583,6 @@ impl eframe::App for Disc2App {
                         ui.separator();
                         ui.add_space(8.0);
 
-                        // Assistir Transmissão de Amigo
                         ui.label(
                             RichText::new("CONECTAR EM UMA SALA")
                                 .size(10.5)
@@ -1455,7 +1682,7 @@ impl eframe::App for Disc2App {
                     });
             });
 
-        // ======================== BARRA SUPERIOR DO PALCO (QUALIDADE EM TEMPO REAL) ========================
+        // ======================== BARRA SUPERIOR DO PALCO (QUALIDADE + ÁUDIO EM TEMPO REAL) ========================
         egui::TopBottomPanel::top("stage_top_bar")
             .exact_height(48.0)
             .frame(
@@ -1480,25 +1707,12 @@ impl eframe::App for Disc2App {
                             });
                     }
 
-                    ui.label(
-                        RichText::new(format!(
-                            "{} • {} FPS",
-                            self.res_preset.short_label(),
-                            self.fps_preset
-                        ))
-                        .strong()
-                        .size(13.0)
-                        .color(Color32::WHITE),
-                    );
-
-                    ui.separator();
-
                     // Seletor de Resolução em Tempo Real (1080p, 720p, 480p, 360p)
                     ui.label(RichText::new("Resolução:").size(12.0));
                     let prev_res = self.res_preset;
                     egui::ComboBox::from_id_salt("combo_res")
                         .selected_text(self.res_preset.label())
-                        .width(122.0)
+                        .width(120.0)
                         .show_ui(ui, |ui| {
                             ui.selectable_value(
                                 &mut self.res_preset,
@@ -1530,7 +1744,7 @@ impl eframe::App for Disc2App {
                     let prev_fps = self.fps_preset;
                     egui::ComboBox::from_id_salt("combo_fps")
                         .selected_text(format!("{} FPS", self.fps_preset))
-                        .width(74.0)
+                        .width(72.0)
                         .show_ui(ui, |ui| {
                             ui.selectable_value(&mut self.fps_preset, 60, "60 FPS");
                             ui.selectable_value(&mut self.fps_preset, 30, "30 FPS");
@@ -1541,7 +1755,6 @@ impl eframe::App for Disc2App {
                     }
 
                     // Seletor de Nitidez
-                    ui.label(RichText::new("Nitidez:").size(12.0));
                     let prev_q = self.jpeg_quality;
                     let q_label = match self.jpeg_quality {
                         90 => "Ultra (90%)",
@@ -1551,7 +1764,7 @@ impl eframe::App for Disc2App {
                     };
                     egui::ComboBox::from_id_salt("combo_quality")
                         .selected_text(q_label)
-                        .width(96.0)
+                        .width(92.0)
                         .show_ui(ui, |ui| {
                             ui.selectable_value(&mut self.jpeg_quality, 90, "Ultra (90%)");
                             ui.selectable_value(&mut self.jpeg_quality, 78, "Alta (78%)");
@@ -1562,11 +1775,34 @@ impl eframe::App for Disc2App {
                         self.sync_live_config();
                     }
 
+                    // Controle de Áudio (Host: Enviar Áudio | Viewer: Volume da Transmissão)
                     if self.is_sharing {
+                        let prev_aud = self.share_audio_enabled;
+                        ui.checkbox(&mut self.share_audio_enabled, "🔊 Áudio");
+                        if self.share_audio_enabled != prev_aud {
+                            self.sync_live_config();
+                        }
+
                         let prev_eco = self.eco_hide_preview;
                         ui.checkbox(&mut self.eco_hide_preview, "Modo Jogo");
                         if self.eco_hide_preview != prev_eco {
                             self.sync_live_config();
+                        }
+                    } else if self.viewer_client.is_some() {
+                        let mut muted = self.viewer_audio_muted.load(Ordering::Relaxed);
+                        if ui
+                            .button(if muted { "🔇 Mudo" } else { "🔊 Som" })
+                            .clicked()
+                        {
+                            muted = !muted;
+                            self.viewer_audio_muted.store(muted, Ordering::Relaxed);
+                        }
+                        let mut vol = self.viewer_volume_percent.load(Ordering::Relaxed);
+                        if ui
+                            .add(egui::Slider::new(&mut vol, 0..=150).suffix("%"))
+                            .changed()
+                        {
+                            self.viewer_volume_percent.store(vol, Ordering::Relaxed);
                         }
                     }
 
@@ -1634,22 +1870,29 @@ impl eframe::App for Disc2App {
                         });
                     }
                 } else {
-                    // Tela Inicial Elegante Estilo Palco do Discord + Card do Seu Perfil
                     ui.vertical_centered(|ui| {
-                        ui.add_space((avail.y * 0.14).max(16.0));
-                        draw_discord_profile_card(ui, &self.custom, false);
+                        ui.add_space((avail.y * 0.12).max(14.0));
+                        draw_discord_profile_card(
+                            ui,
+                            &self.custom,
+                            self.user_avatar_tex.as_ref(),
+                            self.user_banner_tex.as_ref(),
+                            false,
+                        );
 
                         ui.add_space(18.0);
                         ui.label(
-                            RichText::new("Pronto para Compartilhar sua Tela em 1080p 60fps")
-                                .font(FontId::proportional(19.0))
-                                .strong()
-                                .color(Color32::WHITE),
+                            RichText::new(
+                                "Pronto para Compartilhar sua Tela com Áudio em 1080p 60fps",
+                            )
+                            .font(FontId::proportional(18.5))
+                            .strong()
+                            .color(Color32::WHITE),
                         );
                         ui.add_space(6.0);
                         ui.label(
                             RichText::new(
-                                "Escolha entre Aplicativos/Jogos, Guias do Google Chrome/Navegadores ou Tela Inteira.\nVocê pode alterar para 720p, 480p ou 360p a qualquer momento.",
+                                "Transmita Aplicativos/Jogos, Guias do Google Chrome/Navegadores ou Tela Inteira com Áudio do Sistema.\nVocê pode alterar para 720p, 480p ou 360p a qualquer momento.",
                             )
                             .size(12.5)
                             .color(Color32::from_rgb(160, 166, 174)),
@@ -1657,7 +1900,7 @@ impl eframe::App for Disc2App {
                         ui.add_space(14.0);
 
                         ui.horizontal(|ui| {
-                            let pad = ((ui.available_width() - 390.0) * 0.5).max(0.0);
+                            let pad = ((ui.available_width() - 395.0) * 0.5).max(0.0);
                             ui.add_space(pad);
 
                             let share_hero = egui::Button::new(
@@ -1667,22 +1910,23 @@ impl eframe::App for Disc2App {
                                     .color(Color32::WHITE),
                             )
                             .fill(accent)
-                            .min_size(Vec2::new(235.0, 38.0));
+                            .min_size(Vec2::new(240.0, 38.0));
 
                             if ui.add(share_hero).clicked() {
                                 self.open_share_picker(ctx);
                             }
 
                             let cust_btn = egui::Button::new(
-                                RichText::new("🎨 Personalizar")
+                                RichText::new("📷 Foto e Perfil")
                                     .size(13.5)
                                     .strong()
                                     .color(Color32::WHITE),
                             )
                             .fill(card_bg)
-                            .min_size(Vec2::new(140.0, 38.0));
+                            .min_size(Vec2::new(145.0, 38.0));
 
                             if ui.add(cust_btn).clicked() {
+                                self.settings_tab = SettingsTab::Profile;
                                 self.show_settings_modal = true;
                             }
                         });
@@ -1692,9 +1936,15 @@ impl eframe::App for Disc2App {
                 // Popup do Perfil quando clicado no rodapé da barra lateral
                 if self.show_profile_popup {
                     egui::Area::new(egui::Id::new("discord_profile_popover"))
-                        .fixed_pos(egui::Pos2::new(14.0, avail.y - 210.0))
+                        .fixed_pos(egui::Pos2::new(14.0, avail.y - 220.0))
                         .show(ctx, |ui| {
-                            draw_discord_profile_card(ui, &self.custom, self.is_sharing);
+                            draw_discord_profile_card(
+                                ui,
+                                &self.custom,
+                                self.user_avatar_tex.as_ref(),
+                                self.user_banner_tex.as_ref(),
+                                self.is_sharing,
+                            );
                         });
                 }
 
@@ -1719,7 +1969,6 @@ impl eframe::App for Disc2App {
                 }
             });
 
-        // Modais Flutuantes
         self.render_share_picker_modal(ctx);
         self.render_settings_modal(ctx);
     }
@@ -1728,7 +1977,7 @@ impl eframe::App for Disc2App {
 fn main() -> eframe::Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_title("SZdisc — Screen Share Leve em Rust (1080p 60fps)")
+            .with_title("SZdisc — Screen Share Leve em Rust (1080p 60fps + Áudio)")
             .with_inner_size([1200.0, 740.0])
             .with_min_inner_size([900.0, 560.0]),
         ..Default::default()

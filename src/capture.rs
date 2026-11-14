@@ -1,21 +1,27 @@
 use std::ffi::OsString;
 use std::mem::{size_of, zeroed};
 use std::os::windows::ffi::OsStringExt;
+use std::path::Path;
 use std::ptr::null_mut;
 
 use winapi::shared::minwindef::{BOOL, DWORD, FALSE, LPARAM, TRUE, UINT};
 use winapi::shared::windef::{HDC, HMONITOR, HWND, RECT};
-use winapi::um::processthreadsapi::GetCurrentProcess;
+use winapi::um::dwmapi::{DwmGetWindowAttribute, DWMWA_CLOAKED};
+use winapi::um::handleapi::CloseHandle;
+use winapi::um::processthreadsapi::{GetCurrentProcess, OpenProcess};
 use winapi::um::psapi::{GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS};
+use winapi::um::winbase::QueryFullProcessImageNameW;
 use winapi::um::wingdi::{
     BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, DeleteDC, DeleteObject, GetDIBits,
     SelectObject, SetStretchBltMode, StretchBlt, BI_RGB, BITMAPINFO, BITMAPINFOHEADER,
     COLORONCOLOR, DIB_RGB_COLORS, SRCCOPY,
 };
+use winapi::um::winnt::PROCESS_QUERY_LIMITED_INFORMATION;
 use winapi::um::winuser::{
     DrawIconEx, EnumDisplayMonitors, EnumWindows, GetCursorInfo, GetDesktopWindow, GetMonitorInfoW,
-    GetWindowDC, GetWindowRect, GetWindowTextLengthW, GetWindowTextW, IsIconic, IsWindowVisible,
-    PrintWindow, ReleaseDC, CURSORINFO, CURSOR_SHOWING, MONITORINFOEXW,
+    GetWindowDC, GetWindowLongW, GetWindowRect, GetWindowTextLengthW, GetWindowTextW,
+    GetWindowThreadProcessId, IsIconic, IsWindowVisible, PrintWindow, ReleaseDC, CURSORINFO,
+    CURSOR_SHOWING, GWL_EXSTYLE, MONITORINFOEXW, WS_EX_TOOLWINDOW,
 };
 
 const DI_NORMAL: UINT = 0x0003;
@@ -46,6 +52,7 @@ pub struct CaptureSource {
     pub id: String,
     pub name: String,
     pub subtitle: String,
+    pub exe_name: String,
     pub category: SourceCategory,
     pub kind: CaptureSourceKind,
 }
@@ -55,6 +62,37 @@ pub struct RawFrame {
     pub height: u32,
     pub rgb: Vec<u8>,
     pub rgba: Vec<u8>,
+}
+
+unsafe fn get_window_exe_name(hwnd: HWND) -> String {
+    let mut pid: DWORD = 0;
+    GetWindowThreadProcessId(hwnd, &mut pid);
+    if pid == 0 {
+        return String::new();
+    }
+
+    let h_proc = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    if h_proc.is_null() {
+        return String::new();
+    }
+
+    let mut buf = [0u16; 512];
+    let mut size: DWORD = buf.len() as DWORD;
+    let ok = QueryFullProcessImageNameW(h_proc, 0, buf.as_mut_ptr(), &mut size);
+    CloseHandle(h_proc);
+
+    if ok == 0 || size == 0 {
+        return String::new();
+    }
+
+    let full_path = OsString::from_wide(&buf[..size as usize])
+        .to_string_lossy()
+        .to_string();
+
+    Path::new(&full_path)
+        .file_name()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_default()
 }
 
 unsafe extern "system" fn monitor_enum_proc(
@@ -71,7 +109,11 @@ unsafe extern "system" fn monitor_enum_proc(
         let rc = info.rcMonitor;
         let w = rc.right - rc.left;
         let h = rc.bottom - rc.top;
-        let idx = list.iter().filter(|s| s.category == SourceCategory::Screen).count() + 1;
+        let idx = list
+            .iter()
+            .filter(|s| s.category == SourceCategory::Screen)
+            .count()
+            + 1;
         let is_primary = (info.dwFlags & 1) != 0;
         let label = if is_primary {
             format!("Tela {} (Principal)", idx)
@@ -82,7 +124,8 @@ unsafe extern "system" fn monitor_enum_proc(
         list.push(CaptureSource {
             id: format!("screen:{}", idx),
             name: label,
-            subtitle: format!("Monitor Completo • {}×{}", w, h),
+            subtitle: format!("🖥️ Monitor Completo • {}×{}", w, h),
+            exe_name: "Monitor".to_string(),
             category: SourceCategory::Screen,
             kind: CaptureSourceKind::Monitor {
                 index: idx,
@@ -96,64 +139,116 @@ unsafe extern "system" fn monitor_enum_proc(
     TRUE
 }
 
-fn classify_window_title(raw_title: &str, w: i32, h: i32) -> (String, String, SourceCategory) {
+fn classify_window(
+    raw_title: &str,
+    exe_name: &str,
+    w: i32,
+    h: i32,
+    minimized: bool,
+) -> (String, String, SourceCategory) {
+    let exe_lower = exe_name.to_lowercase();
+    let is_browser_exe = matches!(
+        exe_lower.as_str(),
+        "chrome.exe"
+            | "msedge.exe"
+            | "firefox.exe"
+            | "brave.exe"
+            | "opera.exe"
+            | "vivaldi.exe"
+            | "waterfox.exe"
+            | "librewolf.exe"
+            | "thorium.exe"
+            | "arc.exe"
+            | "zen.exe"
+    );
+
     let browser_suffixes = [
         (" - Google Chrome", "Google Chrome"),
         (" — Mozilla Firefox", "Mozilla Firefox"),
         (" - Microsoft​ Edge", "Microsoft Edge"),
         (" - Microsoft Edge", "Microsoft Edge"),
-        (" - Brave", "Brave Browser"),
+        (" - Pessoal — Microsoft​ Edge", "Microsoft Edge"),
+        (" - Brave", "Brave"),
         (" - Opera", "Opera"),
+        (" - Opera GX", "Opera GX"),
         (" - Vivaldi", "Vivaldi"),
     ];
 
-    for (suffix, browser_name) in browser_suffixes {
+    for (suffix, b_label) in browser_suffixes {
         if let Some(stripped) = raw_title.strip_suffix(suffix) {
             let clean_tab = if stripped.trim().is_empty() {
                 raw_title.to_string()
             } else {
                 stripped.trim().to_string()
             };
+            let state_str = if minimized {
+                "Minimizado".to_string()
+            } else {
+                format!("{}×{}", w, h)
+            };
             return (
                 clean_tab,
-                format!("🌐 {} • {}×{}", browser_name, w, h),
+                format!("🌐 {} • {}", b_label, state_str),
                 SourceCategory::Browser,
             );
         }
     }
 
-    let lower = raw_title.to_lowercase();
-    if lower.contains("google chrome")
-        || lower.contains("microsoft edge")
-        || lower.contains("mozilla firefox")
-        || lower.contains("brave")
-        || lower.contains("opera")
-    {
+    if is_browser_exe {
+        let friendly_browser = match exe_lower.as_str() {
+            "chrome.exe" => "Google Chrome",
+            "msedge.exe" => "Microsoft Edge",
+            "firefox.exe" => "Mozilla Firefox",
+            "brave.exe" => "Brave",
+            "opera.exe" => "Opera",
+            "vivaldi.exe" => "Vivaldi",
+            _ => exe_name,
+        };
+        let state_str = if minimized {
+            "Minimizado".to_string()
+        } else {
+            format!("{}×{}", w, h)
+        };
         return (
             raw_title.to_string(),
-            format!("🌐 Navegador Web • {}×{}", w, h),
+            format!("🌐 {} • {}", friendly_browser, state_str),
             SourceCategory::Browser,
         );
     }
 
-    // Separa nome do documento e nome do aplicativo se houver " - "
-    if let Some((left, right)) = raw_title.rsplit_once(" - ") {
-        return (
-            left.trim().to_string(),
-            format!("🎮 {} • {}×{}", right.trim(), w, h),
-            SourceCategory::Application,
-        );
-    }
+    let friendly_app = if !exe_name.is_empty() {
+        exe_name.trim_end_matches(".exe").trim_end_matches(".EXE")
+    } else {
+        "Aplicativo"
+    };
+
+    let state_str = if minimized {
+        "Minimizado".to_string()
+    } else {
+        format!("{}×{}", w, h)
+    };
 
     (
         raw_title.to_string(),
-        format!("🪟 Aplicativo • {}×{}", w, h),
+        format!("🪟 {} • {}", friendly_app, state_str),
         SourceCategory::Application,
     )
 }
 
 unsafe extern "system" fn window_enum_proc(hwnd: HWND, lparam: LPARAM) -> BOOL {
-    if IsWindowVisible(hwnd) == 0 || IsIconic(hwnd) != 0 {
+    if IsWindowVisible(hwnd) == 0 {
+        return TRUE;
+    }
+
+    // Filtra apenas janelas ocultas do sistema operacional (DWM Cloaked), mas mantém janelas reais e minimizadas
+    let mut cloaked: DWORD = 0;
+    let _ = DwmGetWindowAttribute(
+        hwnd,
+        DWMWA_CLOAKED,
+        &mut cloaked as *mut _ as *mut _,
+        size_of::<DWORD>() as DWORD,
+    );
+    if cloaked != 0 {
         return TRUE;
     }
 
@@ -175,32 +270,40 @@ unsafe extern "system" fn window_enum_proc(hwnd: HWND, lparam: LPARAM) -> BOOL {
 
     if title.is_empty()
         || title == "Program Manager"
-        || title == "Settings"
-        || title == "Configurações"
         || title == "Windows Input Experience"
-        || title.starts_with("DISC2")
-        || title.starts_with("SZdisc")
+        || title == "MSCTFIME UI"
+        || title == "Default IME"
+        || title.starts_with("SZdisc —")
+        || title.starts_with("DISC2 —")
     {
         return TRUE;
     }
+
+    let ex_style = GetWindowLongW(hwnd, GWL_EXSTYLE) as u32;
+    let is_minimized = IsIconic(hwnd) != 0;
 
     let mut rect: RECT = zeroed();
     if GetWindowRect(hwnd, &mut rect) == 0 {
         return TRUE;
     }
-    let w = rect.right - rect.left;
-    let h = rect.bottom - rect.top;
-    if w < 140 || h < 90 {
+    let w = (rect.right - rect.left).max(0);
+    let h = (rect.bottom - rect.top).max(0);
+
+    // Ignora apenas pequenos tooltips flutuantes invisíveis quando não estão minimizados
+    if !is_minimized && (w < 60 || h < 40) && (ex_style & WS_EX_TOOLWINDOW) != 0 {
         return TRUE;
     }
 
-    let (clean_name, subtitle, category) = classify_window_title(&title, w, h);
+    let exe_name = get_window_exe_name(hwnd);
+    let (clean_name, subtitle, category) =
+        classify_window(&title, &exe_name, w, h, is_minimized);
 
     let list = &mut *(lparam as *mut Vec<CaptureSource>);
     list.push(CaptureSource {
         id: format!("window:{}", hwnd as usize),
         name: clean_name,
         subtitle,
+        exe_name,
         category,
         kind: CaptureSourceKind::Window {
             hwnd: hwnd as usize,
@@ -224,13 +327,15 @@ pub fn list_capture_sources() -> Vec<CaptureSource> {
     sources
 }
 
-/// Gera uma miniatura RGBA rápida para o seletor visual de telas/aplicativos/guias estilo Discord
-pub fn capture_thumbnail_rgba(source: &CaptureSource, thumb_w: u32, thumb_h: u32) -> Option<(u32, u32, Vec<u8>)> {
+pub fn capture_thumbnail_rgba(
+    source: &CaptureSource,
+    thumb_w: u32,
+    thumb_h: u32,
+) -> Option<(u32, u32, Vec<u8>)> {
     let frame = capture_frame(source, thumb_w, thumb_h, true, false)?;
     Some((frame.width, frame.height, frame.rgba))
 }
 
-/// Captura um quadro da tela ou janela selecionada já escalado para `(target_w, target_h)`
 pub fn capture_frame(
     source: &CaptureSource,
     target_w: u32,
@@ -260,6 +365,9 @@ pub fn capture_frame(
             ),
             CaptureSourceKind::Window { hwnd } => {
                 let hwnd_ptr = hwnd as HWND;
+                if IsIconic(hwnd_ptr) != 0 {
+                    return None;
+                }
                 let mut rect: RECT = zeroed();
                 if GetWindowRect(hwnd_ptr, &mut rect) == 0 {
                     return None;
@@ -307,17 +415,13 @@ unsafe fn capture_region(
     let out_h = (((src_h as f32 * scale) as u32) & !1).max(64);
 
     let desktop_hwnd = GetDesktopWindow();
-    let src_dc = if is_window && !hwnd.is_null() {
-        GetWindowDC(hwnd)
-    } else {
-        GetWindowDC(desktop_hwnd)
-    };
-    if src_dc.is_null() {
+    let desktop_dc = GetWindowDC(desktop_hwnd);
+    if desktop_dc.is_null() {
         return None;
     }
 
-    let mem_dc = CreateCompatibleDC(src_dc);
-    let bmp = CreateCompatibleBitmap(src_dc, out_w as i32, out_h as i32);
+    let mem_dc = CreateCompatibleDC(desktop_dc);
+    let bmp = CreateCompatibleBitmap(desktop_dc, out_w as i32, out_h as i32);
     if mem_dc.is_null() || bmp.is_null() {
         if !mem_dc.is_null() {
             DeleteDC(mem_dc);
@@ -325,24 +429,35 @@ unsafe fn capture_region(
         if !bmp.is_null() {
             DeleteObject(bmp as *mut _);
         }
-        ReleaseDC(if is_window { hwnd } else { desktop_hwnd }, src_dc);
+        ReleaseDC(desktop_hwnd, desktop_dc);
         return None;
     }
 
     let old_obj = SelectObject(mem_dc, bmp as *mut _);
 
     if is_window && !hwnd.is_null() {
-        let full_dc = CreateCompatibleDC(src_dc);
-        let full_bmp = CreateCompatibleBitmap(src_dc, src_w, src_h);
+        let win_dc = GetWindowDC(hwnd);
+        let full_dc = CreateCompatibleDC(desktop_dc);
+        let full_bmp = CreateCompatibleBitmap(desktop_dc, src_w, src_h);
         let old_full = SelectObject(full_dc, full_bmp as *mut _);
 
         let ok = PrintWindow(hwnd, full_dc, 2);
-        if ok == FALSE {
-            BitBlt(full_dc, 0, 0, src_w, src_h, src_dc, 0, 0, SRCCOPY);
+        if ok == FALSE && !win_dc.is_null() {
+            BitBlt(full_dc, 0, 0, src_w, src_h, win_dc, 0, 0, SRCCOPY);
         }
 
         if out_w as i32 == src_w && out_h as i32 == src_h {
-            BitBlt(mem_dc, 0, 0, out_w as i32, out_h as i32, full_dc, 0, 0, SRCCOPY);
+            BitBlt(
+                mem_dc,
+                0,
+                0,
+                out_w as i32,
+                out_h as i32,
+                full_dc,
+                0,
+                0,
+                SRCCOPY,
+            );
         } else {
             SetStretchBltMode(mem_dc, COLORONCOLOR);
             StretchBlt(
@@ -363,6 +478,9 @@ unsafe fn capture_region(
         SelectObject(full_dc, old_full);
         DeleteObject(full_bmp as *mut _);
         DeleteDC(full_dc);
+        if !win_dc.is_null() {
+            ReleaseDC(hwnd, win_dc);
+        }
     } else {
         if out_w as i32 == src_w && out_h as i32 == src_h {
             BitBlt(
@@ -371,7 +489,7 @@ unsafe fn capture_region(
                 0,
                 out_w as i32,
                 out_h as i32,
-                src_dc,
+                desktop_dc,
                 src_left,
                 src_top,
                 SRCCOPY,
@@ -384,7 +502,7 @@ unsafe fn capture_region(
                 0,
                 out_w as i32,
                 out_h as i32,
-                src_dc,
+                desktop_dc,
                 src_left,
                 src_top,
                 src_w,
@@ -392,16 +510,16 @@ unsafe fn capture_region(
                 SRCCOPY,
             );
         }
+    }
 
-        if draw_cursor {
-            let mut ci: CURSORINFO = zeroed();
-            ci.cbSize = size_of::<CURSORINFO>() as DWORD;
-            if GetCursorInfo(&mut ci) != 0 && (ci.flags & CURSOR_SHOWING) != 0 {
-                let cx = ((ci.ptScreenPos.x - src_left) as f32 * scale) as i32;
-                let cy = ((ci.ptScreenPos.y - src_top) as f32 * scale) as i32;
-                if cx >= 0 && cy >= 0 && cx < out_w as i32 && cy < out_h as i32 {
-                    DrawIconEx(mem_dc, cx, cy, ci.hCursor, 0, 0, 0, null_mut(), DI_NORMAL);
-                }
+    if draw_cursor {
+        let mut ci: CURSORINFO = zeroed();
+        ci.cbSize = size_of::<CURSORINFO>() as DWORD;
+        if GetCursorInfo(&mut ci) != 0 && (ci.flags & CURSOR_SHOWING) != 0 {
+            let cx = ((ci.ptScreenPos.x - src_left) as f32 * scale) as i32;
+            let cy = ((ci.ptScreenPos.y - src_top) as f32 * scale) as i32;
+            if cx >= 0 && cy >= 0 && cx < out_w as i32 && cy < out_h as i32 {
+                DrawIconEx(mem_dc, cx, cy, ci.hCursor, 0, 0, 0, null_mut(), DI_NORMAL);
             }
         }
     }
@@ -417,7 +535,7 @@ unsafe fn capture_region(
     let pixel_count = (out_w * out_h) as usize;
     let mut bgra = vec![0u8; pixel_count * 4];
 
-    let lines = GetDIBits(
+    let mut lines = GetDIBits(
         mem_dc,
         bmp,
         0,
@@ -427,10 +545,43 @@ unsafe fn capture_region(
         DIB_RGB_COLORS,
     );
 
+    // Se a janela acelerada por GPU retornou imagem totalmente preta no PrintWindow, faz fallback automático pelo Desktop DC
+    if is_window && lines > 0 {
+        let is_all_black = bgra
+            .iter()
+            .step_by(64)
+            .all(|&b| b == 0);
+        if is_all_black {
+            SetStretchBltMode(mem_dc, COLORONCOLOR);
+            StretchBlt(
+                mem_dc,
+                0,
+                0,
+                out_w as i32,
+                out_h as i32,
+                desktop_dc,
+                src_left,
+                src_top,
+                src_w,
+                src_h,
+                SRCCOPY,
+            );
+            lines = GetDIBits(
+                mem_dc,
+                bmp,
+                0,
+                out_h,
+                bgra.as_mut_ptr() as *mut _,
+                &mut bmi,
+                DIB_RGB_COLORS,
+            );
+        }
+    }
+
     SelectObject(mem_dc, old_obj);
     DeleteObject(bmp as *mut _);
     DeleteDC(mem_dc);
-    ReleaseDC(if is_window { hwnd } else { desktop_hwnd }, src_dc);
+    ReleaseDC(desktop_hwnd, desktop_dc);
 
     if lines == 0 {
         return None;

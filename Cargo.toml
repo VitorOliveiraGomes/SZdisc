@@ -1,21 +1,33 @@
 [package]
 name = "disc2"
-version = "2.0.0"
+version = "2.1.0"
 edition = "2021"
-description = "Aplicativo nativo ultra-leve em Rust para transmissao de tela em 1080p 60fps"
+description = "Aplicativo nativo ultra-leve em Rust para transmissao de tela e audio em 1080p 60fps"
 
 [dependencies]
 eframe = { version = "0.29", default-features = false, features = ["glow", "default_fonts"] }
 egui = "0.29"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "bmp"] }
 jpeg-encoder = "0.6"
 zune-jpeg = "0.4"
 winapi = { version = "0.3", features = [
   "winuser",
   "wingdi",
   "windef",
+  "winbase",
+  "winnt",
   "processthreadsapi",
   "psapi",
-  "libloaderapi"
+  "libloaderapi",
+  "commdlg",
+  "dwmapi",
+  "mmdeviceapi",
+  "audioclient",
+  "audiosessiontypes",
+  "combaseapi",
+  "objbase",
+  "mmsystem",
+  "mmreg"
 ] }
 
 [profile.release]
