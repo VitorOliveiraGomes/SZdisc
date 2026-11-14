@@ -24,7 +24,7 @@ use eframe::egui::{
 };
 use jpeg_encoder::{ColorType, Encoder, SamplingFactor};
 use network::{
-    generate_peer_id, start_lan_discovery_listener, DiscoveredRoom, PeerInfo, RoomHub,
+    derive_persistent_peer_id, start_lan_discovery_listener, DiscoveredRoom, PeerInfo, RoomHub,
 };
 use profile_theme::{
     draw_discord_avatar, draw_discord_profile_card, load_banner_texture,
@@ -135,7 +135,7 @@ struct Disc2App {
     eco_hide_preview: bool,
     show_own_preview_in_grid: bool,
 
-    // Sala Única Bidirecional (sempre pronta, nunca recria ao trocar de janela!)
+    // Sala Única Bidirecional (Estilo Discord)
     room_hub: Option<Arc<RoomHub>>,
     join_addr_input: String,
     remote_tiles: HashMap<u32, RemoteTileState>,
@@ -147,7 +147,7 @@ struct Disc2App {
     capture_stop_flag: Option<Arc<AtomicBool>>,
     local_preview_rx: Option<Receiver<LocalPreviewFrame>>,
 
-    // Salas Descobertas na Rede / VPN (ignorando nossa própria sala)
+    // Salas Descobertas na Rede / Radmin VPN
     discovered_rooms: Arc<Mutex<HashMap<u32, DiscoveredRoom>>>,
 
     // Textura do Vídeo Local e Telemetria
@@ -185,13 +185,17 @@ impl Disc2App {
             None
         };
 
-        let my_peer_id = generate_peer_id();
         let initial_name = if custom.display_name.trim().is_empty() {
             "Jogador".to_string()
         } else {
             custom.display_name.clone()
         };
-        let room_hub = RoomHub::start(my_peer_id, initial_name, cc.egui_ctx.clone()).ok();
+        let initial_peer_id = derive_persistent_peer_id(&initial_name, &custom.user_tag);
+        let room_hub = RoomHub::start(initial_peer_id, initial_name, cc.egui_ctx.clone()).ok();
+        let peer_id_atomic = room_hub
+            .as_ref()
+            .map(|h| Arc::clone(&h.my_peer_id))
+            .unwrap_or_else(|| Arc::new(AtomicU32::new(initial_peer_id)));
 
         let sources = list_capture_sources();
         let initial_pid = sources.first().map(|s| s.pid).unwrap_or(0);
@@ -236,7 +240,7 @@ impl Disc2App {
             stream_config,
             capture_stop_flag: None,
             local_preview_rx: None,
-            discovered_rooms: start_lan_discovery_listener(my_peer_id),
+            discovered_rooms: start_lan_discovery_listener(peer_id_atomic),
             local_video_texture: None,
             local_video_size: (0, 0),
             local_measured_fps: 0,
@@ -339,7 +343,12 @@ impl Disc2App {
 
         let res_lbl = self.current_res_status_label();
         if let Some(hub) = &self.room_hub {
-            hub.update_my_status(self.custom.display_name.clone(), self.is_sharing, res_lbl);
+            hub.update_my_status(
+                self.custom.display_name.clone(),
+                &self.custom.user_tag,
+                self.is_sharing,
+                res_lbl,
+            );
         }
     }
 
@@ -351,6 +360,13 @@ impl Disc2App {
         if self.sources.is_empty() {
             self.show_toast("Nenhuma tela ou janela encontrada para capturar.");
             return;
+        }
+
+        // Se o usuário estava "Fora da Sala", reabre a sala automaticamente ao transmitir
+        if let Some(hub) = &self.room_hub {
+            if !hub.in_room.load(Ordering::Relaxed) {
+                hub.reopen_my_room();
+            }
         }
 
         // Se já estamos transmitindo, apenas troca a janela/aplicativo em tempo real na MESMA sala!
@@ -485,10 +501,22 @@ impl Disc2App {
         if let Some(hub) = &self.room_hub {
             hub.update_my_status(
                 self.custom.display_name.clone(),
+                &self.custom.user_tag,
                 false,
                 "Na sala".to_string(),
             );
         }
+    }
+
+    /// Sai completamente da sala (estilo botão Desconectar do Discord)
+    fn leave_room(&mut self) {
+        self.stop_sharing();
+        self.remote_tiles.clear();
+        self.focused_tile_id = None;
+        if let Some(hub) = &self.room_hub {
+            hub.leave_room_completely();
+        }
+        self.show_toast("Você saiu da sala.");
     }
 
     fn upload_local_rgba_to_gpu(&mut self, ctx: &Context, width: u32, height: u32, rgba: Vec<u8>) {
@@ -665,6 +693,7 @@ impl Disc2App {
                                 if let Some(hub) = &self.room_hub {
                                     hub.update_my_status(
                                         self.custom.display_name.clone(),
+                                        &self.custom.user_tag,
                                         self.is_sharing,
                                         res_lbl,
                                     );
@@ -999,11 +1028,9 @@ impl Disc2App {
                                     self.fps_preset = fps;
                                 }
                             }
-                        });
 
-                        ui.add_space(8.0);
+                            ui.separator();
 
-                        ui.horizontal(|ui| {
                             ui.checkbox(
                                 &mut self.share_audio_enabled,
                                 RichText::new("🔊 Compartilhar Áudio").size(12.0).strong(),
@@ -1285,11 +1312,12 @@ impl Disc2App {
                                 ui.add_space(6.0);
                                 if ui
                                     .button(
-                                        RichText::new("🚪 Trocar de Conta / Sair")
+                                        RichText::new("🚪 Trocar de Conta / Fazer Logout")
                                             .color(Color32::from_rgb(242, 63, 67)),
                                     )
                                     .clicked()
                                 {
+                                    self.leave_room();
                                     self.custom.account_created = false;
                                     self.custom.save_to_disk();
                                     self.show_settings_modal = false;
@@ -1776,21 +1804,27 @@ impl eframe::App for Disc2App {
         let stage_bg = self.custom.stage_color();
         let card_bg = self.custom.card_color();
 
-        // ======================== BARRA LATERAL ESQUERDA (SALA COMPARTILHADA + PESSOAS NA SALA) ========================
+        let in_room = self
+            .room_hub
+            .as_ref()
+            .map(|h| h.in_room.load(Ordering::Relaxed))
+            .unwrap_or(false);
+
+        // ======================== BARRA LATERAL ESQUERDA (IDÊNTICA AO DISCORD) ========================
         egui::SidePanel::left("sidebar_panel")
             .resizable(false)
-            .exact_width(292.0)
+            .exact_width(296.0)
             .frame(egui::Frame::none().fill(sidebar_bg))
             .show(ctx, |ui| {
-                // Rodapé fixo do Perfil de Usuário
+                // 1. Rodapé inferior fixo: Perfil do Usuário (igual ao Discord)
                 egui::TopBottomPanel::bottom("discord_user_footer")
-                    .exact_height(62.0)
+                    .exact_height(60.0)
                     .frame(
                         egui::Frame::none()
                             .fill(Color32::from_rgb(
-                                self.custom.bg_sidebar_rgb[0].saturating_sub(7),
-                                self.custom.bg_sidebar_rgb[1].saturating_sub(7),
-                                self.custom.bg_sidebar_rgb[2].saturating_sub(8),
+                                self.custom.bg_sidebar_rgb[0].saturating_sub(8),
+                                self.custom.bg_sidebar_rgb[1].saturating_sub(8),
+                                self.custom.bg_sidebar_rgb[2].saturating_sub(9),
                             ))
                             .inner_margin(egui::Margin::symmetric(10.0, 8.0)),
                     )
@@ -1798,7 +1832,7 @@ impl eframe::App for Disc2App {
                         ui.horizontal_centered(|ui| {
                             draw_discord_avatar(
                                 ui,
-                                38.0,
+                                36.0,
                                 &self.custom,
                                 self.user_avatar_tex.as_ref(),
                             );
@@ -1813,18 +1847,16 @@ impl eframe::App for Disc2App {
                                     );
                                     let sub = if self.is_sharing {
                                         format!(
-                                            "🔴 {} {}fps",
-                                            self.res_preset.short_label(),
-                                            self.fps_preset
+                                            "🔴 Transmitindo {}",
+                                            self.res_preset.short_label()
                                         )
-                                    } else if !self.custom.custom_status.is_empty() {
-                                        self.custom.custom_status.clone()
+                                    } else if in_room {
+                                        "🟢 Conectado na sala".to_string()
                                     } else {
-                                        self.custom.presence.label().to_string()
+                                        "⚪ Fora da sala".to_string()
                                     };
-                                    let short_sub: String = sub.chars().take(20).collect();
                                     ui.label(
-                                        RichText::new(short_sub)
+                                        RichText::new(sub)
                                             .size(10.5)
                                             .color(Color32::from_rgb(160, 166, 174)),
                                     );
@@ -1841,24 +1873,143 @@ impl eframe::App for Disc2App {
                                 |ui| {
                                     if ui
                                         .button("⚙️")
-                                        .on_hover_text("Personalizar Conta, Foto e Tema do App")
+                                        .on_hover_text("Configurações de Conta, Foto e Aparência")
                                         .clicked()
                                     {
                                         self.show_settings_modal = true;
-                                    }
-                                    if ui
-                                        .button("🖥️")
-                                        .on_hover_text("Escolher ou Trocar Tela / Jogo")
-                                        .clicked()
-                                    {
-                                        self.open_share_picker(ctx);
                                     }
                                 },
                             );
                         });
                     });
 
-                // Conteúdo principal da Barra Lateral
+                // 2. Painel de Controle de Conexão (logo acima do perfil, IGUAL ao "Voz Conectada" do Discord!)
+                egui::TopBottomPanel::bottom("discord_voice_connected_panel")
+                    .exact_height(if self.is_sharing { 112.0 } else { 82.0 })
+                    .frame(
+                        egui::Frame::none()
+                            .fill(Color32::from_rgb(
+                                self.custom.bg_sidebar_rgb[0].saturating_sub(4),
+                                self.custom.bg_sidebar_rgb[1].saturating_sub(4),
+                                self.custom.bg_sidebar_rgb[2].saturating_sub(5),
+                            ))
+                            .stroke(Stroke::new(
+                                1.0_f32,
+                                Color32::from_rgba_unmultiplied(255, 255, 255, 15),
+                            ))
+                            .inner_margin(egui::Margin::symmetric(10.0, 8.0)),
+                    )
+                    .show_inside(ui, |ui| {
+                        let joined_label = self
+                            .room_hub
+                            .as_ref()
+                            .and_then(|h| h.joined_room_label.lock().ok().and_then(|g| g.clone()));
+
+                        ui.horizontal(|ui| {
+                            if in_room {
+                                ui.colored_label(
+                                    Color32::from_rgb(35, 165, 90),
+                                    RichText::new(if let Some(ref j) = joined_label {
+                                        format!("🟢 Conectado: {}", j)
+                                    } else {
+                                        "🟢 Sala Conectada".to_string()
+                                    })
+                                    .strong()
+                                    .size(12.0),
+                                );
+                            } else {
+                                ui.colored_label(
+                                    Color32::from_rgb(148, 155, 164),
+                                    RichText::new("⚪ Desconectado da Sala")
+                                        .strong()
+                                        .size(12.0),
+                                );
+                            }
+                        });
+
+                        ui.add_space(5.0);
+
+                        if in_room {
+                            ui.columns(2, |cols| {
+                                let share_txt = if self.is_sharing {
+                                    "🔄 Trocar Tela"
+                                } else {
+                                    "🖥️ Tela"
+                                };
+                                let share_btn = egui::Button::new(
+                                    RichText::new(share_txt)
+                                        .size(12.0)
+                                        .strong()
+                                        .color(Color32::WHITE),
+                                )
+                                .fill(if self.is_sharing {
+                                    accent
+                                } else {
+                                    Color32::from_rgb(43, 45, 49)
+                                })
+                                .min_size(Vec2::new(cols[0].available_width(), 32.0));
+
+                                if cols[0]
+                                    .add(share_btn)
+                                    .on_hover_text("Compartilhar ou trocar a janela transmitida")
+                                    .clicked()
+                                {
+                                    self.open_share_picker(ctx);
+                                }
+
+                                let leave_btn = egui::Button::new(
+                                    RichText::new("📞 Sair da Sala")
+                                        .size(12.0)
+                                        .strong()
+                                        .color(Color32::WHITE),
+                                )
+                                .fill(Color32::from_rgb(218, 55, 60))
+                                .min_size(Vec2::new(cols[1].available_width(), 32.0));
+
+                                if cols[1]
+                                    .add(leave_btn)
+                                    .on_hover_text("Desconectar completamente da sala atual")
+                                    .clicked()
+                                {
+                                    self.leave_room();
+                                }
+                            });
+
+                            if self.is_sharing {
+                                ui.add_space(5.0);
+                                let stop_stream_btn = egui::Button::new(
+                                    RichText::new("⏹ Parar Transmissão (Continuar na Sala)")
+                                        .size(11.5)
+                                        .strong()
+                                        .color(Color32::WHITE),
+                                )
+                                .fill(Color32::from_rgb(180, 45, 50))
+                                .min_size(Vec2::new(ui.available_width(), 26.0));
+
+                                if ui.add(stop_stream_btn).clicked() {
+                                    self.stop_sharing();
+                                }
+                            }
+                        } else {
+                            let enter_my_room_btn = egui::Button::new(
+                                RichText::new("🔊 Entrar na Minha Sala")
+                                    .size(12.5)
+                                    .strong()
+                                    .color(Color32::WHITE),
+                            )
+                            .fill(Color32::from_rgb(35, 165, 90))
+                            .min_size(Vec2::new(ui.available_width(), 34.0));
+
+                            if ui.add(enter_my_room_btn).clicked() {
+                                if let Some(hub) = &self.room_hub {
+                                    hub.reopen_my_room();
+                                }
+                                self.show_toast("Você entrou na sua sala!");
+                            }
+                        }
+                    });
+
+                // 3. Conteúdo principal da Barra Lateral (Canais, Convite e Salas no Radmin)
                 egui::Frame::none()
                     .inner_margin(egui::Margin::same(12.0))
                     .show(ui, |ui| {
@@ -1885,84 +2036,40 @@ impl eframe::App for Disc2App {
                         ui.separator();
                         ui.add_space(6.0);
 
-                        // 1. CARTÃO DA SALA (CÓDIGO FIXO - NÃO MUDA AO TROCAR DE TELA)
-                        let joined_label = self
-                            .room_hub
-                            .as_ref()
-                            .and_then(|h| h.joined_room_label.lock().ok().and_then(|g| g.clone()));
-
-                        if let Some(j_lbl) = joined_label {
-                            egui::Frame::none()
-                                .fill(Color32::from_rgb(20, 42, 30))
-                                .stroke(Stroke::new(1.0_f32, Color32::from_rgb(35, 165, 90)))
-                                .rounding(Rounding::same(7.0))
-                                .inner_margin(egui::Margin::same(9.0))
-                                .show(ui, |ui| {
-                                    ui.horizontal(|ui| {
-                                        ui.colored_label(
-                                            Color32::from_rgb(134, 239, 172),
-                                            RichText::new(format!("🟢 Conectado: {}", j_lbl))
-                                                .strong()
-                                                .size(12.5),
-                                        );
-                                        ui.with_layout(
-                                            egui::Layout::right_to_left(egui::Align::Center),
-                                            |ui| {
-                                                if ui.small_button("🚪 Sair").clicked() {
-                                                    if let Some(hub) = &self.room_hub {
-                                                        hub.leave_joined_rooms();
-                                                    }
-                                                }
-                                            },
-                                        );
-                                    });
-                                    ui.label(
-                                        RichText::new(
-                                            "Você e seu amigo estão na mesma sala! Qualquer um pode compartilhar a tela abaixo.",
-                                        )
-                                        .size(10.5)
-                                        .color(Color32::from_rgb(181, 186, 193)),
-                                    );
-                                });
-                        } else if let Some(hub) = &self.room_hub {
-                            let addr = hub.listen_addr.clone();
+                        // Bloco de Convite Rápido (Código Sem Radmin + IP Radmin)
+                        if let Some(hub) = &self.room_hub {
                             let net_code = hub
                                 .internet_code
                                 .lock()
                                 .ok()
                                 .and_then(|g| g.clone());
+                            let radmin_ip = hub
+                                .radmin_addr
+                                .lock()
+                                .ok()
+                                .and_then(|g| g.clone());
+                            let lan_ip = hub.listen_addr.clone();
 
                             egui::Frame::none()
                                 .fill(card_bg)
-                                .stroke(Stroke::new(
-                                    1.0_f32,
-                                    Color32::from_rgba_unmultiplied(255, 255, 255, 22),
-                                ))
                                 .rounding(Rounding::same(7.0))
-                                .inner_margin(egui::Margin::same(9.0))
+                                .inner_margin(egui::Margin::same(8.0))
                                 .show(ui, |ui| {
-                                    ui.label(
-                                        RichText::new("CÓDIGO DA SUA SALA (ENVIE AO AMIGO)")
-                                            .size(10.0)
-                                            .strong()
-                                            .color(Color32::from_rgb(148, 155, 164)),
-                                    );
-                                    ui.add_space(3.0);
                                     if let Some(code) = net_code {
                                         ui.horizontal(|ui| {
                                             ui.colored_label(
                                                 Color32::from_rgb(134, 239, 172),
                                                 RichText::new(format!(
-                                                    "🌐 Código: {}",
+                                                    "🌐 Código da Sala: {}",
                                                     code
                                                 ))
                                                 .strong()
-                                                .size(14.0),
+                                                .size(12.5),
                                             );
                                             ui.with_layout(
                                                 egui::Layout::right_to_left(egui::Align::Center),
                                                 |ui| {
-                                                    if ui.button("📋 Copiar Código").clicked() {
+                                                    if ui.small_button("📋 Copiar").clicked() {
                                                         ctx.copy_text(code.clone());
                                                         self.show_toast(format!(
                                                             "Código {} copiado!",
@@ -1975,46 +2082,58 @@ impl eframe::App for Disc2App {
                                     } else {
                                         ui.label(
                                             RichText::new("🌐 Gerando código da sala...")
-                                                .size(11.5)
+                                                .size(11.0)
                                                 .color(Color32::from_rgb(250, 204, 21)),
                                         );
                                     }
 
                                     ui.add_space(2.0);
-                                    ui.horizontal(|ui| {
-                                        ui.label(
-                                            RichText::new(format!("🏠 LAN/Radmin: {}", addr))
-                                                .size(10.5)
-                                                .color(Color32::from_rgb(160, 166, 174)),
-                                        );
-                                        ui.with_layout(
-                                            egui::Layout::right_to_left(egui::Align::Center),
-                                            |ui| {
-                                                if ui.small_button("Copiar IP").clicked() {
-                                                    ctx.copy_text(addr.clone());
-                                                    self.show_toast("IP copiado!");
-                                                }
-                                            },
-                                        );
-                                    });
+                                    if let Some(rip) = radmin_ip {
+                                        ui.horizontal(|ui| {
+                                            ui.label(
+                                                RichText::new(format!("🛡️ Radmin: {}", rip))
+                                                    .size(11.0)
+                                                    .color(Color32::from_rgb(181, 186, 193)),
+                                            );
+                                            ui.with_layout(
+                                                egui::Layout::right_to_left(egui::Align::Center),
+                                                |ui| {
+                                                    if ui.small_button("Copiar IP").clicked() {
+                                                        ctx.copy_text(rip);
+                                                        self.show_toast("IP do Radmin copiado!");
+                                                    }
+                                                },
+                                            );
+                                        });
+                                    } else {
+                                        ui.horizontal(|ui| {
+                                            ui.label(
+                                                RichText::new(format!("🏠 Rede Local: {}", lan_ip))
+                                                    .size(10.5)
+                                                    .color(Color32::from_rgb(160, 166, 174)),
+                                            );
+                                            ui.with_layout(
+                                                egui::Layout::right_to_left(egui::Align::Center),
+                                                |ui| {
+                                                    if ui.small_button("Copiar IP").clicked() {
+                                                        ctx.copy_text(lan_ip);
+                                                        self.show_toast("IP local copiado!");
+                                                    }
+                                                },
+                                            );
+                                        });
+                                    }
                                 });
                         }
 
-                        ui.add_space(8.0);
+                        ui.add_space(6.0);
 
-                        // Campo para entrar na sala do amigo
-                        ui.label(
-                            RichText::new("OU ENTRAR NA SALA DO SEU AMIGO")
-                                .size(10.0)
-                                .strong()
-                                .color(Color32::from_rgb(148, 155, 164)),
-                        );
-                        ui.add_space(3.0);
+                        // Campo para entrar por Código ou IP do Radmin
                         ui.horizontal(|ui| {
                             let resp = ui.add(
                                 egui::TextEdit::singleline(&mut self.join_addr_input)
-                                    .hint_text("Código do amigo (ex: 42877)")
-                                    .desired_width(185.0),
+                                    .hint_text("Código ou IP Radmin do amigo")
+                                    .desired_width(195.0),
                             );
                             let enter = resp.lost_focus()
                                 && ui.input(|i| i.key_pressed(egui::Key::Enter));
@@ -2024,60 +2143,17 @@ impl eframe::App for Disc2App {
                                 let target = self.join_addr_input.trim().to_string();
                                 self.join_addr_input.clear();
                                 if let Some(hub) = &self.room_hub {
-                                    hub.join_friend_room(&target);
+                                    hub.join_friend_room(&target, None);
                                 }
                             }
                         });
 
                         ui.add_space(10.0);
                         ui.separator();
-                        ui.add_space(8.0);
+                        ui.add_space(6.0);
 
-                        // 2. BOTÃO DE COMPARTILHAR OU TROCAR TELA (NÃO MUDA A SALA!)
-                        let share_label = if self.is_sharing {
-                            "🔄 Trocar Tela / Jogo (Na Mesma Sala)"
-                        } else {
-                            "🖥️ Compartilhar Sua Tela"
-                        };
-                        let share_btn = egui::Button::new(
-                            RichText::new(share_label)
-                                .size(13.0)
-                                .strong()
-                                .color(Color32::WHITE),
-                        )
-                        .fill(if self.is_sharing {
-                            accent
-                        } else {
-                            Color32::from_rgb(35, 165, 90)
-                        })
-                        .min_size(Vec2::new(ui.available_width(), 36.0));
-
-                        if ui.add(share_btn).clicked() {
-                            self.open_share_picker(ctx);
-                        }
-
-                        if self.is_sharing {
-                            ui.add_space(5.0);
-                            let stop_btn = egui::Button::new(
-                                RichText::new("⏹ Parar de Transmitir (Continuar na Sala)")
-                                    .size(11.5)
-                                    .strong()
-                                    .color(Color32::WHITE),
-                            )
-                            .fill(Color32::from_rgb(242, 63, 67))
-                            .min_size(Vec2::new(ui.available_width(), 28.0));
-
-                            if ui.add(stop_btn).clicked() {
-                                self.stop_sharing();
-                            }
-                        }
-
-                        ui.add_space(10.0);
-                        ui.separator();
-                        ui.add_space(8.0);
-
-                        // 3. LISTA DE TODAS AS PESSOAS NA SALA (VOCÊ + SEUS AMIGOS!)
-                        let peers_list: Vec<PeerInfo> = self
+                        // CANAL DE VOZ / TELA ATUAL (Estilo Árvore de Canal do Discord)
+                        let mut peers_list: Vec<PeerInfo> = self
                             .room_hub
                             .as_ref()
                             .and_then(|h| {
@@ -2087,188 +2163,251 @@ impl eframe::App for Disc2App {
                                     .map(|m| m.values().cloned().collect())
                             })
                             .unwrap_or_default();
+                        peers_list.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+
+                        let joined_label = self
+                            .room_hub
+                            .as_ref()
+                            .and_then(|h| h.joined_room_label.lock().ok().and_then(|g| g.clone()));
+
+                        let channel_title = joined_label
+                            .unwrap_or_else(|| format!("Sala de {}", self.custom.display_name));
+
+                        let member_count = if in_room { peers_list.len() + 1 } else { 0 };
 
                         ui.label(
                             RichText::new(format!(
-                                "PESSOAS NA SALA ({})",
-                                peers_list.len() + 1
+                                "CANAIS DE TRANSMISSÃO — {} NA SALA",
+                                member_count
                             ))
-                            .size(10.5)
+                            .size(10.0)
                             .strong()
                             .color(Color32::from_rgb(148, 155, 164)),
                         );
                         ui.add_space(4.0);
 
-                        egui::ScrollArea::vertical()
-                            .id_salt("room_members_scroll")
-                            .max_height(165.0)
+                        // Cabeçalho do Canal (ex: "🔊 Sala de Vitor")
+                        egui::Frame::none()
+                            .fill(if in_room {
+                                Color32::from_rgba_unmultiplied(88, 101, 242, 32)
+                            } else {
+                                card_bg
+                            })
+                            .rounding(Rounding::same(6.0))
+                            .inner_margin(egui::Margin::symmetric(8.0, 6.0))
                             .show(ui, |ui| {
-                                // Você
-                                egui::Frame::none()
-                                    .fill(card_bg)
-                                    .rounding(Rounding::same(7.0))
-                                    .inner_margin(egui::Margin::same(7.0))
-                                    .show(ui, |ui| {
-                                        ui.horizontal(|ui| {
-                                            draw_discord_avatar(
-                                                ui,
-                                                30.0,
-                                                &self.custom,
-                                                self.user_avatar_tex.as_ref(),
-                                            );
-                                            ui.vertical(|ui| {
-                                                ui.label(
-                                                    RichText::new(format!(
-                                                        "{} (Você)",
-                                                        self.custom.display_name
-                                                    ))
-                                                    .strong()
-                                                    .size(12.0)
-                                                    .color(self.custom.name_color()),
-                                                );
-                                                let src_name = self
-                                                    .sources
-                                                    .get(self.selected_source_idx)
-                                                    .map(|s| s.name.as_str())
-                                                    .unwrap_or("Tela");
-                                                let short_src: String =
-                                                    src_name.chars().take(22).collect();
-                                                ui.label(
-                                                    RichText::new(if self.is_sharing {
-                                                        format!("Transmitindo: {}", short_src)
-                                                    } else {
-                                                        "🟢 Na sala".to_string()
-                                                    })
-                                                    .size(10.5)
-                                                    .color(Color32::from_rgb(160, 166, 174)),
-                                                );
-                                            });
-
-                                            if self.is_sharing {
-                                                ui.with_layout(
-                                                    egui::Layout::right_to_left(
-                                                        egui::Align::Center,
-                                                    ),
-                                                    |ui| {
-                                                        egui::Frame::none()
-                                                            .fill(Color32::from_rgb(242, 63, 67))
-                                                            .rounding(Rounding::same(4.0))
-                                                            .inner_margin(egui::Margin::symmetric(
-                                                                5.0, 2.0,
-                                                            ))
-                                                            .show(ui, |ui| {
-                                                                ui.label(
-                                                                    RichText::new("LIVE")
-                                                                        .size(9.5)
-                                                                        .strong()
-                                                                        .color(Color32::WHITE),
-                                                                );
-                                                            });
-                                                    },
-                                                );
-                                            }
-                                        });
-                                    });
-
-                                // Amigos conectados na mesma sala
-                                for peer in &peers_list {
-                                    ui.add_space(4.0);
-                                    egui::Frame::none()
-                                        .fill(card_bg)
-                                        .rounding(Rounding::same(7.0))
-                                        .inner_margin(egui::Margin::same(7.0))
-                                        .show(ui, |ui| {
-                                            ui.horizontal(|ui| {
-                                                // Avatar do amigo com inicial
-                                                let (rect, _) = ui.allocate_exact_size(
-                                                    Vec2::new(30.0, 30.0),
-                                                    egui::Sense::hover(),
-                                                );
-                                                ui.painter().circle_filled(
-                                                    rect.center(),
-                                                    15.0,
-                                                    accent,
-                                                );
-                                                let init: String = peer
-                                                    .name
-                                                    .chars()
-                                                    .next()
-                                                    .unwrap_or('A')
-                                                    .to_uppercase()
-                                                    .collect();
-                                                ui.painter().text(
-                                                    rect.center(),
-                                                    egui::Align2::CENTER_CENTER,
-                                                    init,
-                                                    FontId::proportional(13.0),
-                                                    Color32::WHITE,
-                                                );
-
-                                                ui.vertical(|ui| {
-                                                    ui.label(
-                                                        RichText::new(&peer.name)
-                                                            .strong()
-                                                            .size(12.0)
-                                                            .color(Color32::WHITE),
-                                                    );
-                                                    ui.label(
-                                                        RichText::new(if peer.is_sharing {
-                                                            format!("🔴 Transmitindo ({})", peer.res_label)
-                                                        } else {
-                                                            "🟢 Na sala".to_string()
-                                                        })
-                                                        .size(10.5)
-                                                        .color(if peer.is_sharing {
-                                                            Color32::from_rgb(134, 239, 172)
-                                                        } else {
-                                                            Color32::from_rgb(160, 166, 174)
-                                                        }),
-                                                    );
-                                                });
-
-                                                if peer.is_sharing {
-                                                    ui.with_layout(
-                                                        egui::Layout::right_to_left(
-                                                            egui::Align::Center,
-                                                        ),
-                                                        |ui| {
-                                                            egui::Frame::none()
-                                                                .fill(Color32::from_rgb(
-                                                                    242, 63, 67,
-                                                                ))
-                                                                .rounding(Rounding::same(4.0))
-                                                                .inner_margin(
-                                                                    egui::Margin::symmetric(
-                                                                        5.0, 2.0,
-                                                                    ),
-                                                                )
-                                                                .show(ui, |ui| {
-                                                                    ui.label(
-                                                                        RichText::new("LIVE")
-                                                                            .size(9.5)
-                                                                            .strong()
-                                                                            .color(Color32::WHITE),
-                                                                    );
-                                                                });
-                                                        },
-                                                    );
+                                ui.horizontal(|ui| {
+                                    ui.label(
+                                        RichText::new(format!("🔊 {}", channel_title))
+                                            .strong()
+                                            .size(13.0)
+                                            .color(Color32::WHITE),
+                                    );
+                                    if !in_room {
+                                        ui.with_layout(
+                                            egui::Layout::right_to_left(egui::Align::Center),
+                                            |ui| {
+                                                if ui.small_button("Entrar").clicked() {
+                                                    if let Some(hub) = &self.room_hub {
+                                                        hub.reopen_my_room();
+                                                    }
                                                 }
-                                            });
-                                        });
-                                }
+                                            },
+                                        );
+                                    }
+                                });
                             });
 
-                        // 4. OUTRAS SALAS DESCOBERTAS NA REDE / VPN
-                        let rooms_snapshot: Vec<DiscoveredRoom> = self
+                        // Membros dentro do canal (indentados exatamente como no Discord)
+                        if in_room {
+                            ui.add_space(4.0);
+                            egui::ScrollArea::vertical()
+                                .id_salt("discord_channel_members")
+                                .max_height(155.0)
+                                .show(ui, |ui| {
+                                    // 1. Você
+                                    ui.horizontal(|ui| {
+                                        ui.add_space(12.0);
+                                        egui::Frame::none()
+                                            .fill(card_bg)
+                                            .rounding(Rounding::same(6.0))
+                                            .inner_margin(egui::Margin::symmetric(8.0, 5.0))
+                                            .show(ui, |ui| {
+                                                ui.set_width(ui.available_width());
+                                                ui.horizontal(|ui| {
+                                                    draw_discord_avatar(
+                                                        ui,
+                                                        26.0,
+                                                        &self.custom,
+                                                        self.user_avatar_tex.as_ref(),
+                                                    );
+                                                    ui.vertical(|ui| {
+                                                        ui.label(
+                                                            RichText::new(format!(
+                                                                "{} (Você)",
+                                                                self.custom.display_name
+                                                            ))
+                                                            .strong()
+                                                            .size(12.0)
+                                                            .color(self.custom.name_color()),
+                                                        );
+                                                        if self.is_sharing {
+                                                            ui.label(
+                                                                RichText::new(format!(
+                                                                    "Transmitindo {}",
+                                                                    self.res_preset.short_label()
+                                                                ))
+                                                                .size(10.0)
+                                                                .color(Color32::from_rgb(
+                                                                    134, 239, 172,
+                                                                )),
+                                                            );
+                                                        }
+                                                    });
+
+                                                    if self.is_sharing {
+                                                        ui.with_layout(
+                                                            egui::Layout::right_to_left(
+                                                                egui::Align::Center,
+                                                            ),
+                                                            |ui| {
+                                                                egui::Frame::none()
+                                                                    .fill(Color32::from_rgb(
+                                                                        242, 63, 67,
+                                                                    ))
+                                                                    .rounding(Rounding::same(4.0))
+                                                                    .inner_margin(
+                                                                        egui::Margin::symmetric(
+                                                                            5.0, 1.5,
+                                                                        ),
+                                                                    )
+                                                                    .show(ui, |ui| {
+                                                                        ui.label(
+                                                                            RichText::new("LIVE")
+                                                                                .size(9.0)
+                                                                                .strong()
+                                                                                .color(
+                                                                                    Color32::WHITE,
+                                                                                ),
+                                                                        );
+                                                                    });
+                                                            },
+                                                        );
+                                                    }
+                                                });
+                                            });
+                                    });
+
+                                    // 2. Amigos conectados na sala (sem duplicatas!)
+                                    for peer in &peers_list {
+                                        ui.add_space(3.0);
+                                        ui.horizontal(|ui| {
+                                            ui.add_space(12.0);
+                                            egui::Frame::none()
+                                                .fill(card_bg)
+                                                .rounding(Rounding::same(6.0))
+                                                .inner_margin(egui::Margin::symmetric(8.0, 5.0))
+                                                .show(ui, |ui| {
+                                                    ui.set_width(ui.available_width());
+                                                    ui.horizontal(|ui| {
+                                                        let (rect, _) = ui.allocate_exact_size(
+                                                            Vec2::new(26.0, 26.0),
+                                                            egui::Sense::hover(),
+                                                        );
+                                                        ui.painter().circle_filled(
+                                                            rect.center(),
+                                                            13.0,
+                                                            accent,
+                                                        );
+                                                        let init: String = peer
+                                                            .name
+                                                            .chars()
+                                                            .next()
+                                                            .unwrap_or('A')
+                                                            .to_uppercase()
+                                                            .collect();
+                                                        ui.painter().text(
+                                                            rect.center(),
+                                                            egui::Align2::CENTER_CENTER,
+                                                            init,
+                                                            FontId::proportional(12.0),
+                                                            Color32::WHITE,
+                                                        );
+
+                                                        ui.vertical(|ui| {
+                                                            ui.label(
+                                                                RichText::new(&peer.name)
+                                                                    .strong()
+                                                                    .size(12.0)
+                                                                    .color(Color32::WHITE),
+                                                            );
+                                                            if peer.is_sharing {
+                                                                ui.label(
+                                                                    RichText::new(format!(
+                                                                        "Transmitindo ({})",
+                                                                        peer.res_label
+                                                                    ))
+                                                                    .size(10.0)
+                                                                    .color(Color32::from_rgb(
+                                                                        134, 239, 172,
+                                                                    )),
+                                                                );
+                                                            }
+                                                        });
+
+                                                        if peer.is_sharing {
+                                                            ui.with_layout(
+                                                                egui::Layout::right_to_left(
+                                                                    egui::Align::Center,
+                                                                ),
+                                                                |ui| {
+                                                                    egui::Frame::none()
+                                                                        .fill(Color32::from_rgb(
+                                                                            242, 63, 67,
+                                                                        ))
+                                                                        .rounding(Rounding::same(
+                                                                            4.0,
+                                                                        ))
+                                                                        .inner_margin(
+                                                                            egui::Margin::symmetric(
+                                                                                5.0, 1.5,
+                                                                            ),
+                                                                        )
+                                                                        .show(ui, |ui| {
+                                                                            ui.label(
+                                                                                RichText::new(
+                                                                                    "LIVE",
+                                                                                )
+                                                                                .size(9.0)
+                                                                                .strong()
+                                                                                .color(
+                                                                                    Color32::WHITE,
+                                                                                ),
+                                                                            );
+                                                                        });
+                                                                },
+                                                            );
+                                                        }
+                                                    });
+                                                });
+                                        });
+                                    }
+                                });
+                        }
+
+                        // OUTRAS SALAS DESCOBERTAS NO RADMIN / REDE
+                        let mut rooms_snapshot: Vec<DiscoveredRoom> = self
                             .discovered_rooms
                             .lock()
                             .map(|m| m.values().cloned().collect())
                             .unwrap_or_default();
+                        rooms_snapshot
+                            .sort_by(|a, b| a.host_name.to_lowercase().cmp(&b.host_name.to_lowercase()));
 
                         if !rooms_snapshot.is_empty() {
                             ui.add_space(8.0);
                             ui.label(
-                                RichText::new("OUTRAS SALAS NA REDE / RADMIN")
+                                RichText::new("OUTRAS SALAS NO RADMIN / REDE")
                                     .size(10.0)
                                     .strong()
                                     .color(Color32::from_rgb(148, 155, 164)),
@@ -2277,21 +2416,29 @@ impl eframe::App for Disc2App {
 
                             egui::ScrollArea::vertical()
                                 .id_salt("lan_rooms_scroll")
-                                .max_height(95.0)
+                                .max_height(100.0)
                                 .show(ui, |ui| {
                                     for room in rooms_snapshot {
                                         egui::Frame::none()
                                             .fill(card_bg)
                                             .rounding(Rounding::same(6.0))
-                                            .inner_margin(egui::Margin::same(6.0))
+                                            .inner_margin(egui::Margin::symmetric(8.0, 5.0))
                                             .show(ui, |ui| {
                                                 ui.horizontal(|ui| {
                                                     ui.vertical(|ui| {
+                                                        let badge = if room.is_radmin {
+                                                            "🛡️"
+                                                        } else {
+                                                            "🔊"
+                                                        };
                                                         ui.label(
-                                                            RichText::new(&room.host_name)
-                                                                .strong()
-                                                                .size(11.5)
-                                                                .color(Color32::WHITE),
+                                                            RichText::new(format!(
+                                                                "{} Sala de {}",
+                                                                badge, room.host_name
+                                                            ))
+                                                            .strong()
+                                                            .size(11.5)
+                                                            .color(Color32::WHITE),
                                                         );
                                                         ui.label(
                                                             RichText::new(format!(
@@ -2299,7 +2446,7 @@ impl eframe::App for Disc2App {
                                                                 room.res_label, room.peer_count
                                                             ))
                                                             .size(10.0)
-                                                            .color(Color32::from_rgb(181, 186, 193)),
+                                                            .color(Color32::from_rgb(165, 170, 180)),
                                                         );
                                                     });
                                                     ui.with_layout(
@@ -2309,7 +2456,12 @@ impl eframe::App for Disc2App {
                                                         |ui| {
                                                             if ui.small_button("Entrar").clicked() {
                                                                 if let Some(hub) = &self.room_hub {
-                                                                    hub.join_friend_room(&room.addr);
+                                                                    hub.join_friend_room(
+                                                                        &room.addr,
+                                                                        Some(
+                                                                            room.host_name.clone(),
+                                                                        ),
+                                                                    );
                                                                 }
                                                             }
                                                         },
@@ -2323,7 +2475,7 @@ impl eframe::App for Disc2App {
                     });
             });
 
-        // ======================== BARRA SUPERIOR DO PALCO (LIMPA, SEM SOBREPOSIÇÃO DE TEXTO) ========================
+        // ======================== BARRA SUPERIOR DO PALCO ========================
         egui::TopBottomPanel::top("stage_top_bar")
             .exact_height(46.0)
             .frame(
@@ -2348,7 +2500,6 @@ impl eframe::App for Disc2App {
                             });
                     }
 
-                    // Seletor de Resolução em Tempo Real
                     ui.label(RichText::new("Sua Qualidade:").size(11.5));
                     let prev_res = self.res_preset;
                     egui::ComboBox::from_id_salt("combo_res")
@@ -2380,7 +2531,6 @@ impl eframe::App for Disc2App {
                         self.sync_live_config();
                     }
 
-                    // Seletor de FPS
                     let prev_fps = self.fps_preset;
                     egui::ComboBox::from_id_salt("combo_fps")
                         .selected_text(format!("{} FPS", self.fps_preset))
@@ -2394,7 +2544,6 @@ impl eframe::App for Disc2App {
                         self.sync_live_config();
                     }
 
-                    // Seletor de Nitidez
                     let prev_q = self.jpeg_quality;
                     let q_label = match self.jpeg_quality {
                         90 => "Ultra",
@@ -2713,9 +2862,11 @@ impl eframe::App for Disc2App {
 
                         ui.add_space(18.0);
                         ui.label(
-                            RichText::new(
-                                "Sua Sala Compartilhada está Pronta!",
-                            )
+                            RichText::new(if in_room {
+                                "Você está Conectado na Sala!"
+                            } else {
+                                "Você está Desconectado da Sala"
+                            })
                             .font(FontId::proportional(19.0))
                             .strong()
                             .color(Color32::WHITE),
@@ -2723,7 +2874,7 @@ impl eframe::App for Disc2App {
                         ui.add_space(6.0);
                         ui.label(
                             RichText::new(
-                                "1. Envie o Código da sua sala (na barra esquerda) para seu amigo, ou digite o código dele.\n2. Quando vocês dois clicarem em 'Compartilhar Sua Tela', as 2 telas aparecem juntas lado a lado para ambos!",
+                                "Clique em '🖥️ Compartilhar Tela / Jogo' abaixo ou na barra inferior esquerda.\nQuando você e seus amigos compartilham a tela, todas as telas aparecem juntas no palco!",
                             )
                             .size(12.5)
                             .color(Color32::from_rgb(160, 166, 174)),

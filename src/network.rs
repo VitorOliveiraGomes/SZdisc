@@ -4,7 +4,7 @@ use std::net::{IpAddr, TcpListener, TcpStream, ToSocketAddrs, UdpSocket};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use eframe::egui::Context;
 use zune_jpeg::JpegDecoder;
@@ -15,11 +15,12 @@ pub const DEFAULT_STREAM_PORT: u16 = 47830;
 pub const LAN_DISCOVERY_PORT: u16 = 47831;
 const BORE_RELAY_HOST: &str = "bore.pub:7835";
 
-const MAGIC_VIDEO: &[u8; 4] = b"VID3";
-const MAGIC_AUDIO: &[u8; 4] = b"AUD3";
-const MAGIC_INFO: &[u8; 4] = b"INF3";
-const MAGIC_STOP_STREAM: &[u8; 4] = b"STP3";
-const MAGIC_LEFT_ROOM: &[u8; 4] = b"BYE3";
+const MAGIC_HELLO: &[u8; 4] = b"HLO4";
+const MAGIC_INFO: &[u8; 4] = b"INF4";
+const MAGIC_VIDEO: &[u8; 4] = b"VID4";
+const MAGIC_AUDIO: &[u8; 4] = b"AUD4";
+const MAGIC_STOP_STREAM: &[u8; 4] = b"STP4";
+const MAGIC_LEFT_ROOM: &[u8; 4] = b"BYE4";
 
 #[derive(Clone, Debug)]
 pub struct DiscoveredRoom {
@@ -28,6 +29,7 @@ pub struct DiscoveredRoom {
     pub addr: String,
     pub res_label: String,
     pub peer_count: usize,
+    pub is_radmin: bool,
     pub last_seen: Instant,
 }
 
@@ -49,8 +51,6 @@ pub struct DecodedRemoteFrame {
 
 /// Estado de recepção de vídeo e áudio de um participante específico na sala
 pub struct RemotePeerStream {
-    pub peer_id: u32,
-    pub peer_name: String,
     pub latest_frame: Mutex<Option<DecodedRemoteFrame>>,
     pub volume_percent: Arc<AtomicU32>,
     pub muted: Arc<AtomicBool>,
@@ -58,14 +58,12 @@ pub struct RemotePeerStream {
 }
 
 impl RemotePeerStream {
-    fn new(peer_id: u32, peer_name: String) -> Arc<Self> {
+    fn new() -> Arc<Self> {
         let volume_percent = Arc::new(AtomicU32::new(100));
         let muted = Arc::new(AtomicBool::new(false));
         let audio_player =
             StreamAudioPlayer::start(Arc::clone(&volume_percent), Arc::clone(&muted));
         Arc::new(Self {
-            peer_id,
-            peer_name,
             latest_frame: Mutex::new(None),
             volume_percent,
             muted,
@@ -81,7 +79,7 @@ impl Drop for RemotePeerStream {
 }
 
 /// Fila de envio por conexão TCP (Full-Duplex).
-/// Sobrescreve sempre o quadro de vídeo pendente por `sender_id` para nunca acumular atraso na internet!
+/// Sobrescreve sempre o quadro de vídeo pendente por `sender_id` para nunca acumular atraso!
 struct PeerConnectionSlot {
     conn_id: u64,
     is_outbound: bool,
@@ -99,7 +97,7 @@ impl PeerConnectionSlot {
             conn_id,
             is_outbound,
             remote_peer_id: AtomicU32::new(0),
-            control_queue: Mutex::new(VecDeque::with_capacity(16)),
+            control_queue: Mutex::new(VecDeque::with_capacity(24)),
             audio_queue: Mutex::new(VecDeque::with_capacity(24)),
             latest_video_by_sender: Mutex::new(HashMap::new()),
             wakeup: Condvar::new(),
@@ -135,17 +133,48 @@ impl PeerConnectionSlot {
     }
 }
 
-pub fn generate_peer_id() -> u32 {
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.subsec_nanos())
-        .unwrap_or(1234567);
-    let pid = std::process::id();
-    let mixed = nanos.wrapping_mul(1664525).wrapping_add(pid).wrapping_add(1013904223);
-    if mixed == 0 { 1 } else { mixed }
+/// Gera um ID fixo por máquina + conta para NUNCA duplicar o mesmo usuário ao reconectar ou reiniciar o app!
+pub fn derive_persistent_peer_id(display_name: &str, user_tag: &str) -> u32 {
+    let comp = std::env::var("COMPUTERNAME").unwrap_or_else(|_| "PC".to_string());
+    let user = std::env::var("USERNAME").unwrap_or_else(|_| "USER".to_string());
+    let seed = format!(
+        "{}|{}|{}|{}",
+        comp.to_uppercase(),
+        user.to_uppercase(),
+        display_name.trim().to_uppercase(),
+        user_tag.trim().to_uppercase()
+    );
+
+    // FNV-1a 32-bit hash
+    let mut hash: u32 = 2166136261;
+    for b in seed.as_bytes() {
+        hash ^= *b as u32;
+        hash = hash.wrapping_mul(16777619);
+    }
+    if hash == 0 { 1 } else { hash }
+}
+
+/// Detecta especificamente o IP do Radmin VPN (faixa 26.x.x.x) se o Radmin estiver aberto
+pub fn get_radmin_ip() -> Option<String> {
+    if let Ok(sock) = UdpSocket::bind("0.0.0.0:0") {
+        if sock.connect("26.1.1.1:80").is_ok() {
+            if let Ok(local_addr) = sock.local_addr() {
+                if let IpAddr::V4(ip) = local_addr.ip() {
+                    let s = ip.to_string();
+                    if s.starts_with("26.") {
+                        return Some(s);
+                    }
+                }
+            }
+        }
+    }
+    None
 }
 
 pub fn get_local_ip() -> String {
+    if let Some(radmin) = get_radmin_ip() {
+        return radmin;
+    }
     if let Ok(sock) = UdpSocket::bind("0.0.0.0:0") {
         if sock.connect("8.8.8.8:80").is_ok() {
             if let Ok(local_addr) = sock.local_addr() {
@@ -161,7 +190,7 @@ pub fn get_local_ip() -> String {
 }
 
 pub fn start_lan_discovery_listener(
-    my_peer_id: u32,
+    my_peer_id: Arc<AtomicU32>,
 ) -> Arc<Mutex<HashMap<u32, DiscoveredRoom>>> {
     let rooms: Arc<Mutex<HashMap<u32, DiscoveredRoom>>> = Arc::new(Mutex::new(HashMap::new()));
     let rooms_clone = Arc::clone(&rooms);
@@ -178,28 +207,43 @@ pub fn start_lan_discovery_listener(
             if let Ok((len, src)) = sock.recv_from(&mut buf) {
                 if let Ok(msg) = std::str::from_utf8(&buf[..len]) {
                     let parts: Vec<&str> = msg.split('|').collect();
-                    // Formato: DISC3|peer_id|port|host_name|res_label|peer_count
-                    if parts.len() >= 6 && parts[0] == "DISC3" {
+                    // Formato: DISC4|peer_id|port|host_name|res_label|peer_count
+                    if parts.len() >= 6 && parts[0] == "DISC4" {
                         let host_peer_id = parts[1].parse::<u32>().unwrap_or(0);
-                        if host_peer_id != 0 && host_peer_id != my_peer_id {
+                        let current_my_id = my_peer_id.load(Ordering::Relaxed);
+                        if host_peer_id != 0 && host_peer_id != current_my_id {
                             let port = parts[2];
                             let host_name = parts[3].to_string();
                             let res_label = parts[4].to_string();
                             let peer_count = parts[5].parse::<usize>().unwrap_or(1);
-                            let addr = format!("{}:{}", src.ip(), port);
+                            let ip_str = src.ip().to_string();
+                            let is_radmin = ip_str.starts_with("26.");
+                            let addr = format!("{}:{}", ip_str, port);
 
                             if let Ok(mut map) = rooms_clone.lock() {
-                                map.insert(
-                                    host_peer_id,
-                                    DiscoveredRoom {
+                                // Prefere manter o endereço Radmin (26.x.x.x) se recebermos de duas interfaces
+                                let should_update = match map.get(&host_peer_id) {
+                                    Some(existing) if existing.is_radmin && !is_radmin => false,
+                                    _ => true,
+                                };
+                                if should_update {
+                                    map.insert(
                                         host_peer_id,
-                                        host_name,
-                                        addr,
-                                        res_label,
-                                        peer_count,
-                                        last_seen: Instant::now(),
-                                    },
-                                );
+                                        DiscoveredRoom {
+                                            host_peer_id,
+                                            host_name,
+                                            addr,
+                                            res_label,
+                                            peer_count,
+                                            is_radmin,
+                                            last_seen: Instant::now(),
+                                        },
+                                    );
+                                } else if let Some(existing) = map.get_mut(&host_peer_id) {
+                                    existing.last_seen = Instant::now();
+                                    existing.peer_count = peer_count;
+                                    existing.res_label = res_label;
+                                }
                             }
                         }
                     }
@@ -235,12 +279,12 @@ fn build_packet(
     Arc::new(pkt)
 }
 
-fn build_info_packet(info: &PeerInfo) -> Arc<Vec<u8>> {
+fn build_info_or_hello_packet(magic: &[u8; 4], info: &PeerInfo) -> Arc<Vec<u8>> {
     let share_flag = if info.is_sharing { "1" } else { "0" };
     let clean_name = info.name.replace('\t', " ").replace('\n', " ");
     let clean_res = info.res_label.replace('\t', " ").replace('\n', " ");
     let text = format!("{}\t{}\t{}", clean_name, share_flag, clean_res);
-    build_packet(MAGIC_INFO, info.peer_id, 0, 0, 0, text.as_bytes())
+    build_packet(magic, info.peer_id, 0, 0, 0, text.as_bytes())
 }
 
 fn read_exact_interruptible(
@@ -262,6 +306,7 @@ fn read_exact_interruptible(
                     || e.kind() == std::io::ErrorKind::TimedOut
                     || e.kind() == std::io::ErrorKind::Interrupted =>
             {
+                thread::sleep(Duration::from_millis(5));
                 continue;
             }
             Err(_) => return false,
@@ -289,9 +334,10 @@ fn write_all_interruptible(stream: &mut TcpStream, buf: &[u8], alive: &AtomicBoo
                     || e.kind() == std::io::ErrorKind::Interrupted =>
             {
                 retries += 1;
-                if retries > 4 {
+                if retries > 40 {
                     return false;
                 }
+                thread::sleep(Duration::from_millis(15));
                 continue;
             }
             Err(_) => return false,
@@ -318,14 +364,21 @@ fn parse_bore_connection_uuid(msg: &str) -> Option<String> {
     Some(rest[..end].to_string())
 }
 
-/// Hub Central da Sala (Bidirecional / Full-Duplex):
-/// Mantém a sala aberta sem criar salas duplicadas ao trocar de janela, sincroniza a lista de amigos
-/// conectados na sala e permite que 2, 3 ou mais pessoas transmitam e assistam telas juntas ao mesmo tempo!
+/// Hub Central da Sala (Bidirecional / Estilo Discord):
+/// - Garante que Sockets aceitos pelo `TcpListener` fiquem em modo BLOCKING (`set_nonblocking(false)`),
+///   eliminando quedas repentinas de transmissão (`WouldBlock`)!
+/// - Evita loops de relay e contas duplicadas usando ID persistente + limpeza automática de participantes inativos.
+/// - Suporta botão "Sair da Sala" tanto para quem entrou quanto para o dono da sala!
 pub struct RoomHub {
-    pub my_peer_id: u32,
+    pub my_peer_id: Arc<AtomicU32>,
+    pub bound_port: u16,
     pub listen_addr: String,
+    pub radmin_addr: Mutex<Option<String>>,
     pub internet_code: Arc<Mutex<Option<String>>>,
+    pub in_room: Arc<AtomicBool>,
     pub joined_room_label: Arc<Mutex<Option<String>>>,
+    pub target_outbound_addr: Arc<Mutex<Option<String>>>,
+    pub is_connecting_outbound: Arc<AtomicBool>,
     pub status_notice: Arc<Mutex<Option<String>>>,
     pub my_info: Arc<Mutex<PeerInfo>>,
     pub peers: Arc<Mutex<HashMap<u32, PeerInfo>>>,
@@ -339,7 +392,7 @@ pub struct RoomHub {
 
 impl RoomHub {
     pub fn start(
-        my_peer_id: u32,
+        initial_peer_id: u32,
         initial_name: String,
         ctx: Context,
     ) -> Result<Arc<Self>, String> {
@@ -360,9 +413,11 @@ impl RoomHub {
 
         let ip = get_local_ip();
         let listen_addr = format!("{}:{}", ip, bound_port);
+        let radmin_addr = get_radmin_ip().map(|rip| format!("{}:{}", rip, bound_port));
 
+        let my_peer_id = Arc::new(AtomicU32::new(initial_peer_id));
         let my_info = Arc::new(Mutex::new(PeerInfo {
-            peer_id: my_peer_id,
+            peer_id: initial_peer_id,
             name: initial_name,
             is_sharing: false,
             res_label: "Na sala".to_string(),
@@ -371,9 +426,14 @@ impl RoomHub {
 
         let hub = Arc::new(Self {
             my_peer_id,
+            bound_port,
             listen_addr,
+            radmin_addr: Mutex::new(radmin_addr),
             internet_code: Arc::new(Mutex::new(None)),
+            in_room: Arc::new(AtomicBool::new(true)),
             joined_room_label: Arc::new(Mutex::new(None)),
+            target_outbound_addr: Arc::new(Mutex::new(None)),
+            is_connecting_outbound: Arc::new(AtomicBool::new(false)),
             status_notice: Arc::new(Mutex::new(None)),
             my_info,
             peers: Arc::new(Mutex::new(HashMap::new())),
@@ -385,13 +445,18 @@ impl RoomHub {
             ctx,
         });
 
-        // 1. Thread que aceita conexões TCP locais / VPN (Radmin)
+        // 1. Thread que aceita conexões TCP locais / Radmin VPN
         let hub_accept = Arc::clone(&hub);
         thread::spawn(move || {
             while !hub_accept.stop_flag.load(Ordering::Relaxed) {
                 match listener.accept() {
                     Ok((stream, _peer)) => {
-                        hub_accept.attach_bidirectional_stream(stream, false);
+                        if hub_accept.in_room.load(Ordering::Relaxed) {
+                            hub_accept.attach_bidirectional_stream(stream, false);
+                        } else {
+                            // Se o usuário saiu da sala ("Desconectado"), recusa novas entradas até ele voltar
+                            drop(stream);
+                        }
                     }
                     Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                         thread::sleep(Duration::from_millis(40));
@@ -409,50 +474,135 @@ impl RoomHub {
             hub_tunnel.internet_tunnel_loop();
         });
 
-        // 3. Thread de anúncio na rede local / VPN e Heartbeat de presença na sala
+        // 3. Thread de Heartbeat (1.2s), limpeza de fantasmas e anúncio no Radmin VPN + LAN
         let hub_beacon = Arc::clone(&hub);
         thread::spawn(move || {
-            let udp = UdpSocket::bind("0.0.0.0:0").ok();
-            if let Some(ref s) = udp {
+            let udp_any = UdpSocket::bind("0.0.0.0:0").ok();
+            if let Some(ref s) = udp_any {
                 let _ = s.set_broadcast(true);
             }
 
             while !hub_beacon.stop_flag.load(Ordering::Relaxed) {
-                // Envia nosso status atualizado para todos os participantes conectados na sala
-                if let Ok(info) = hub_beacon.my_info.lock() {
-                    let pkt = build_info_packet(&info);
-                    if let Ok(mut conns) = hub_beacon.connections.lock() {
-                        conns.retain(|c| c.alive.load(Ordering::Relaxed));
-                        for c in conns.iter() {
-                            c.push_control(Arc::clone(&pkt));
-                        }
-                    }
-
-                    // Anuncia a sala na LAN / VPN apenas uma vez por PC (identificado por my_peer_id)
-                    if let Some(ref s) = udp {
-                        let peer_total = hub_beacon
-                            .peers
-                            .lock()
-                            .map(|m| m.len() + 1)
-                            .unwrap_or(1);
-                        let clean_name = info.name.replace('|', " ");
-                        let clean_res = if info.is_sharing {
-                            info.res_label.replace('|', " ")
-                        } else {
-                            "Sala Aberta".to_string()
-                        };
-                        let payload = format!(
-                            "DISC3|{}|{}|{}|{}|{}",
-                            hub_beacon.my_peer_id, bound_port, clean_name, clean_res, peer_total
-                        );
-                        let _ = s.send_to(
-                            payload.as_bytes(),
-                            ("255.255.255.255", LAN_DISCOVERY_PORT),
-                        );
+                // Atualiza IP do Radmin caso o usuário tenha aberto o Radmin VPN depois
+                if let Some(rip) = get_radmin_ip() {
+                    if let Ok(mut g) = hub_beacon.radmin_addr.lock() {
+                        *g = Some(format!("{}:{}", rip, hub_beacon.bound_port));
                     }
                 }
 
-                thread::sleep(Duration::from_millis(1500));
+                // Remove qualquer participante fantasma que não enviou sinal nos últimos 6 segundos
+                let mut expired_ids = Vec::new();
+                if let Ok(mut peers_map) = hub_beacon.peers.lock() {
+                    peers_map.retain(|&pid, p| {
+                        let ok = p.last_seen.elapsed() < Duration::from_secs(6);
+                        if !ok {
+                            expired_ids.push(pid);
+                        }
+                        ok
+                    });
+                }
+                if !expired_ids.is_empty() {
+                    if let Ok(mut streams) = hub_beacon.remote_streams.lock() {
+                        for pid in expired_ids {
+                            streams.remove(&pid);
+                        }
+                    }
+                    hub_beacon.ctx.request_repaint();
+                }
+
+                // Se estamos em uma sala externa e a conexão caiu por oscilação de rede, reconecta automaticamente!
+                let need_reconnect = if hub_beacon.in_room.load(Ordering::Relaxed)
+                    && !hub_beacon.is_connecting_outbound.load(Ordering::Relaxed)
+                {
+                    let has_outbound_target = hub_beacon
+                        .target_outbound_addr
+                        .lock()
+                        .ok()
+                        .and_then(|g| g.clone());
+                    let has_alive_outbound = hub_beacon
+                        .connections
+                        .lock()
+                        .map(|c| c.iter().any(|s| s.is_outbound && s.alive.load(Ordering::Relaxed)))
+                        .unwrap_or(false);
+                    if !has_alive_outbound {
+                        has_outbound_target
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+
+                if let Some(addr_to_reconnect) = need_reconnect {
+                    hub_beacon.spawn_outbound_connect(addr_to_reconnect, None, true);
+                }
+
+                // Envia nosso status para todos na sala e anuncia no Radmin VPN + LAN
+                if hub_beacon.in_room.load(Ordering::Relaxed) {
+                    if let Ok(info) = hub_beacon.my_info.lock() {
+                        let pkt = build_info_or_hello_packet(MAGIC_INFO, &info);
+                        if let Ok(mut conns) = hub_beacon.connections.lock() {
+                            conns.retain(|c| c.alive.load(Ordering::Relaxed));
+                            for c in conns.iter() {
+                                c.push_control(Arc::clone(&pkt));
+                            }
+                        }
+
+                        // Só anuncia nossa própria sala na rede se não estivermos como convidado na sala de outra pessoa
+                        let is_guest = hub_beacon
+                            .joined_room_label
+                            .lock()
+                            .map(|g| g.is_some())
+                            .unwrap_or(false);
+
+                        if !is_guest {
+                            let peer_total = hub_beacon
+                                .peers
+                                .lock()
+                                .map(|m| m.len() + 1)
+                                .unwrap_or(1);
+                            let clean_name = info.name.replace('|', " ");
+                            let clean_res = if info.is_sharing {
+                                info.res_label.replace('|', " ")
+                            } else {
+                                "Sala Aberta".to_string()
+                            };
+                            let my_id = hub_beacon.my_peer_id.load(Ordering::Relaxed);
+                            let payload = format!(
+                                "DISC4|{}|{}|{}|{}|{}",
+                                my_id, hub_beacon.bound_port, clean_name, clean_res, peer_total
+                            );
+
+                            if let Some(ref s) = udp_any {
+                                let _ = s.send_to(
+                                    payload.as_bytes(),
+                                    ("255.255.255.255", LAN_DISCOVERY_PORT),
+                                );
+                                let _ = s.send_to(
+                                    payload.as_bytes(),
+                                    ("26.255.255.255", LAN_DISCOVERY_PORT),
+                                );
+                            }
+
+                            // Envia também diretamente pela interface Radmin (26.x.x.x) para garantir entrega no Radmin VPN!
+                            if let Some(radmin_ip) = get_radmin_ip() {
+                                if let Ok(rsock) = UdpSocket::bind((radmin_ip.as_str(), 0)) {
+                                    let _ = rsock.set_broadcast(true);
+                                    let _ = rsock.send_to(
+                                        payload.as_bytes(),
+                                        ("26.255.255.255", LAN_DISCOVERY_PORT),
+                                    );
+                                    let _ = rsock.send_to(
+                                        payload.as_bytes(),
+                                        ("255.255.255.255", LAN_DISCOVERY_PORT),
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+
+                thread::sleep(Duration::from_millis(1200));
             }
         });
 
@@ -509,6 +659,9 @@ impl RoomHub {
                                     self.ctx.request_repaint();
                                 }
                             } else if let Some(uuid) = parse_bore_connection_uuid(&s) {
+                                if !self.in_room.load(Ordering::Relaxed) {
+                                    continue;
+                                }
                                 let hub_clone = Arc::clone(&self);
                                 thread::spawn(move || {
                                     if let Ok(mut data_stream) =
@@ -542,16 +695,18 @@ impl RoomHub {
         }
     }
 
-    /// Conecta na sala de um amigo (por código de 5 dígitos ou IP).
-    /// A conexão é bidirecional: você vê quem está na sala, assiste a tela do amigo E se você compartilhar
-    /// sua tela, seu amigo vê a sua tela automaticamente sem precisar digitar outro código!
-    pub fn join_friend_room(self: &Arc<Self>, raw_target: &str) {
+    /// Entra na sala de um amigo (por Radmin, IP ou Código de 5 dígitos),
+    /// fechando antes qualquer conexão anterior para nunca misturar ou duplicar contas!
+    pub fn join_friend_room(self: &Arc<Self>, raw_target: &str, custom_host_name: Option<String>) {
         let trimmed = raw_target.trim().trim_start_matches('#');
         if trimmed.is_empty() {
             return;
         }
 
-        // Não conecta no próprio código da nossa sala
+        if self.is_connecting_outbound.load(Ordering::Relaxed) {
+            return;
+        }
+
         if let Ok(guard) = self.internet_code.lock() {
             if let Some(my_code) = guard.as_ref() {
                 if my_code == trimmed {
@@ -563,7 +718,7 @@ impl RoomHub {
             }
         }
 
-        let (addr_str, label) = if !trimmed.contains('.') && !trimmed.contains(':') {
+        let (addr_str, default_label) = if !trimmed.contains('.') && !trimmed.contains(':') {
             (
                 format!("bore.pub:{}", trimmed),
                 format!("Sala #{}", trimmed),
@@ -577,6 +732,35 @@ impl RoomHub {
             )
         };
 
+        let label = custom_host_name
+            .map(|n| format!("Sala de {}", n))
+            .unwrap_or(default_label);
+
+        // Limpa conexões antigas antes de entrar na nova sala
+        self.disconnect_all_connections();
+        self.in_room.store(true, Ordering::Relaxed);
+
+        if let Ok(mut t) = self.target_outbound_addr.lock() {
+            *t = Some(addr_str.clone());
+        }
+
+        self.spawn_outbound_connect(addr_str, Some(label), false);
+    }
+
+    fn spawn_outbound_connect(
+        self: &Arc<Self>,
+        addr_str: String,
+        label_opt: Option<String>,
+        is_silent_reconnect: bool,
+    ) {
+        if self
+            .is_connecting_outbound
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            return;
+        }
+
         let hub = Arc::clone(self);
         thread::spawn(move || {
             let sock_addr = match addr_str
@@ -586,47 +770,65 @@ impl RoomHub {
             {
                 Some(a) => a,
                 None => {
-                    if let Ok(mut n) = hub.status_notice.lock() {
-                        *n = Some(format!("Endereço inválido: {}", addr_str));
+                    if !is_silent_reconnect {
+                        if let Ok(mut n) = hub.status_notice.lock() {
+                            *n = Some(format!("Endereço inválido: {}", addr_str));
+                        }
+                        if let Ok(mut t) = hub.target_outbound_addr.lock() {
+                            *t = None;
+                        }
                     }
+                    hub.is_connecting_outbound.store(false, Ordering::SeqCst);
                     hub.ctx.request_repaint();
                     return;
                 }
             };
 
-            match TcpStream::connect_timeout(&sock_addr, Duration::from_secs(6)) {
+            match TcpStream::connect_timeout(&sock_addr, Duration::from_secs(5)) {
                 Ok(stream) => {
-                    if let Ok(mut joined) = hub.joined_room_label.lock() {
-                        *joined = Some(label.clone());
+                    if let Some(ref lbl) = label_opt {
+                        if let Ok(mut joined) = hub.joined_room_label.lock() {
+                            *joined = Some(lbl.clone());
+                        }
+                        if !is_silent_reconnect {
+                            if let Ok(mut n) = hub.status_notice.lock() {
+                                *n = Some(format!("Conectado em {}!", lbl));
+                            }
+                        }
                     }
-                    if let Ok(mut n) = hub.status_notice.lock() {
-                        *n = Some(format!("Conectado na {}!", label));
-                    }
+                    hub.is_connecting_outbound.store(false, Ordering::SeqCst);
                     hub.ctx.request_repaint();
                     hub.attach_bidirectional_stream(stream, true);
                 }
                 Err(e) => {
-                    if let Ok(mut n) = hub.status_notice.lock() {
-                        *n = Some(format!("Não foi possível entrar na {}: {}", label, e));
+                    if !is_silent_reconnect {
+                        if let Ok(mut t) = hub.target_outbound_addr.lock() {
+                            *t = None;
+                        }
+                        if let Ok(mut joined) = hub.joined_room_label.lock() {
+                            *joined = None;
+                        }
+                        if let Ok(mut n) = hub.status_notice.lock() {
+                            *n = Some(format!("Não foi possível conectar: {}", e));
+                        }
                     }
+                    hub.is_connecting_outbound.store(false, Ordering::SeqCst);
                     hub.ctx.request_repaint();
                 }
             }
         });
     }
 
-    /// Sai das salas externas às quais nos conectamos como convidado
-    pub fn leave_joined_rooms(&self) {
-        let bye_pkt = build_packet(MAGIC_LEFT_ROOM, self.my_peer_id, 0, 0, 0, &[0]);
+    fn disconnect_all_connections(&self) {
+        let my_id = self.my_peer_id.load(Ordering::Relaxed);
+        let bye_pkt = build_packet(MAGIC_LEFT_ROOM, my_id, 0, 0, 0, &[0]);
         if let Ok(mut conns) = self.connections.lock() {
             for c in conns.iter() {
-                if c.is_outbound {
-                    let _ = c.push_control(Arc::clone(&bye_pkt));
-                    c.alive.store(false, Ordering::Relaxed);
-                    c.wakeup.notify_all();
-                }
+                c.push_control(Arc::clone(&bye_pkt));
+                c.alive.store(false, Ordering::Relaxed);
+                c.wakeup.notify_all();
             }
-            conns.retain(|c| !c.is_outbound);
+            conns.clear();
         }
         if let Ok(mut joined) = self.joined_room_label.lock() {
             *joined = None;
@@ -637,11 +839,34 @@ impl RoomHub {
         if let Ok(mut streams) = self.remote_streams.lock() {
             streams.clear();
         }
+    }
+
+    /// Botão "📞 Sair da Sala" estilo Discord: desconecta de tudo (seja você Host ou Convidado)
+    pub fn leave_room_completely(&self) {
+        if let Ok(mut t) = self.target_outbound_addr.lock() {
+            *t = None;
+        }
+        self.in_room.store(false, Ordering::Relaxed);
+        self.disconnect_all_connections();
         self.ctx.request_repaint();
     }
 
-    /// Atualiza nosso nome/status de transmissão sem derrubar nem recriar a sala!
-    pub fn update_my_status(&self, name: String, is_sharing: bool, res_label: String) {
+    /// Reabre nossa própria sala quando clicamos em "🔊 Entrar na Minha Sala"
+    pub fn reopen_my_room(&self) {
+        if let Ok(mut t) = self.target_outbound_addr.lock() {
+            *t = None;
+        }
+        if let Ok(mut joined) = self.joined_room_label.lock() {
+            *joined = None;
+        }
+        self.in_room.store(true, Ordering::Relaxed);
+        self.ctx.request_repaint();
+    }
+
+    pub fn update_my_status(&self, name: String, user_tag: &str, is_sharing: bool, res_label: String) {
+        let new_id = derive_persistent_peer_id(&name, user_tag);
+        self.my_peer_id.store(new_id, Ordering::Relaxed);
+
         let mut stopped_sharing = false;
         let pkt = {
             let Ok(mut info) = self.my_info.lock() else {
@@ -650,22 +875,16 @@ impl RoomHub {
             if info.is_sharing && !is_sharing {
                 stopped_sharing = true;
             }
+            info.peer_id = new_id;
             info.name = name;
             info.is_sharing = is_sharing;
             info.res_label = res_label;
             info.last_seen = Instant::now();
-            build_info_packet(&info)
+            build_info_or_hello_packet(MAGIC_INFO, &info)
         };
 
         let stop_pkt = if stopped_sharing {
-            Some(build_packet(
-                MAGIC_STOP_STREAM,
-                self.my_peer_id,
-                0,
-                0,
-                0,
-                &[0],
-            ))
+            Some(build_packet(MAGIC_STOP_STREAM, new_id, 0, 0, 0, &[0]))
         } else {
             None
         };
@@ -681,8 +900,10 @@ impl RoomHub {
         }
     }
 
-    /// Envia um quadro de vídeo nosso para todos na sala (seja você o Host ou o Amigo convidado!)
     pub fn broadcast_my_video(&self, width: u16, height: u16, fps: u8, jpeg_bytes: &[u8]) {
+        if !self.in_room.load(Ordering::Relaxed) {
+            return;
+        }
         let mut conns = match self.connections.lock() {
             Ok(g) => g,
             Err(_) => return,
@@ -692,22 +913,18 @@ impl RoomHub {
             return;
         }
 
-        let pkt = build_packet(
-            MAGIC_VIDEO,
-            self.my_peer_id,
-            width,
-            height,
-            fps,
-            jpeg_bytes,
-        );
+        let my_id = self.my_peer_id.load(Ordering::Relaxed);
+        let pkt = build_packet(MAGIC_VIDEO, my_id, width, height, fps, jpeg_bytes);
 
         for c in conns.iter() {
-            c.push_video(self.my_peer_id, Arc::clone(&pkt));
+            c.push_video(my_id, Arc::clone(&pkt));
         }
     }
 
-    /// Envia um bloco de áudio nosso para todos na sala
     pub fn broadcast_my_audio(&self, pcm_bytes: &[u8]) {
+        if !self.in_room.load(Ordering::Relaxed) {
+            return;
+        }
         let mut conns = match self.connections.lock() {
             Ok(g) => g,
             Err(_) => return,
@@ -717,7 +934,8 @@ impl RoomHub {
             return;
         }
 
-        let pkt = build_packet(MAGIC_AUDIO, self.my_peer_id, 0, 0, 0, pcm_bytes);
+        let my_id = self.my_peer_id.load(Ordering::Relaxed);
+        let pkt = build_packet(MAGIC_AUDIO, my_id, 0, 0, 0, pcm_bytes);
 
         for c in conns.iter() {
             c.push_audio(Arc::clone(&pkt));
@@ -731,26 +949,36 @@ impl RoomHub {
             .unwrap_or(false)
     }
 
-    fn attach_bidirectional_stream(self: &Arc<Self>, mut write_stream: TcpStream, is_outbound: bool) {
+    fn attach_bidirectional_stream(
+        self: &Arc<Self>,
+        mut write_stream: TcpStream,
+        is_outbound: bool,
+    ) {
+        // CRÍTICO NO WINDOWS: Sockets vindos de `listener.accept()` herdam `nonblocking = true`!
+        // Forçamos `set_nonblocking(false)` para a transmissão NUNCA cair com erro `WouldBlock`!
+        let _ = write_stream.set_nonblocking(false);
         let _ = write_stream.set_nodelay(true);
-        let _ = write_stream.set_read_timeout(Some(Duration::from_secs(15)));
-        let _ = write_stream.set_write_timeout(Some(Duration::from_secs(15)));
+        let _ = write_stream.set_read_timeout(Some(Duration::from_secs(25)));
+        let _ = write_stream.set_write_timeout(Some(Duration::from_secs(20)));
 
         let mut read_stream = match write_stream.try_clone() {
             Ok(s) => s,
             Err(_) => return,
         };
+        let _ = read_stream.set_nonblocking(false);
 
         let conn_id = self.next_conn_id.fetch_add(1, Ordering::Relaxed);
         let slot = PeerConnectionSlot::new(conn_id, is_outbound);
 
-        // Envia imediatamente nossas informações e a lista de quem já está na sala para o novo participante
+        // Envia nosso pacote HELLO direto para identificar esta conexão sem ambiguidade
         if let Ok(info) = self.my_info.lock() {
-            slot.push_control(build_info_packet(&info));
+            slot.push_control(build_info_or_hello_packet(MAGIC_HELLO, &info));
         }
         if let Ok(existing_peers) = self.peers.lock() {
             for p in existing_peers.values() {
-                slot.push_control(build_info_packet(p));
+                if p.last_seen.elapsed() < Duration::from_secs(5) {
+                    slot.push_control(build_info_or_hello_packet(MAGIC_INFO, p));
+                }
             }
         }
 
@@ -758,13 +986,12 @@ impl RoomHub {
             conns.push(Arc::clone(&slot));
         }
 
-        // Thread de ESCRITA (envia Controle, Áudio e Vídeo mais recente)
+        // Thread de ESCRITA
         let slot_writer = Arc::clone(&slot);
         thread::spawn(move || {
             while slot_writer.alive.load(Ordering::Relaxed) {
                 let mut sent_anything = false;
 
-                // 1. Pacotes de controle (identidade/status da sala)
                 loop {
                     let next_ctrl = slot_writer
                         .control_queue
@@ -782,7 +1009,6 @@ impl RoomHub {
                     }
                 }
 
-                // 2. Pacotes de áudio
                 loop {
                     let next_aud = slot_writer
                         .audio_queue
@@ -800,7 +1026,6 @@ impl RoomHub {
                     }
                 }
 
-                // 3. Quadros de vídeo mais recentes de cada participante transmitindo
                 let video_pkts: Vec<Arc<Vec<u8>>> = {
                     if let Ok(mut map) = slot_writer.latest_video_by_sender.lock() {
                         map.drain().map(|(_, v)| v).collect()
@@ -830,7 +1055,7 @@ impl RoomHub {
             }
         });
 
-        // Thread de LEITURA (recebe Controle, Áudio e Vídeo do amigo nesta conexão e repassa aos demais na sala)
+        // Thread de LEITURA
         let hub_reader = Arc::clone(self);
         let slot_reader = Arc::clone(&slot);
         thread::spawn(move || {
@@ -870,66 +1095,124 @@ impl RoomHub {
                     break;
                 }
 
-                if sender_id == 0 || sender_id == hub_reader.my_peer_id {
+                let my_id = hub_reader.my_peer_id.load(Ordering::Relaxed);
+                if sender_id == 0 || sender_id == my_id {
                     continue;
                 }
 
-                if slot_reader.remote_peer_id.load(Ordering::Relaxed) == 0 {
+                // Se for HELLO direto (ou primeiro pacote direto), registra o dono desta conexão
+                // e derruba qualquer conexão duplicada anterior do mesmo amigo!
+                if &magic == MAGIC_HELLO
+                    || slot_reader.remote_peer_id.load(Ordering::Relaxed) == 0
+                {
                     slot_reader.remote_peer_id.store(sender_id, Ordering::Relaxed);
+                    if let Ok(mut conns) = hub_reader.connections.lock() {
+                        for other in conns.iter() {
+                            if other.conn_id != slot_reader.conn_id
+                                && other.remote_peer_id.load(Ordering::Relaxed) == sender_id
+                            {
+                                other.alive.store(false, Ordering::Relaxed);
+                                other.wakeup.notify_all();
+                            }
+                        }
+                        conns.retain(|c| c.alive.load(Ordering::Relaxed));
+                    }
                 }
 
-                // Repassa o pacote para outras conexões na mesma sala (Multi-Stream Mesh/Relay)
-                let relay_pkt =
-                    build_packet(&magic, sender_id, width, height, fps, &payload);
-                if let Ok(conns) = hub_reader.connections.lock() {
-                    for other in conns.iter() {
-                        if other.conn_id != slot_reader.conn_id
-                            && other.alive.load(Ordering::Relaxed)
-                        {
-                            if &magic == MAGIC_VIDEO {
-                                other.push_video(sender_id, Arc::clone(&relay_pkt));
-                            } else if &magic == MAGIC_AUDIO {
-                                other.push_audio(Arc::clone(&relay_pkt));
-                            } else {
-                                other.push_control(Arc::clone(&relay_pkt));
+                let direct_peer_id = slot_reader.remote_peer_id.load(Ordering::Relaxed);
+
+                // REGRA ANTI-LOOP: Só repassa pacotes que vieram DIRETAMENTE do dono deste socket (`sender_id == direct_peer_id`),
+                // nunca pacotes já repassados!
+                if sender_id == direct_peer_id {
+                    let relay_magic = if &magic == MAGIC_HELLO {
+                        MAGIC_INFO
+                    } else {
+                        &magic
+                    };
+                    let relay_pkt =
+                        build_packet(relay_magic, sender_id, width, height, fps, &payload);
+                    if let Ok(conns) = hub_reader.connections.lock() {
+                        for other in conns.iter() {
+                            if other.conn_id != slot_reader.conn_id
+                                && other.alive.load(Ordering::Relaxed)
+                                && other.remote_peer_id.load(Ordering::Relaxed) != sender_id
+                            {
+                                if &magic == MAGIC_VIDEO {
+                                    other.push_video(sender_id, Arc::clone(&relay_pkt));
+                                } else if &magic == MAGIC_AUDIO {
+                                    other.push_audio(Arc::clone(&relay_pkt));
+                                } else {
+                                    other.push_control(Arc::clone(&relay_pkt));
+                                }
                             }
                         }
                     }
                 }
 
-                if &magic == MAGIC_INFO {
+                if &magic == MAGIC_HELLO || &magic == MAGIC_INFO {
                     if let Ok(text) = std::str::from_utf8(&payload) {
                         let parts: Vec<&str> = text.split('\t').collect();
                         if parts.len() >= 3 {
-                            let peer_name = parts[0].to_string();
+                            let peer_name = parts[0].trim().to_string();
                             let is_sharing = parts[1] == "1";
                             let res_label = parts[2].to_string();
 
-                            if let Ok(mut peers_map) = hub_reader.peers.lock() {
-                                peers_map.insert(
-                                    sender_id,
-                                    PeerInfo {
-                                        peer_id: sender_id,
-                                        name: peer_name.clone(),
-                                        is_sharing,
-                                        res_label,
-                                        last_seen: Instant::now(),
-                                    },
-                                );
-                            }
+                            // Ignora fantasmas com o nosso próprio nome caso tenhamos mudado de tag
+                            let is_same_as_me = hub_reader
+                                .my_info
+                                .lock()
+                                .map(|me| {
+                                    me.peer_id == sender_id
+                                        || (me.name.eq_ignore_ascii_case(&peer_name)
+                                            && sender_id != direct_peer_id)
+                                })
+                                .unwrap_or(false);
 
-                            if !is_sharing {
-                                if let Ok(mut streams) = hub_reader.remote_streams.lock() {
-                                    streams.remove(&sender_id);
+                            if !is_same_as_me {
+                                let mut old_duplicate_ids = Vec::new();
+                                if let Ok(mut peers_map) = hub_reader.peers.lock() {
+                                    // Remove entradas antigas com o mesmo nome mas ID antigo
+                                    peers_map.retain(|&k, v| {
+                                        if k != sender_id && v.name.eq_ignore_ascii_case(&peer_name)
+                                        {
+                                            old_duplicate_ids.push(k);
+                                            false
+                                        } else {
+                                            true
+                                        }
+                                    });
+
+                                    peers_map.insert(
+                                        sender_id,
+                                        PeerInfo {
+                                            peer_id: sender_id,
+                                            name: peer_name.clone(),
+                                            is_sharing,
+                                            res_label,
+                                            last_seen: Instant::now(),
+                                        },
+                                    );
                                 }
+
+                                if !old_duplicate_ids.is_empty() || !is_sharing {
+                                    if let Ok(mut streams) = hub_reader.remote_streams.lock() {
+                                        for old_id in old_duplicate_ids {
+                                            streams.remove(&old_id);
+                                        }
+                                        if !is_sharing {
+                                            streams.remove(&sender_id);
+                                        }
+                                    }
+                                }
+                                hub_reader.ctx.request_repaint();
                             }
-                            hub_reader.ctx.request_repaint();
                         }
                     }
                 } else if &magic == MAGIC_STOP_STREAM {
                     if let Ok(mut peers_map) = hub_reader.peers.lock() {
                         if let Some(p) = peers_map.get_mut(&sender_id) {
                             p.is_sharing = false;
+                            p.last_seen = Instant::now();
                         }
                     }
                     if let Ok(mut streams) = hub_reader.remote_streams.lock() {
@@ -959,22 +1242,15 @@ impl RoomHub {
                                 rgba[i * 4 + 3] = 255;
                             }
 
-                            let peer_name = hub_reader
-                                .peers
-                                .lock()
-                                .ok()
-                                .and_then(|m| m.get(&sender_id).map(|p| p.name.clone()))
-                                .unwrap_or_else(|| format!("Amigo #{}", sender_id % 1000));
-
-                            // Marca também que esse amigo está transmitindo
                             if let Ok(mut peers_map) = hub_reader.peers.lock() {
-                                let entry = peers_map.entry(sender_id).or_insert_with(|| PeerInfo {
-                                    peer_id: sender_id,
-                                    name: peer_name.clone(),
-                                    is_sharing: true,
-                                    res_label: format!("{}p {}fps", h, fps),
-                                    last_seen: Instant::now(),
-                                });
+                                let entry =
+                                    peers_map.entry(sender_id).or_insert_with(|| PeerInfo {
+                                        peer_id: sender_id,
+                                        name: format!("Amigo #{}", sender_id % 1000),
+                                        is_sharing: true,
+                                        res_label: format!("{}p {}fps", h, fps),
+                                        last_seen: Instant::now(),
+                                    });
                                 entry.is_sharing = true;
                                 entry.last_seen = Instant::now();
                             }
@@ -984,7 +1260,7 @@ impl RoomHub {
                                 Arc::clone(
                                     streams
                                         .entry(sender_id)
-                                        .or_insert_with(|| RemotePeerStream::new(sender_id, peer_name)),
+                                        .or_insert_with(RemotePeerStream::new),
                                 )
                             };
 
@@ -1000,51 +1276,52 @@ impl RoomHub {
                         }
                     }
                 } else if &magic == MAGIC_AUDIO {
-                    let peer_name = hub_reader
-                        .peers
-                        .lock()
-                        .ok()
-                        .and_then(|m| m.get(&sender_id).map(|p| p.name.clone()))
-                        .unwrap_or_else(|| format!("Amigo #{}", sender_id % 1000));
-
                     let stream_arc = {
                         let mut streams = hub_reader.remote_streams.lock().unwrap();
                         Arc::clone(
                             streams
                                 .entry(sender_id)
-                                .or_insert_with(|| RemotePeerStream::new(sender_id, peer_name)),
+                                .or_insert_with(RemotePeerStream::new),
                         )
                     };
                     let _ = stream_arc.audio_player.clone_sender().try_send(payload);
                 }
             }
 
-            // Conexão encerrada: limpa o participante que desconectou
+            // Conexão encerrada
             slot_reader.alive.store(false, Ordering::Relaxed);
             slot_reader.wakeup.notify_all();
 
             let disconnected_peer = slot_reader.remote_peer_id.load(Ordering::Relaxed);
             if disconnected_peer != 0 {
-                if let Ok(mut peers_map) = hub_reader.peers.lock() {
-                    peers_map.remove(&disconnected_peer);
-                }
-                if let Ok(mut streams) = hub_reader.remote_streams.lock() {
-                    streams.remove(&disconnected_peer);
-                }
+                // Só remove o participante se NÃO houver outra conexão ativa para o mesmo `disconnected_peer`!
+                let still_connected_elsewhere = hub_reader
+                    .connections
+                    .lock()
+                    .map(|conns| {
+                        conns.iter().any(|c| {
+                            c.conn_id != slot_reader.conn_id
+                                && c.alive.load(Ordering::Relaxed)
+                                && c.remote_peer_id.load(Ordering::Relaxed) == disconnected_peer
+                        })
+                    })
+                    .unwrap_or(false);
 
-                // Notifica os demais na sala que esse participante saiu
-                let bye_pkt = build_packet(MAGIC_LEFT_ROOM, disconnected_peer, 0, 0, 0, &[0]);
-                if let Ok(mut conns) = hub_reader.connections.lock() {
-                    conns.retain(|c| c.alive.load(Ordering::Relaxed));
-                    for c in conns.iter() {
-                        c.push_control(Arc::clone(&bye_pkt));
+                if !still_connected_elsewhere {
+                    if let Ok(mut peers_map) = hub_reader.peers.lock() {
+                        peers_map.remove(&disconnected_peer);
                     }
-                }
-            }
+                    if let Ok(mut streams) = hub_reader.remote_streams.lock() {
+                        streams.remove(&disconnected_peer);
+                    }
 
-            if slot_reader.is_outbound {
-                if let Ok(mut joined) = hub_reader.joined_room_label.lock() {
-                    *joined = None;
+                    let bye_pkt = build_packet(MAGIC_LEFT_ROOM, disconnected_peer, 0, 0, 0, &[0]);
+                    if let Ok(mut conns) = hub_reader.connections.lock() {
+                        conns.retain(|c| c.alive.load(Ordering::Relaxed));
+                        for c in conns.iter() {
+                            c.push_control(Arc::clone(&bye_pkt));
+                        }
+                    }
                 }
             }
 
