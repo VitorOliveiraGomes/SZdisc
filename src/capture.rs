@@ -53,6 +53,7 @@ pub struct CaptureSource {
     pub name: String,
     pub subtitle: String,
     pub exe_name: String,
+    pub pid: u32,
     pub category: SourceCategory,
     pub kind: CaptureSourceKind,
 }
@@ -64,16 +65,16 @@ pub struct RawFrame {
     pub rgba: Vec<u8>,
 }
 
-unsafe fn get_window_exe_name(hwnd: HWND) -> String {
+unsafe fn get_window_pid_and_exe(hwnd: HWND) -> (u32, String) {
     let mut pid: DWORD = 0;
     GetWindowThreadProcessId(hwnd, &mut pid);
     if pid == 0 {
-        return String::new();
+        return (0, String::new());
     }
 
     let h_proc = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
     if h_proc.is_null() {
-        return String::new();
+        return (pid, String::new());
     }
 
     let mut buf = [0u16; 512];
@@ -82,17 +83,19 @@ unsafe fn get_window_exe_name(hwnd: HWND) -> String {
     CloseHandle(h_proc);
 
     if ok == 0 || size == 0 {
-        return String::new();
+        return (pid, String::new());
     }
 
     let full_path = OsString::from_wide(&buf[..size as usize])
         .to_string_lossy()
         .to_string();
 
-    Path::new(&full_path)
+    let exe = Path::new(&full_path)
         .file_name()
         .map(|s| s.to_string_lossy().to_string())
-        .unwrap_or_default()
+        .unwrap_or_default();
+
+    (pid, exe)
 }
 
 unsafe extern "system" fn monitor_enum_proc(
@@ -126,6 +129,7 @@ unsafe extern "system" fn monitor_enum_proc(
             name: label,
             subtitle: format!("🖥️ Monitor Completo • {}×{}", w, h),
             exe_name: "Monitor".to_string(),
+            pid: 0,
             category: SourceCategory::Screen,
             kind: CaptureSourceKind::Monitor {
                 index: idx,
@@ -294,7 +298,7 @@ unsafe extern "system" fn window_enum_proc(hwnd: HWND, lparam: LPARAM) -> BOOL {
         return TRUE;
     }
 
-    let exe_name = get_window_exe_name(hwnd);
+    let (pid, exe_name) = get_window_pid_and_exe(hwnd);
     let (clean_name, subtitle, category) =
         classify_window(&title, &exe_name, w, h, is_minimized);
 
@@ -304,6 +308,7 @@ unsafe extern "system" fn window_enum_proc(hwnd: HWND, lparam: LPARAM) -> BOOL {
         name: clean_name,
         subtitle,
         exe_name,
+        pid,
         category,
         kind: CaptureSourceKind::Window {
             hwnd: hwnd as usize,

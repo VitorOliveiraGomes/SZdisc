@@ -83,6 +83,7 @@ struct LiveStreamConfig {
     eco_hide_preview: AtomicBool,
     draw_cursor: AtomicBool,
     share_system_audio: Arc<AtomicBool>,
+    target_audio_pid: Arc<AtomicU32>,
     active_source: Mutex<Option<CaptureSource>>,
 }
 
@@ -165,7 +166,9 @@ impl Disc2App {
         };
 
         let sources = list_capture_sources();
+        let initial_pid = sources.first().map(|s| s.pid).unwrap_or(0);
         let share_system_audio = Arc::new(AtomicBool::new(true));
+        let target_audio_pid = Arc::new(AtomicU32::new(initial_pid));
         let stream_config = Arc::new(LiveStreamConfig {
             target_w: AtomicU32::new(1920),
             target_h: AtomicU32::new(1080),
@@ -174,6 +177,7 @@ impl Disc2App {
             eco_hide_preview: AtomicBool::new(false),
             draw_cursor: AtomicBool::new(custom.show_cursor_in_stream),
             share_system_audio,
+            target_audio_pid,
             active_source: Mutex::new(sources.first().cloned()),
         });
 
@@ -285,6 +289,9 @@ impl Disc2App {
             .store(self.share_audio_enabled, Ordering::Relaxed);
 
         if let Some(src) = self.sources.get(self.selected_source_idx).cloned() {
+            self.stream_config
+                .target_audio_pid
+                .store(src.pid, Ordering::Relaxed);
             if let Ok(mut guard) = self.stream_config.active_source.lock() {
                 *guard = Some(src);
             }
@@ -332,11 +339,12 @@ impl Disc2App {
         let stop_flag = Arc::new(AtomicBool::new(false));
         self.capture_stop_flag = Some(Arc::clone(&stop_flag));
 
-        // Inicia a captura de áudio do sistema (WASAPI Loopback) junto com a transmissão
+        // Inicia a captura de áudio isolada do jogo/app selecionado (ou do sistema se for Tela Inteira)
         let audio_stop = Arc::clone(&stop_flag);
         let audio_enabled = Arc::clone(&self.stream_config.share_system_audio);
+        let audio_pid = Arc::clone(&self.stream_config.target_audio_pid);
         let server_for_audio = Arc::clone(&server);
-        spawn_system_audio_loopback(audio_stop, audio_enabled, move |pcm_bytes| {
+        spawn_system_audio_loopback(audio_stop, audio_enabled, audio_pid, move |pcm_bytes| {
             server_for_audio.broadcast_audio(pcm_bytes);
         });
 
