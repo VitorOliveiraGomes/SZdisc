@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::io::{Read, Write};
-use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream, UdpSocket};
+use std::net::{IpAddr, TcpListener, TcpStream, ToSocketAddrs, UdpSocket};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
 use std::sync::{Arc, Mutex};
@@ -13,6 +13,7 @@ use crate::audio::StreamAudioPlayer;
 
 pub const DEFAULT_STREAM_PORT: u16 = 47830;
 pub const LAN_DISCOVERY_PORT: u16 = 47831;
+const BORE_RELAY_HOST: &str = "bore.pub:7835";
 const FRAME_MAGIC: &[u8; 4] = b"DSC2";
 const AUDIO_MAGIC: &[u8; 4] = b"AUD2";
 
@@ -92,8 +93,132 @@ pub fn start_lan_discovery_listener() -> Arc<Mutex<HashMap<String, DiscoveredRoo
     rooms
 }
 
+fn attach_viewer_stream(
+    mut stream: TcpStream,
+    viewers: &Arc<Mutex<Vec<SyncSender<Arc<Vec<u8>>>>>>,
+    viewer_count: &Arc<AtomicUsize>,
+) {
+    let _ = stream.set_nodelay(true);
+    let _ = stream.set_write_timeout(Some(Duration::from_millis(900)));
+
+    let (tx, rx) = sync_channel::<Arc<Vec<u8>>>(8);
+    if let Ok(mut list) = viewers.lock() {
+        list.push(tx);
+        viewer_count.store(list.len(), Ordering::Relaxed);
+    }
+
+    thread::spawn(move || {
+        while let Ok(packet) = rx.recv() {
+            if stream.write_all(&packet).is_err() {
+                break;
+            }
+        }
+    });
+}
+
+/// Extrai o valor de `"Hello":12345`
+fn parse_bore_hello_port(msg: &str) -> Option<u16> {
+    let idx = msg.find("\"Hello\":")?;
+    let rest = &msg[idx + 8..];
+    let digits: String = rest
+        .chars()
+        .skip_while(|c| c.is_whitespace())
+        .take_while(|c| c.is_ascii_digit())
+        .collect();
+    digits.parse::<u16>().ok()
+}
+
+/// Extrai o UUID de `"Connection":"550e8400-..."`
+fn parse_bore_connection_uuid(msg: &str) -> Option<String> {
+    let idx = msg.find("\"Connection\":\"")?;
+    let rest = &msg[idx + 14..];
+    let end = rest.find('"')?;
+    Some(rest[..end].to_string())
+}
+
+/// Inicia túnel público na internet (bore.pub) para que amigos conectem com código de 5 dígitos sem Radmin VPN
+fn spawn_internet_tunnel_worker(
+    stop_flag: Arc<AtomicBool>,
+    internet_code: Arc<Mutex<Option<String>>>,
+    viewers: Arc<Mutex<Vec<SyncSender<Arc<Vec<u8>>>>>>,
+    viewer_count: Arc<AtomicUsize>,
+) {
+    thread::spawn(move || {
+        let addr = match BORE_RELAY_HOST
+            .to_socket_addrs()
+            .ok()
+            .and_then(|mut it| it.next())
+        {
+            Some(a) => a,
+            None => return,
+        };
+
+        let mut ctrl = match TcpStream::connect_timeout(&addr, Duration::from_secs(5)) {
+            Ok(s) => s,
+            Err(_) => return,
+        };
+
+        let _ = ctrl.set_nodelay(true);
+        let _ = ctrl.set_read_timeout(Some(Duration::from_secs(15)));
+
+        if ctrl.write_all(b"{\"Hello\":0}\0").is_err() {
+            return;
+        }
+
+        let mut pending = Vec::with_capacity(512);
+        let mut temp = [0u8; 256];
+
+        while !stop_flag.load(Ordering::Relaxed) {
+            match ctrl.read(&mut temp) {
+                Ok(0) => break,
+                Ok(n) => {
+                    pending.extend_from_slice(&temp[..n]);
+                    while let Some(pos) = pending.iter().position(|&b| b == 0) {
+                        let msg_bytes: Vec<u8> = pending.drain(..=pos).collect();
+                        let s = String::from_utf8_lossy(&msg_bytes[..msg_bytes.len() - 1]);
+
+                        if let Some(port) = parse_bore_hello_port(&s) {
+                            if port > 0 {
+                                if let Ok(mut code_guard) = internet_code.lock() {
+                                    *code_guard = Some(port.to_string());
+                                }
+                            }
+                        } else if let Some(uuid) = parse_bore_connection_uuid(&s) {
+                            // Um amigo conectou pelo código da sala na internet!
+                            let viewers_clone = Arc::clone(&viewers);
+                            let count_clone = Arc::clone(&viewer_count);
+                            thread::spawn(move || {
+                                if let Ok(mut data_stream) =
+                                    TcpStream::connect_timeout(&addr, Duration::from_secs(5))
+                                {
+                                    let accept_msg = format!("{{\"Accept\":\"{}\"}}\0", uuid);
+                                    if data_stream.write_all(accept_msg.as_bytes()).is_ok() {
+                                        attach_viewer_stream(
+                                            data_stream,
+                                            &viewers_clone,
+                                            &count_clone,
+                                        );
+                                    }
+                                }
+                            });
+                        }
+                    }
+                }
+                Err(ref e)
+                    if e.kind() == std::io::ErrorKind::WouldBlock
+                        || e.kind() == std::io::ErrorKind::TimedOut =>
+                {
+                    continue;
+                }
+                Err(_) => break,
+            }
+        }
+    });
+}
+
 pub struct StreamHostServer {
     pub listen_addr: String,
+    pub internet_code: Arc<Mutex<Option<String>>>,
     stop_flag: Arc<AtomicBool>,
     viewers: Arc<Mutex<Vec<SyncSender<Arc<Vec<u8>>>>>>,
     pub viewer_count: Arc<AtomicUsize>,
@@ -124,7 +249,9 @@ impl StreamHostServer {
         let viewers: Arc<Mutex<Vec<SyncSender<Arc<Vec<u8>>>>>> = Arc::new(Mutex::new(Vec::new()));
         let viewer_count = Arc::new(AtomicUsize::new(0));
         let bytes_sent_per_sec = Arc::new(AtomicU32::new(0));
+        let internet_code: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
 
+        // 1. Thread aceitando conexões diretas (LAN / Radmin VPN)
         let stop_accept = Arc::clone(&stop_flag);
         let viewers_accept = Arc::clone(&viewers);
         let count_accept = Arc::clone(&viewer_count);
@@ -132,24 +259,8 @@ impl StreamHostServer {
         thread::spawn(move || {
             while !stop_accept.load(Ordering::Relaxed) {
                 match listener.accept() {
-                    Ok((mut stream, _peer)) => {
-                        let _ = stream.set_nodelay(true);
-                        let _ = stream.set_write_timeout(Some(Duration::from_millis(800)));
-
-                        // Fila curta (vídeo + áudio de baixa latência)
-                        let (tx, rx) = sync_channel::<Arc<Vec<u8>>>(8);
-                        if let Ok(mut list) = viewers_accept.lock() {
-                            list.push(tx);
-                            count_accept.store(list.len(), Ordering::Relaxed);
-                        }
-
-                        thread::spawn(move || {
-                            while let Ok(packet) = rx.recv() {
-                                if stream.write_all(&packet).is_err() {
-                                    break;
-                                }
-                            }
-                        });
+                    Ok((stream, _peer)) => {
+                        attach_viewer_stream(stream, &viewers_accept, &count_accept);
                     }
                     Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                         thread::sleep(Duration::from_millis(40));
@@ -161,6 +272,15 @@ impl StreamHostServer {
             }
         });
 
+        // 2. Inicia também o Túnel de Internet (código de 5 dígitos sem precisar de Radmin!)
+        spawn_internet_tunnel_worker(
+            Arc::clone(&stop_flag),
+            Arc::clone(&internet_code),
+            Arc::clone(&viewers),
+            Arc::clone(&viewer_count),
+        );
+
+        // 3. Thread anunciando na rede local via UDP Broadcast
         let stop_udp = Arc::clone(&stop_flag);
         let count_udp = Arc::clone(&viewer_count);
         thread::spawn(move || {
@@ -182,6 +302,7 @@ impl StreamHostServer {
 
         Ok(Self {
             listen_addr,
+            internet_code,
             stop_flag,
             viewers,
             viewer_count,
@@ -277,10 +398,15 @@ impl StreamViewerClient {
         volume_percent: Arc<AtomicU32>,
         muted: Arc<AtomicBool>,
     ) -> Self {
-        let addr_str = if raw_target.contains(':') {
-            raw_target.trim().to_string()
+        let trimmed = raw_target.trim().trim_start_matches('#');
+
+        // Se o amigo digitou apenas o Código de 4-5 dígitos (ex: "52735"), conecta via túnel de internet (bore.pub:52735)
+        let addr_str = if !trimmed.contains('.') && !trimmed.contains(':') {
+            format!("bore.pub:{}", trimmed)
+        } else if trimmed.contains(':') {
+            trimmed.to_string()
         } else {
-            format!("{}:{}", raw_target.trim(), DEFAULT_STREAM_PORT)
+            format!("{}:{}", trimmed, DEFAULT_STREAM_PORT)
         };
 
         let connected = Arc::new(AtomicBool::new(false));
@@ -293,31 +419,35 @@ impl StreamViewerClient {
         let stop_clone = Arc::clone(&stop_flag);
         let err_clone = Arc::clone(&error_msg);
         let target_copy = addr_str.clone();
-        let audio_tx = audio_player_sender_clone(&audio_player);
+        let audio_tx = audio_player.clone_sender();
 
         thread::spawn(move || {
-            let sock_addr: SocketAddr = match target_copy.parse() {
-                Ok(a) => a,
-                Err(_) => {
+            let sock_addr = match target_copy
+                .to_socket_addrs()
+                .ok()
+                .and_then(|mut it| it.next())
+            {
+                Some(a) => a,
+                None => {
                     if let Ok(mut e) = err_clone.lock() {
-                        *e = Some(format!("Endereço inválido: {}", target_copy));
+                        *e = Some(format!("Endereço/código inválido: {}", target_copy));
                     }
                     return;
                 }
             };
 
-            let mut stream = match TcpStream::connect_timeout(&sock_addr, Duration::from_secs(4)) {
+            let mut stream = match TcpStream::connect_timeout(&sock_addr, Duration::from_secs(5)) {
                 Ok(s) => s,
                 Err(err) => {
                     if let Ok(mut e) = err_clone.lock() {
-                        *e = Some(format!("Falha ao conectar: {}", err));
+                        *e = Some(format!("Não foi possível conectar na sala ({})", err));
                     }
                     return;
                 }
             };
 
             let _ = stream.set_nodelay(true);
-            let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+            let _ = stream.set_read_timeout(Some(Duration::from_secs(6)));
             conn_flag.store(true, Ordering::Relaxed);
 
             let mut header = [0u8; 13];
@@ -387,10 +517,6 @@ impl StreamViewerClient {
         self.connected.store(false, Ordering::Relaxed);
         self.audio_player.stop();
     }
-}
-
-fn audio_player_sender_clone(player: &StreamAudioPlayer) -> SyncSender<Vec<u8>> {
-    player.clone_sender()
 }
 
 impl StreamAudioPlayer {

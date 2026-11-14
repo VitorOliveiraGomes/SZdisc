@@ -4,6 +4,7 @@ mod audio;
 mod capture;
 mod network;
 mod profile_theme;
+mod updater;
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, Ordering};
@@ -29,6 +30,10 @@ use profile_theme::{
     draw_discord_avatar, draw_discord_profile_card, load_banner_texture,
     load_circular_avatar_texture, pick_image_file_dialog, PresenceStatus, ThemePreset,
     UserCustomization,
+};
+use updater::{
+    check_for_updates_async, cleanup_old_exe, download_and_apply_update_async, UpdateStatus,
+    CURRENT_VERSION,
 };
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -146,10 +151,17 @@ struct Disc2App {
     bytes_counter: usize,
     last_metrics_tick: Instant,
     status_toast: Option<(String, Instant)>,
+
+    // Auto-Updater pelo GitHub
+    update_status: Arc<Mutex<UpdateStatus>>,
 }
 
 impl Disc2App {
     fn new(cc: &eframe::CreationContext<'_>) -> Self {
+        cleanup_old_exe();
+        let update_status = Arc::new(Mutex::new(UpdateStatus::Idle));
+        check_for_updates_async(Arc::clone(&update_status));
+
         let custom = UserCustomization::load_from_disk();
         custom.apply_to_egui(&cc.egui_ctx);
 
@@ -219,6 +231,7 @@ impl Disc2App {
             bytes_counter: 0,
             last_metrics_tick: Instant::now(),
             status_toast: None,
+            update_status,
         }
     }
 
@@ -1466,37 +1479,78 @@ impl eframe::App for Disc2App {
                             ui.add_space(6.0);
                             if let Some(srv) = &self.host_server {
                                 let addr = srv.listen_addr.clone();
+                                let net_code = srv
+                                    .internet_code
+                                    .lock()
+                                    .ok()
+                                    .and_then(|g| g.clone());
                                 let viewers = srv.viewer_count.load(Ordering::Relaxed);
+
                                 egui::Frame::none()
                                     .fill(Color32::from_rgb(20, 42, 30))
                                     .stroke(Stroke::new(1.0_f32, Color32::from_rgb(35, 165, 90)))
                                     .rounding(Rounding::same(6.0))
                                     .inner_margin(egui::Margin::same(8.0))
                                     .show(ui, |ui| {
-                                        ui.horizontal(|ui| {
-                                            ui.colored_label(
-                                                Color32::from_rgb(134, 239, 172),
-                                                RichText::new(format!("Sala: {}", addr))
+                                        if let Some(code) = net_code {
+                                            ui.horizontal(|ui| {
+                                                ui.colored_label(
+                                                    Color32::from_rgb(134, 239, 172),
+                                                    RichText::new(format!(
+                                                        "🌐 Código (Sem Radmin): {}",
+                                                        code
+                                                    ))
                                                     .strong()
-                                                    .size(12.0),
+                                                    .size(12.5),
+                                                );
+                                                ui.with_layout(
+                                                    egui::Layout::right_to_left(
+                                                        egui::Align::Center,
+                                                    ),
+                                                    |ui| {
+                                                        if ui.small_button("Copiar").clicked() {
+                                                            ctx.copy_text(code.clone());
+                                                            self.show_toast(format!(
+                                                                "Código {} copiado!",
+                                                                code
+                                                            ));
+                                                        }
+                                                    },
+                                                );
+                                            });
+                                        } else {
+                                            ui.label(
+                                                RichText::new("🌐 Gerando código de internet...")
+                                                    .size(11.5)
+                                                    .color(Color32::from_rgb(250, 204, 21)),
+                                            );
+                                        }
+
+                                        ui.add_space(2.0);
+                                        ui.horizontal(|ui| {
+                                            ui.label(
+                                                RichText::new(format!("🏠 LAN/VPN: {}", addr))
+                                                    .size(11.0)
+                                                    .color(Color32::from_rgb(181, 186, 193)),
                                             );
                                             ui.with_layout(
                                                 egui::Layout::right_to_left(egui::Align::Center),
                                                 |ui| {
-                                                    if ui.small_button("Copiar").clicked() {
+                                                    if ui.small_button("IP").clicked() {
                                                         ctx.copy_text(addr.clone());
-                                                        self.show_toast("Endereço copiado!");
+                                                        self.show_toast("IP local copiado!");
                                                     }
                                                 },
                                             );
                                         });
+
                                         ui.label(
                                             RichText::new(format!(
                                                 "Assistindo agora: {}",
                                                 viewers
                                             ))
                                             .size(11.0)
-                                            .color(Color32::from_rgb(181, 186, 193)),
+                                            .color(Color32::from_rgb(134, 239, 172)),
                                         );
                                     });
                             }
@@ -1592,7 +1646,7 @@ impl eframe::App for Disc2App {
                         ui.add_space(8.0);
 
                         ui.label(
-                            RichText::new("CONECTAR EM UMA SALA")
+                            RichText::new("CONECTAR EM UMA SALA (CÓDIGO OU IP)")
                                 .size(10.5)
                                 .strong()
                                 .color(Color32::from_rgb(148, 155, 164)),
@@ -1601,7 +1655,7 @@ impl eframe::App for Disc2App {
                         ui.horizontal(|ui| {
                             ui.add(
                                 egui::TextEdit::singleline(&mut self.join_addr_input)
-                                    .hint_text("IP ou IP:Porta do amigo")
+                                    .hint_text("Código (ex: 52735) ou IP")
                                     .desired_width(175.0),
                             );
                             if ui.button("Entrar").clicked()
@@ -1815,6 +1869,55 @@ impl eframe::App for Disc2App {
                     }
 
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        // Botão de Auto-Update pelo GitHub
+                        let upd_state = self
+                            .update_status
+                            .lock()
+                            .map(|g| g.clone())
+                            .unwrap_or(UpdateStatus::Idle);
+
+                        match upd_state {
+                            UpdateStatus::Downloading => {
+                                ui.colored_label(
+                                    Color32::from_rgb(250, 204, 21),
+                                    RichText::new("⏳ Atualizando...").size(12.0).strong(),
+                                );
+                            }
+                            UpdateStatus::UpdateAvailable(ver) => {
+                                let btn = egui::Button::new(
+                                    RichText::new(format!("⬇ Atualizar (v{})", ver))
+                                        .size(12.0)
+                                        .strong()
+                                        .color(Color32::WHITE),
+                                )
+                                .fill(Color32::from_rgb(35, 165, 90));
+                                if ui
+                                    .add(btn)
+                                    .on_hover_text(
+                                        "Baixa a nova versão direto do GitHub e reinicia sozinho",
+                                    )
+                                    .clicked()
+                                {
+                                    download_and_apply_update_async(Arc::clone(
+                                        &self.update_status,
+                                    ));
+                                }
+                            }
+                            _ => {
+                                if ui
+                                    .button(format!("🔄 Atualizar (v{})", CURRENT_VERSION))
+                                    .on_hover_text(
+                                        "Clique para baixar a versão mais recente direto do GitHub e reiniciar automaticamente",
+                                    )
+                                    .clicked()
+                                {
+                                    download_and_apply_update_async(Arc::clone(
+                                        &self.update_status,
+                                    ));
+                                }
+                            }
+                        }
+
                         if ui.button("🎨 Personalizar").clicked() {
                             self.show_settings_modal = true;
                         }
