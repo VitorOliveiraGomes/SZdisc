@@ -10,22 +10,23 @@ use eframe::egui::Context;
 use zune_jpeg::JpegDecoder;
 
 use crate::audio::StreamAudioPlayer;
+use crate::profile_theme::ServerProfile;
 
 pub const DEFAULT_STREAM_PORT: u16 = 47830;
 pub const LAN_DISCOVERY_PORT: u16 = 47831;
-pub const GLOBAL_LOBBY_BORE_PORT: u16 = 47829;
 const BORE_RELAY_HOST: &str = "bore.pub:7835";
 
-const MAGIC_HELLO: &[u8; 4] = b"HLO5";
-const MAGIC_INFO: &[u8; 4] = b"INF5";
-const MAGIC_VIDEO: &[u8; 4] = b"VID5";
-const MAGIC_AUDIO: &[u8; 4] = b"AUD5";
-const MAGIC_STOP_STREAM: &[u8; 4] = b"STP5";
-const MAGIC_LEFT_ROOM: &[u8; 4] = b"BYE5";
+const MAGIC_HELLO: &[u8; 4] = b"HLO6";
+const MAGIC_INFO: &[u8; 4] = b"INF6";
+const MAGIC_VIDEO: &[u8; 4] = b"VID6";
+const MAGIC_AUDIO: &[u8; 4] = b"AUD6";
+const MAGIC_STOP_STREAM: &[u8; 4] = b"STP6";
+const MAGIC_LEFT_ROOM: &[u8; 4] = b"BYE6";
 
 #[derive(Clone, Debug)]
 pub struct DiscoveredRoom {
     pub host_peer_id: u32,
+    pub server_id: String,
     pub current_room: String,
     pub addr: String,
     pub res_label: String,
@@ -34,11 +35,12 @@ pub struct DiscoveredRoom {
     pub last_seen: Instant,
 }
 
-/// Representa qualquer amigo online no Servidor (mesmo que esteja em outra sala ou no lobby)
+/// Representa um membro online dentro de um Servidor específico (mesmo em outra sala daquele servidor)
 #[derive(Clone, Debug)]
 pub struct ServerMemberPresence {
     pub peer_id: u32,
     pub name: String,
+    pub server_id: String,
     pub current_room: String,
     pub is_sharing: bool,
     pub res_label: String,
@@ -163,12 +165,29 @@ pub fn derive_persistent_peer_id(display_name: &str, user_tag: &str) -> u32 {
     if hash == 0 { 1 } else { hash }
 }
 
-/// Calcula a porta dedicada de uma Sala a partir do nome dela!
-/// Assim, quando você ou seu amigo clicam na mesma sala (ex: "Sala Geral #1" ou "Tropa"),
-/// ambos se encontram automaticamente sem precisar digitar código!
-pub fn derive_room_port(room_name: &str) -> u16 {
-    let norm = room_name.trim().to_lowercase();
-    let seed = format!("SZDISC_V5_ROOM::{}", norm);
+/// Calcula a porta exclusiva do Lobby daquele Servidor (`server_id`)!
+/// Assim cada Servidor tem sua própria lista de salas e membros, 100% isolada de outros servidores!
+pub fn derive_server_lobby_port(server_id: &str) -> u16 {
+    let norm = server_id.trim().to_uppercase();
+    let seed = format!("SZDISC_V6_SERVER_LOBBY::{}", norm);
+    let mut hash: u32 = 2166136261;
+    for b in seed.as_bytes() {
+        hash ^= *b as u32;
+        hash = hash.wrapping_mul(16777619);
+    }
+    let mut port = 20000 + (hash % 37000) as u16;
+    if (47820..=47850).contains(&port) {
+        port += 120;
+    }
+    port
+}
+
+/// Calcula a porta dedicada de uma Sala dentro de um Servidor específico (`server_id` + `room_name`)!
+/// Assim, duas salas com o mesmo nome ("Sala Geral") em servidores diferentes NUNCA se misturam!
+pub fn derive_room_port(server_id: &str, room_name: &str) -> u16 {
+    let norm_srv = server_id.trim().to_uppercase();
+    let norm_room = room_name.trim().to_lowercase();
+    let seed = format!("SZDISC_V6_SRV_ROOM::{}::{}", norm_srv, norm_room);
     let mut hash: u32 = 2166136261;
     for b in seed.as_bytes() {
         hash ^= *b as u32;
@@ -238,12 +257,16 @@ fn build_packet(
 fn build_info_or_hello_packet(
     magic: &[u8; 4],
     info: &PeerInfo,
+    server_id: &str,
+    server_name: &str,
     room_name: &str,
     known_rooms: &[String],
 ) -> Arc<Vec<u8>> {
     let share_flag = if info.is_sharing { "1" } else { "0" };
     let clean_name = info.name.replace('\t', " ").replace('\n', " ");
     let clean_res = info.res_label.replace('\t', " ").replace('\n', " ");
+    let clean_srv_id = server_id.replace('\t', " ").replace('\n', " ");
+    let clean_srv_name = server_name.replace('\t', " ").replace('\n', " ");
     let clean_room = room_name.replace('\t', " ").replace('\n', " ");
     let rooms_csv = known_rooms
         .iter()
@@ -252,8 +275,8 @@ fn build_info_or_hello_packet(
         .collect::<Vec<_>>()
         .join(";");
     let text = format!(
-        "{}\t{}\t{}\t{}\t{}",
-        clean_name, share_flag, clean_res, clean_room, rooms_csv
+        "{}\t{}\t{}\t{}\t{}\t{}\t{}",
+        clean_name, share_flag, clean_res, clean_srv_id, clean_srv_name, clean_room, rooms_csv
     );
     build_packet(magic, info.peer_id, 0, 0, 0, text.as_bytes())
 }
@@ -335,20 +358,23 @@ fn parse_bore_connection_uuid(msg: &str) -> Option<String> {
     Some(rest[..end].to_string())
 }
 
-/// Hub de Salas Estilo Discord:
-/// - Salas persistentes por nome (sem precisar digitar código!).
-/// - Qualquer pessoa pode criar uma sala ou entrar/sair a hora que quiser.
-/// - Sincroniza as salas criadas e quem está em cada sala automaticamente via Lobby Global + Radmin/LAN.
+/// Hub Multi-Servidores Estilo Discord:
+/// - Cada Servidor (`server_id`) é totalmente isolado: possui suas próprias salas e seus próprios membros!
+/// - Quando você entra em um Servidor (pelo código de convite) 1 vez, ele fica salvo para sempre na sua barra esquerda.
+/// - Dentro de cada Servidor, basta clicar em qualquer sala para entrar/sair sem precisar de código!
 pub struct RoomHub {
     pub my_peer_id: Arc<AtomicU32>,
     pub bound_port: u16,
     pub listen_addr: String,
     pub radmin_addr: Mutex<Option<String>>,
     pub in_room: Arc<AtomicBool>,
+    pub viewed_server_id: Arc<Mutex<String>>,
+    pub connected_server_id: Arc<Mutex<String>>,
     pub active_room_name: Arc<Mutex<String>>,
     pub desired_bore_port: Arc<AtomicU16>,
     pub holding_bore_port: Arc<AtomicU16>,
-    pub known_rooms: Arc<Mutex<Vec<String>>>,
+    pub server_rooms_map: Arc<Mutex<HashMap<String, Vec<String>>>>,
+    pub server_names_map: Arc<Mutex<HashMap<String, String>>>,
     pub server_members: Arc<Mutex<HashMap<u32, ServerMemberPresence>>>,
     pub lan_discovered: Arc<Mutex<HashMap<u32, DiscoveredRoom>>>,
     pub is_connecting_outbound: Arc<AtomicBool>,
@@ -367,7 +393,8 @@ impl RoomHub {
     pub fn start(
         initial_peer_id: u32,
         initial_name: String,
-        initial_rooms: Vec<String>,
+        initial_servers: &[ServerProfile],
+        selected_server_id: &str,
         ctx: Context,
     ) -> Result<Arc<Self>, String> {
         let mut bound_listener = None;
@@ -389,11 +416,21 @@ impl RoomHub {
         let listen_addr = format!("{}:{}", ip, bound_port);
         let radmin_addr = get_radmin_ip().map(|rip| format!("{}:{}", rip, bound_port));
 
-        let default_room = initial_rooms
-            .first()
-            .cloned()
-            .unwrap_or_else(|| "Sala Geral #1".to_string());
-        let initial_port = derive_room_port(&default_room);
+        let mut rooms_map = HashMap::new();
+        let mut names_map = HashMap::new();
+        for srv in initial_servers {
+            rooms_map.insert(srv.server_id.to_uppercase(), srv.rooms.clone());
+            names_map.insert(srv.server_id.to_uppercase(), srv.name.clone());
+        }
+
+        let initial_viewed = if !selected_server_id.is_empty() {
+            selected_server_id.to_uppercase()
+        } else {
+            initial_servers
+                .first()
+                .map(|s| s.server_id.to_uppercase())
+                .unwrap_or_default()
+        };
 
         let my_peer_id = Arc::new(AtomicU32::new(initial_peer_id));
         let my_info = Arc::new(Mutex::new(PeerInfo {
@@ -409,11 +446,14 @@ impl RoomHub {
             bound_port,
             listen_addr,
             radmin_addr: Mutex::new(radmin_addr),
-            in_room: Arc::new(AtomicBool::new(true)),
-            active_room_name: Arc::new(Mutex::new(default_room)),
-            desired_bore_port: Arc::new(AtomicU16::new(initial_port)),
+            in_room: Arc::new(AtomicBool::new(false)),
+            viewed_server_id: Arc::new(Mutex::new(initial_viewed)),
+            connected_server_id: Arc::new(Mutex::new(String::new())),
+            active_room_name: Arc::new(Mutex::new(String::new())),
+            desired_bore_port: Arc::new(AtomicU16::new(0)),
             holding_bore_port: Arc::new(AtomicU16::new(0)),
-            known_rooms: Arc::new(Mutex::new(initial_rooms)),
+            server_rooms_map: Arc::new(Mutex::new(rooms_map)),
+            server_names_map: Arc::new(Mutex::new(names_map)),
             server_members: Arc::new(Mutex::new(HashMap::new())),
             lan_discovered: Arc::new(Mutex::new(HashMap::new())),
             is_connecting_outbound: Arc::new(AtomicBool::new(false)),
@@ -450,24 +490,22 @@ impl RoomHub {
             }
         });
 
-        // 2. Thread de escuta UDP (Radmin VPN + LAN) para descobrir salas e amigos automaticamente
+        // 2. Thread de escuta UDP (Radmin VPN + LAN) isolada por Servidor (`server_id`)
         let hub_udp_rx = Arc::clone(&hub);
         thread::spawn(move || {
             hub_udp_rx.udp_discovery_listener_loop();
         });
 
-        // 3. Thread Automática da Sala via Internet (bore.pub com porta determinística da sala!)
-        // Se ninguém estiver hospedando a sala no momento, assume o túnel da sala;
-        // se um amigo já estiver na sala, conecta nele automaticamente sem precisar de código!
+        // 3. Thread Automática da Sala via Internet (`bore.pub` com porta determinística de `server_id + room_name`)
         let hub_tunnel = Arc::clone(&hub);
         thread::spawn(move || {
             hub_tunnel.room_internet_auto_mesh_loop();
         });
 
-        // 4. Thread do Lobby Global do Servidor (sincroniza salas criadas e membros online em outras salas)
+        // 4. Thread do Lobby Dedicado do Servidor Selecionado (`derive_server_lobby_port(server_id)`)
         let hub_lobby = Arc::clone(&hub);
         thread::spawn(move || {
-            hub_lobby.global_lobby_sync_loop();
+            hub_lobby.server_lobby_sync_loop();
         });
 
         // 5. Thread de Heartbeat (1.2s), limpeza de fantasmas e anúncio no Radmin VPN + LAN
@@ -510,23 +548,54 @@ impl RoomHub {
                     members.retain(|_, m| m.last_seen.elapsed() < Duration::from_secs(8));
                 }
 
-                let curr_room = hub_beacon
-                    .active_room_name
+                let in_room = hub_beacon.in_room.load(Ordering::Relaxed);
+                let conn_srv = hub_beacon
+                    .connected_server_id
                     .lock()
                     .map(|g| g.clone())
                     .unwrap_or_default();
-                let in_room = hub_beacon.in_room.load(Ordering::Relaxed);
-                let rooms_snapshot = hub_beacon
-                    .known_rooms
+                let viewed_srv = hub_beacon
+                    .viewed_server_id
                     .lock()
                     .map(|g| g.clone())
+                    .unwrap_or_default();
+                let active_srv = if in_room && !conn_srv.is_empty() {
+                    conn_srv.clone()
+                } else {
+                    viewed_srv.clone()
+                };
+
+                let curr_room = if in_room {
+                    hub_beacon
+                        .active_room_name
+                        .lock()
+                        .map(|g| g.clone())
+                        .unwrap_or_default()
+                } else {
+                    String::new()
+                };
+
+                let srv_name = hub_beacon
+                    .server_names_map
+                    .lock()
+                    .ok()
+                    .and_then(|m| m.get(&active_srv).cloned())
+                    .unwrap_or_default();
+
+                let rooms_snapshot = hub_beacon
+                    .server_rooms_map
+                    .lock()
+                    .ok()
+                    .and_then(|m| m.get(&active_srv).cloned())
                     .unwrap_or_default();
 
                 if let Ok(info) = hub_beacon.my_info.lock() {
-                    if in_room {
+                    if in_room && !conn_srv.is_empty() {
                         let pkt = build_info_or_hello_packet(
                             MAGIC_INFO,
                             &info,
+                            &conn_srv,
+                            &srv_name,
                             &curr_room,
                             &rooms_snapshot,
                         );
@@ -538,69 +607,73 @@ impl RoomHub {
                         }
                     }
 
-                    // Anuncia presença e lista de salas no Radmin VPN + LAN
-                    let my_id = hub_beacon.my_peer_id.load(Ordering::Relaxed);
-                    let clean_name = info.name.replace('|', " ");
-                    let clean_room = if in_room {
-                        curr_room.replace('|', " ")
-                    } else {
-                        String::new()
-                    };
-                    let clean_res = if info.is_sharing {
-                        info.res_label.replace('|', " ")
-                    } else {
-                        "Na sala".to_string()
-                    };
-                    let share_bit = if info.is_sharing { "1" } else { "0" };
-                    let rooms_csv = rooms_snapshot
-                        .iter()
-                        .map(|r| r.replace('|', " ").replace(';', " ").trim().to_string())
-                        .filter(|r| !r.is_empty())
-                        .collect::<Vec<_>>()
-                        .join(";");
+                    // Anuncia presença no Radmin VPN + LAN apenas para quem participa do MESMO servidor (`active_srv`)
+                    if !active_srv.is_empty() {
+                        let my_id = hub_beacon.my_peer_id.load(Ordering::Relaxed);
+                        let clean_name = info.name.replace('|', " ");
+                        let clean_srv_id = active_srv.replace('|', "");
+                        let clean_srv_name = srv_name.replace('|', " ");
+                        let clean_room = curr_room.replace('|', " ");
+                        let clean_res = if info.is_sharing {
+                            info.res_label.replace('|', " ")
+                        } else {
+                            "Na sala".to_string()
+                        };
+                        let share_bit = if info.is_sharing { "1" } else { "0" };
+                        let rooms_csv = rooms_snapshot
+                            .iter()
+                            .map(|r| r.replace('|', " ").replace(';', " ").trim().to_string())
+                            .filter(|r| !r.is_empty())
+                            .collect::<Vec<_>>()
+                            .join(";");
 
-                    let payload = format!(
-                        "DISC5|{}|{}|{}|{}|{}|{}|{}",
-                        my_id,
-                        hub_beacon.bound_port,
-                        clean_name,
-                        clean_room,
-                        share_bit,
-                        clean_res,
-                        rooms_csv
-                    );
-
-                    if let Some(ref s) = udp_any {
-                        let _ = s.send_to(
-                            payload.as_bytes(),
-                            ("255.255.255.255", LAN_DISCOVERY_PORT),
+                        // DISC6|peer_id|port|host_name|server_id|server_name|current_room|is_sharing|res_label|rooms_csv
+                        let payload = format!(
+                            "DISC6|{}|{}|{}|{}|{}|{}|{}|{}|{}",
+                            my_id,
+                            hub_beacon.bound_port,
+                            clean_name,
+                            clean_srv_id,
+                            clean_srv_name,
+                            clean_room,
+                            share_bit,
+                            clean_res,
+                            rooms_csv
                         );
-                        let _ = s.send_to(
-                            payload.as_bytes(),
-                            ("26.255.255.255", LAN_DISCOVERY_PORT),
-                        );
-                    }
 
-                    if let Some(radmin_ip) = get_radmin_ip() {
-                        if let Ok(rsock) = UdpSocket::bind((radmin_ip.as_str(), 0)) {
-                            let _ = rsock.set_broadcast(true);
-                            let _ = rsock.send_to(
-                                payload.as_bytes(),
-                                ("26.255.255.255", LAN_DISCOVERY_PORT),
-                            );
-                            let _ = rsock.send_to(
+                        if let Some(ref s) = udp_any {
+                            let _ = s.send_to(
                                 payload.as_bytes(),
                                 ("255.255.255.255", LAN_DISCOVERY_PORT),
                             );
+                            let _ = s.send_to(
+                                payload.as_bytes(),
+                                ("26.255.255.255", LAN_DISCOVERY_PORT),
+                            );
+                        }
+
+                        if let Some(radmin_ip) = get_radmin_ip() {
+                            if let Ok(rsock) = UdpSocket::bind((radmin_ip.as_str(), 0)) {
+                                let _ = rsock.set_broadcast(true);
+                                let _ = rsock.send_to(
+                                    payload.as_bytes(),
+                                    ("26.255.255.255", LAN_DISCOVERY_PORT),
+                                );
+                                let _ = rsock.send_to(
+                                    payload.as_bytes(),
+                                    ("255.255.255.255", LAN_DISCOVERY_PORT),
+                                );
+                            }
                         }
                     }
                 }
 
-                // Se houver alguém no Radmin/LAN na MESMA sala que nós e ainda não estivermos conectados a ele, conecta automaticamente!
-                if in_room && !curr_room.is_empty() {
+                // Se houver alguém no Radmin/LAN no MESMO Servidor (`conn_srv`) e na MESMA Sala (`curr_room`), conecta automaticamente!
+                if in_room && !conn_srv.is_empty() && !curr_room.is_empty() {
                     let lan_target = hub_beacon.lan_discovered.lock().ok().and_then(|map| {
                         for d in map.values() {
-                            if d.current_room.eq_ignore_ascii_case(&curr_room)
+                            if d.server_id.eq_ignore_ascii_case(&conn_srv)
+                                && d.current_room.eq_ignore_ascii_case(&curr_room)
                                 && d.last_seen.elapsed() < Duration::from_secs(4)
                             {
                                 let already_conn = hub_beacon
@@ -634,6 +707,86 @@ impl RoomHub {
         Ok(hub)
     }
 
+    /// Registra ou atualiza um servidor local no Hub e seleciona ele como servidor visível
+    pub fn register_and_select_server(&self, srv: &ServerProfile) {
+        let key = srv.server_id.trim().to_uppercase();
+        if let Ok(mut map) = self.server_rooms_map.lock() {
+            let entry = map.entry(key.clone()).or_insert_with(|| srv.rooms.clone());
+            for r in &srv.rooms {
+                if !entry.iter().any(|x| x.eq_ignore_ascii_case(r)) {
+                    entry.push(r.clone());
+                }
+            }
+        }
+        if let Ok(mut nmap) = self.server_names_map.lock() {
+            if !srv.name.starts_with("Servidor SZ-") || !nmap.contains_key(&key) {
+                nmap.insert(key.clone(), srv.name.clone());
+            }
+        }
+        if let Ok(mut v) = self.viewed_server_id.lock() {
+            *v = key;
+        }
+        self.ctx.request_repaint();
+    }
+
+    pub fn remove_server(&self, server_id: &str) {
+        let key = server_id.trim().to_uppercase();
+        let is_connected_here = self
+            .connected_server_id
+            .lock()
+            .map(|g| g.eq_ignore_ascii_case(&key))
+            .unwrap_or(false);
+        if is_connected_here {
+            self.leave_room_completely();
+        }
+        if let Ok(mut map) = self.server_rooms_map.lock() {
+            map.remove(&key);
+        }
+        if let Ok(mut nmap) = self.server_names_map.lock() {
+            nmap.remove(&key);
+        }
+    }
+
+    fn is_member_of_server(&self, server_id: &str) -> bool {
+        let key = server_id.trim().to_uppercase();
+        self.server_rooms_map
+            .lock()
+            .map(|m| m.contains_key(&key))
+            .unwrap_or(false)
+    }
+
+    fn merge_server_metadata(&self, server_id: &str, server_name: &str, rooms_csv: &str) {
+        let key = server_id.trim().to_uppercase();
+        if key.is_empty() || !self.is_member_of_server(&key) {
+            return;
+        }
+
+        if !server_name.trim().is_empty() && !server_name.starts_with("Servidor SZ-") {
+            if let Ok(mut nmap) = self.server_names_map.lock() {
+                nmap.insert(key.clone(), server_name.trim().to_string());
+            }
+        }
+
+        if !rooms_csv.trim().is_empty() {
+            if let Ok(mut map) = self.server_rooms_map.lock() {
+                if let Some(rooms) = map.get_mut(&key) {
+                    let mut existing_lower: HashSet<String> =
+                        rooms.iter().map(|r| r.to_lowercase()).collect();
+                    for item in rooms_csv.split(';') {
+                        let clean = item.trim();
+                        if !clean.is_empty() && clean.len() <= 40 {
+                            let lower = clean.to_lowercase();
+                            if !existing_lower.contains(&lower) {
+                                existing_lower.insert(lower);
+                                rooms.push(clean.to_string());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     fn udp_discovery_listener_loop(self: Arc<Self>) {
         let sock = match UdpSocket::bind(("0.0.0.0", LAN_DISCOVERY_PORT)) {
             Ok(s) => s,
@@ -646,21 +799,28 @@ impl RoomHub {
             if let Ok((len, src)) = sock.recv_from(&mut buf) {
                 if let Ok(msg) = std::str::from_utf8(&buf[..len]) {
                     let parts: Vec<&str> = msg.split('|').collect();
-                    // DISC5|peer_id|port|host_name|current_room|is_sharing|res_label|rooms_csv
-                    if parts.len() >= 8 && parts[0] == "DISC5" {
+                    // DISC6|peer_id|port|host_name|server_id|server_name|current_room|is_sharing|res_label|rooms_csv
+                    if parts.len() >= 10 && parts[0] == "DISC6" {
                         let host_peer_id = parts[1].parse::<u32>().unwrap_or(0);
                         let my_id = self.my_peer_id.load(Ordering::Relaxed);
-                        if host_peer_id != 0 && host_peer_id != my_id {
+                        let server_id = parts[4].trim().to_uppercase();
+
+                        // Só processa pacotes de Servidores dos quais nós fazemos parte!
+                        if host_peer_id != 0
+                            && host_peer_id != my_id
+                            && self.is_member_of_server(&server_id)
+                        {
                             let port = parts[2];
                             let host_name = parts[3].trim().to_string();
-                            let current_room = parts[4].trim().to_string();
-                            let is_sharing = parts[5] == "1";
-                            let res_label = parts[6].trim().to_string();
-                            let rooms_csv = parts[7];
+                            let server_name = parts[5].trim();
+                            let current_room = parts[6].trim().to_string();
+                            let is_sharing = parts[7] == "1";
+                            let res_label = parts[8].trim().to_string();
+                            let rooms_csv = parts[9];
 
-                            self.merge_known_rooms_from_csv(rooms_csv);
+                            self.merge_server_metadata(&server_id, server_name, rooms_csv);
                             if !current_room.is_empty() {
-                                self.merge_known_rooms_from_csv(&current_room);
+                                self.merge_server_metadata(&server_id, server_name, &current_room);
                             }
 
                             if let Ok(mut members) = self.server_members.lock() {
@@ -668,7 +828,8 @@ impl RoomHub {
                                     host_peer_id,
                                     ServerMemberPresence {
                                         peer_id: host_peer_id,
-                                        name: host_name.clone(),
+                                        name: host_name,
+                                        server_id: server_id.clone(),
                                         current_room: current_room.clone(),
                                         is_sharing,
                                         res_label: res_label.clone(),
@@ -691,6 +852,7 @@ impl RoomHub {
                                         host_peer_id,
                                         DiscoveredRoom {
                                             host_peer_id,
+                                            server_id,
                                             current_room,
                                             addr,
                                             res_label,
@@ -701,6 +863,7 @@ impl RoomHub {
                                     );
                                 } else if let Some(existing) = map.get_mut(&host_peer_id) {
                                     existing.last_seen = Instant::now();
+                                    existing.server_id = server_id;
                                     existing.current_room = current_room;
                                     existing.is_sharing = is_sharing;
                                     existing.res_label = res_label;
@@ -718,30 +881,7 @@ impl RoomHub {
         }
     }
 
-    fn merge_known_rooms_from_csv(&self, csv: &str) {
-        if csv.trim().is_empty() {
-            return;
-        }
-        if let Ok(mut rooms) = self.known_rooms.lock() {
-            let mut existing_lower: HashSet<String> =
-                rooms.iter().map(|r| r.to_lowercase()).collect();
-            for item in csv.split(';') {
-                let clean = item.trim();
-                if !clean.is_empty() && clean.len() <= 40 {
-                    let lower = clean.to_lowercase();
-                    if !existing_lower.contains(&lower) {
-                        existing_lower.insert(lower);
-                        rooms.push(clean.to_string());
-                    }
-                }
-            }
-        }
-    }
-
-    /// Loop automático da Sala via Internet (Sem precisar de código!):
-    /// Usa a porta determinística da sala (`desired_bore_port`) no `bore.pub`.
-    /// - Se a sala estiver livre na internet, registra a porta no `bore.pub` e aceita amigos que clicarem na sala.
-    /// - Se um amigo já estiver na sala segurando a porta no `bore.pub`, conecta automaticamente nele como cliente!
+    /// Loop automático da Sala via Internet (`bore.pub` usando porta exclusiva `derive_room_port(server_id, room_name)`)
     fn room_internet_auto_mesh_loop(self: Arc<Self>) {
         while !self.stop_flag.load(Ordering::Relaxed) {
             if !self.in_room.load(Ordering::Relaxed) {
@@ -756,7 +896,6 @@ impl RoomHub {
                 continue;
             }
 
-            // Se já temos uma conexão ativa de saída para a sala na internet, aguarda enquanto ela estiver viva
             let has_alive_outbound = self
                 .connections
                 .lock()
@@ -817,7 +956,6 @@ impl RoomHub {
                             let s = String::from_utf8_lossy(&msg_bytes[..msg_bytes.len() - 1]);
 
                             if s.contains("\"Error\"") {
-                                // A porta da sala já está aberta pelo nosso amigo! Conectamos nele automaticamente!
                                 port_already_in_use = true;
                                 break;
                             } else if let Some(port) = parse_bore_hello_port(&s) {
@@ -875,11 +1013,24 @@ impl RoomHub {
         }
     }
 
-    /// Sincroniza a lista de salas e quem está online em cada sala pela internet (`GLOBAL_LOBBY_BORE_PORT`)
-    fn global_lobby_sync_loop(self: Arc<Self>) {
+    /// Sincroniza as salas e os membros online APENAS do Servidor atualmente selecionado (`viewed_server_id`)!
+    fn server_lobby_sync_loop(self: Arc<Self>) {
         let lobby_clients: Arc<Mutex<Vec<TcpStream>>> = Arc::new(Mutex::new(Vec::new()));
 
         while !self.stop_flag.load(Ordering::Relaxed) {
+            let current_srv = self
+                .viewed_server_id
+                .lock()
+                .map(|g| g.clone())
+                .unwrap_or_default();
+
+            if current_srv.is_empty() {
+                thread::sleep(Duration::from_millis(600));
+                continue;
+            }
+
+            let lobby_port = derive_server_lobby_port(&current_srv);
+
             let relay_addr = match BORE_RELAY_HOST
                 .to_socket_addrs()
                 .ok()
@@ -901,9 +1052,9 @@ impl RoomHub {
             };
 
             let _ = ctrl.set_nodelay(true);
-            let _ = ctrl.set_read_timeout(Some(Duration::from_secs(4)));
+            let _ = ctrl.set_read_timeout(Some(Duration::from_secs(3)));
 
-            let hello_cmd = format!("{{\"Hello\":{}}}\0", GLOBAL_LOBBY_BORE_PORT);
+            let hello_cmd = format!("{{\"Hello\":{}}}\0", lobby_port);
             if ctrl.write_all(hello_cmd.as_bytes()).is_err() {
                 thread::sleep(Duration::from_secs(2));
                 continue;
@@ -914,6 +1065,15 @@ impl RoomHub {
             let mut lobby_already_hosted = false;
 
             while !self.stop_flag.load(Ordering::Relaxed) {
+                let latest_srv = self
+                    .viewed_server_id
+                    .lock()
+                    .map(|g| g.clone())
+                    .unwrap_or_default();
+                if latest_srv != current_srv {
+                    break;
+                }
+
                 match ctrl.read(&mut temp) {
                     Ok(0) => break,
                     Ok(n) => {
@@ -928,6 +1088,7 @@ impl RoomHub {
                             } else if let Some(uuid) = parse_bore_connection_uuid(&s) {
                                 let hub_clone = Arc::clone(&self);
                                 let clients_clone = Arc::clone(&lobby_clients);
+                                let srv_clone = current_srv.clone();
                                 thread::spawn(move || {
                                     if let Ok(mut data_stream) =
                                         TcpStream::connect_timeout(&relay_addr, Duration::from_secs(5))
@@ -946,6 +1107,7 @@ impl RoomHub {
                                             }
                                             hub_clone.handle_lobby_stream(
                                                 data_stream,
+                                                &srv_clone,
                                                 Some(clients_clone),
                                             );
                                         }
@@ -961,8 +1123,7 @@ impl RoomHub {
                         if e.kind() == std::io::ErrorKind::WouldBlock
                             || e.kind() == std::io::ErrorKind::TimedOut =>
                     {
-                        // Envia nosso status para todos os clientes do Lobby
-                        let line = self.build_lobby_line();
+                        let line = self.build_lobby_line(&current_srv);
                         if let Ok(mut list) = lobby_clients.lock() {
                             list.retain_mut(|c| c.write_all(line.as_bytes()).is_ok());
                         }
@@ -975,8 +1136,7 @@ impl RoomHub {
             drop(ctrl);
 
             if lobby_already_hosted {
-                // Conecta como cliente ao Lobby Global
-                if let Ok( lobby_addr ) = format!("bore.pub:{}", GLOBAL_LOBBY_BORE_PORT)
+                if let Ok(lobby_addr) = format!("bore.pub:{}", lobby_port)
                     .to_socket_addrs()
                     .and_then(|mut it| {
                         it.next()
@@ -988,20 +1148,27 @@ impl RoomHub {
                         let _ = stream.set_nonblocking(false);
                         let _ = stream.set_nodelay(true);
                         let _ = stream.set_read_timeout(Some(Duration::from_secs(3)));
-                        self.handle_lobby_stream(stream, None);
+                        self.handle_lobby_stream(stream, &current_srv, None);
                     }
                 }
                 thread::sleep(Duration::from_secs(2));
             } else {
-                thread::sleep(Duration::from_secs(2));
+                thread::sleep(Duration::from_millis(800));
             }
         }
     }
 
-    fn build_lobby_line(&self) -> String {
+    fn build_lobby_line(&self, server_id: &str) -> String {
+        let key = server_id.trim().to_uppercase();
         let my_id = self.my_peer_id.load(Ordering::Relaxed);
         let in_room = self.in_room.load(Ordering::Relaxed);
-        let curr_room = if in_room {
+        let conn_srv = self
+            .connected_server_id
+            .lock()
+            .map(|g| g.clone())
+            .unwrap_or_default();
+
+        let curr_room = if in_room && conn_srv.eq_ignore_ascii_case(&key) {
             self.active_room_name
                 .lock()
                 .map(|g| g.clone())
@@ -1009,14 +1176,25 @@ impl RoomHub {
         } else {
             String::new()
         };
+
+        let srv_name = self
+            .server_names_map
+            .lock()
+            .ok()
+            .and_then(|m| m.get(&key).cloned())
+            .unwrap_or_default();
+
         let (name, is_sharing, res_label) = self
             .my_info
             .lock()
             .map(|i| (i.name.clone(), i.is_sharing, i.res_label.clone()))
             .unwrap_or_else(|_| ("Jogador".to_string(), false, "Na sala".to_string()));
+
         let rooms_csv = self
-            .known_rooms
+            .server_rooms_map
             .lock()
+            .ok()
+            .and_then(|m| m.get(&key).cloned())
             .map(|rs| {
                 rs.iter()
                     .map(|r| r.replace('|', " ").replace(';', " ").trim().to_string())
@@ -1026,12 +1204,19 @@ impl RoomHub {
             })
             .unwrap_or_default();
 
+        // LBY6|peer_id|name|server_id|server_name|curr_room|is_sharing|res_label|rooms_csv
         format!(
-            "LBY5|{}|{}|{}|{}|{}|{}\n",
+            "LBY6|{}|{}|{}|{}|{}|{}|{}|{}\n",
             my_id,
             name.replace('|', " ").replace('\n', " "),
+            key,
+            srv_name.replace('|', " ").replace('\n', " "),
             curr_room.replace('|', " ").replace('\n', " "),
-            if is_sharing { "1" } else { "0" },
+            if is_sharing && !curr_room.is_empty() {
+                "1"
+            } else {
+                "0"
+            },
             res_label.replace('|', " ").replace('\n', " "),
             rooms_csv.replace('\n', " ")
         )
@@ -1040,6 +1225,7 @@ impl RoomHub {
     fn handle_lobby_stream(
         &self,
         mut stream: TcpStream,
+        expected_server_id: &str,
         relay_clients: Option<Arc<Mutex<Vec<TcpStream>>>>,
     ) {
         let mut pending = Vec::with_capacity(1024);
@@ -1047,8 +1233,17 @@ impl RoomHub {
         let mut last_send = Instant::now() - Duration::from_secs(5);
 
         while !self.stop_flag.load(Ordering::Relaxed) {
+            let latest_srv = self
+                .viewed_server_id
+                .lock()
+                .map(|g| g.clone())
+                .unwrap_or_default();
+            if !latest_srv.eq_ignore_ascii_case(expected_server_id) {
+                break;
+            }
+
             if last_send.elapsed() >= Duration::from_millis(1600) {
-                let line = self.build_lobby_line();
+                let line = self.build_lobby_line(expected_server_id);
                 if stream.write_all(line.as_bytes()).is_err() {
                     break;
                 }
@@ -1065,19 +1260,25 @@ impl RoomHub {
                         if let Ok(line_str) = std::str::from_utf8(&line_bytes) {
                             let trimmed = line_str.trim();
                             let parts: Vec<&str> = trimmed.split('|').collect();
-                            if parts.len() >= 7 && parts[0] == "LBY5" {
+                            // LBY6|peer_id|name|server_id|server_name|curr_room|is_sharing|res_label|rooms_csv
+                            if parts.len() >= 9 && parts[0] == "LBY6" {
                                 let pid = parts[1].parse::<u32>().unwrap_or(0);
                                 let my_id = self.my_peer_id.load(Ordering::Relaxed);
-                                if pid != 0 && pid != my_id {
+                                let srv_id = parts[3].trim().to_uppercase();
+                                if pid != 0
+                                    && pid != my_id
+                                    && srv_id.eq_ignore_ascii_case(expected_server_id)
+                                {
                                     let uname = parts[2].trim().to_string();
-                                    let uroom = parts[3].trim().to_string();
-                                    let usharing = parts[4] == "1";
-                                    let ures = parts[5].trim().to_string();
-                                    let ucsv = parts[6];
+                                    let srv_name = parts[4].trim();
+                                    let uroom = parts[5].trim().to_string();
+                                    let usharing = parts[6] == "1";
+                                    let ures = parts[7].trim().to_string();
+                                    let ucsv = parts[8];
 
-                                    self.merge_known_rooms_from_csv(ucsv);
+                                    self.merge_server_metadata(&srv_id, srv_name, ucsv);
                                     if !uroom.is_empty() {
-                                        self.merge_known_rooms_from_csv(&uroom);
+                                        self.merge_server_metadata(&srv_id, srv_name, &uroom);
                                     }
 
                                     if let Ok(mut members) = self.server_members.lock() {
@@ -1086,6 +1287,7 @@ impl RoomHub {
                                             ServerMemberPresence {
                                                 peer_id: pid,
                                                 name: uname,
+                                                server_id: srv_id,
                                                 current_room: uroom,
                                                 is_sharing: usharing,
                                                 res_label: ures,
@@ -1094,7 +1296,6 @@ impl RoomHub {
                                         );
                                     }
 
-                                    // Se somos o Host do Lobby, repassa a atualização para os demais amigos conectados
                                     if let Some(ref clients_arc) = relay_clients {
                                         let forward = format!("{}\n", trimmed);
                                         if let Ok(mut list) = clients_arc.lock() {
@@ -1120,56 +1321,78 @@ impl RoomHub {
         }
     }
 
-    /// Cria uma nova sala no servidor e já entra nela automaticamente!
-    pub fn create_and_enter_room(self: &Arc<Self>, room_name: &str) -> Vec<String> {
+    /// Cria uma nova sala exclusivamente dentro do Servidor informado e já entra nela!
+    pub fn create_and_enter_room(
+        self: &Arc<Self>,
+        server_id: &str,
+        room_name: &str,
+    ) -> Vec<String> {
+        let key = server_id.trim().to_uppercase();
         let clean = room_name.trim().to_string();
-        if clean.is_empty() {
+        if key.is_empty() || clean.is_empty() {
             return self
-                .known_rooms
+                .server_rooms_map
                 .lock()
-                .map(|g| g.clone())
+                .ok()
+                .and_then(|m| m.get(&key).cloned())
                 .unwrap_or_default();
         }
 
         let updated_list = {
-            let mut rooms = self.known_rooms.lock().unwrap();
+            let mut map = self.server_rooms_map.lock().unwrap();
+            let rooms = map.entry(key.clone()).or_default();
             if !rooms.iter().any(|r| r.eq_ignore_ascii_case(&clean)) {
                 rooms.push(clean.clone());
             }
             rooms.clone()
         };
 
-        self.enter_named_room(&clean);
+        self.enter_server_room(&key, &clean);
         updated_list
     }
 
-    /// Entra em qualquer sala do servidor com 1 clique (sem precisar de código!)
-    pub fn enter_named_room(self: &Arc<Self>, room_name: &str) {
+    /// Entra em uma sala específica dentro de um Servidor específico (`server_id` + `room_name`)
+    pub fn enter_server_room(self: &Arc<Self>, server_id: &str, room_name: &str) {
+        let key = server_id.trim().to_uppercase();
         let clean = room_name.trim().to_string();
-        if clean.is_empty() {
+        if key.is_empty() || clean.is_empty() {
             return;
         }
 
-        let current = self
+        let curr_srv = self
+            .connected_server_id
+            .lock()
+            .map(|g| g.clone())
+            .unwrap_or_default();
+        let curr_room = self
             .active_room_name
             .lock()
             .map(|g| g.clone())
             .unwrap_or_default();
-        if self.in_room.load(Ordering::Relaxed) && current.eq_ignore_ascii_case(&clean) {
+
+        if self.in_room.load(Ordering::Relaxed)
+            && curr_srv.eq_ignore_ascii_case(&key)
+            && curr_room.eq_ignore_ascii_case(&clean)
+        {
             return;
         }
 
         self.disconnect_all_connections();
+        if let Ok(mut cs) = self.connected_server_id.lock() {
+            *cs = key.clone();
+        }
+        if let Ok(mut vs) = self.viewed_server_id.lock() {
+            *vs = key.clone();
+        }
         if let Ok(mut active) = self.active_room_name.lock() {
             *active = clean.clone();
         }
-        let port = derive_room_port(&clean);
+        let port = derive_room_port(&key, &clean);
         self.desired_bore_port.store(port, Ordering::Relaxed);
         self.in_room.store(true, Ordering::Relaxed);
         self.ctx.request_repaint();
     }
 
-    /// Também permite conectar manualmente por IP/Código caso queira
     pub fn join_manual_address(self: &Arc<Self>, raw_target: &str) {
         let trimmed = raw_target.trim().trim_start_matches('#');
         if trimmed.is_empty() {
@@ -1189,11 +1412,7 @@ impl RoomHub {
         self.spawn_outbound_connect(addr_str, false);
     }
 
-    fn spawn_outbound_connect(
-        self: &Arc<Self>,
-        addr_str: String,
-        is_silent_auto: bool,
-    ) {
+    fn spawn_outbound_connect(self: &Arc<Self>, addr_str: String, is_silent_auto: bool) {
         if self
             .is_connecting_outbound
             .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
@@ -1257,6 +1476,13 @@ impl RoomHub {
     pub fn leave_room_completely(&self) {
         self.in_room.store(false, Ordering::Relaxed);
         self.holding_bore_port.store(0, Ordering::Relaxed);
+        self.desired_bore_port.store(0, Ordering::Relaxed);
+        if let Ok(mut cs) = self.connected_server_id.lock() {
+            cs.clear();
+        }
+        if let Ok(mut ar) = self.active_room_name.lock() {
+            ar.clear();
+        }
         self.disconnect_all_connections();
         self.ctx.request_repaint();
     }
@@ -1271,15 +1497,27 @@ impl RoomHub {
         let new_id = derive_persistent_peer_id(&name, user_tag);
         self.my_peer_id.store(new_id, Ordering::Relaxed);
 
+        let conn_srv = self
+            .connected_server_id
+            .lock()
+            .map(|g| g.clone())
+            .unwrap_or_default();
         let curr_room = self
             .active_room_name
             .lock()
             .map(|g| g.clone())
             .unwrap_or_default();
-        let rooms_snapshot = self
-            .known_rooms
+        let srv_name = self
+            .server_names_map
             .lock()
-            .map(|g| g.clone())
+            .ok()
+            .and_then(|m| m.get(&conn_srv).cloned())
+            .unwrap_or_default();
+        let rooms_snapshot = self
+            .server_rooms_map
+            .lock()
+            .ok()
+            .and_then(|m| m.get(&conn_srv).cloned())
             .unwrap_or_default();
 
         let mut stopped_sharing = false;
@@ -1295,7 +1533,14 @@ impl RoomHub {
             info.is_sharing = is_sharing;
             info.res_label = res_label;
             info.last_seen = Instant::now();
-            build_info_or_hello_packet(MAGIC_INFO, &info, &curr_room, &rooms_snapshot)
+            build_info_or_hello_packet(
+                MAGIC_INFO,
+                &info,
+                &conn_srv,
+                &srv_name,
+                &curr_room,
+                &rooms_snapshot,
+            )
         };
 
         let stop_pkt = if stopped_sharing {
@@ -1383,21 +1628,35 @@ impl RoomHub {
         let conn_id = self.next_conn_id.fetch_add(1, Ordering::Relaxed);
         let slot = PeerConnectionSlot::new(conn_id, is_outbound);
 
+        let conn_srv = self
+            .connected_server_id
+            .lock()
+            .map(|g| g.clone())
+            .unwrap_or_default();
         let curr_room = self
             .active_room_name
             .lock()
             .map(|g| g.clone())
             .unwrap_or_default();
-        let rooms_snapshot = self
-            .known_rooms
+        let srv_name = self
+            .server_names_map
             .lock()
-            .map(|g| g.clone())
+            .ok()
+            .and_then(|m| m.get(&conn_srv).cloned())
+            .unwrap_or_default();
+        let rooms_snapshot = self
+            .server_rooms_map
+            .lock()
+            .ok()
+            .and_then(|m| m.get(&conn_srv).cloned())
             .unwrap_or_default();
 
         if let Ok(info) = self.my_info.lock() {
             slot.push_control(build_info_or_hello_packet(
                 MAGIC_HELLO,
                 &info,
+                &conn_srv,
+                &srv_name,
                 &curr_room,
                 &rooms_snapshot,
             ));
@@ -1408,6 +1667,8 @@ impl RoomHub {
                     slot.push_control(build_info_or_hello_packet(
                         MAGIC_INFO,
                         p,
+                        &conn_srv,
+                        &srv_name,
                         &curr_room,
                         &rooms_snapshot,
                     ));
@@ -1582,12 +1843,15 @@ impl RoomHub {
                 if &magic == MAGIC_HELLO || &magic == MAGIC_INFO {
                     if let Ok(text) = std::str::from_utf8(&payload) {
                         let parts: Vec<&str> = text.split('\t').collect();
+                        // name \t share_flag \t res_label \t server_id \t server_name \t room_name \t rooms_csv
                         if parts.len() >= 3 {
                             let peer_name = parts[0].trim().to_string();
                             let is_sharing = parts[1] == "1";
                             let res_label = parts[2].to_string();
-                            if parts.len() >= 5 {
-                                hub_reader.merge_known_rooms_from_csv(parts[4]);
+                            if parts.len() >= 7 {
+                                let srv_id = parts[3].trim();
+                                let srv_name = parts[4].trim();
+                                hub_reader.merge_server_metadata(srv_id, srv_name, parts[6]);
                             }
 
                             let is_same_as_me = hub_reader
@@ -1625,6 +1889,11 @@ impl RoomHub {
                                     );
                                 }
 
+                                let conn_srv = hub_reader
+                                    .connected_server_id
+                                    .lock()
+                                    .map(|g| g.clone())
+                                    .unwrap_or_default();
                                 let curr_room = hub_reader
                                     .active_room_name
                                     .lock()
@@ -1636,6 +1905,7 @@ impl RoomHub {
                                         ServerMemberPresence {
                                             peer_id: sender_id,
                                             name: peer_name,
+                                            server_id: conn_srv,
                                             current_room: curr_room,
                                             is_sharing,
                                             res_label,
