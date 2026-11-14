@@ -999,9 +999,11 @@ impl Disc2App {
                                     self.fps_preset = fps;
                                 }
                             }
+                        });
 
-                            ui.separator();
+                        ui.add_space(8.0);
 
+                        ui.horizontal(|ui| {
                             ui.checkbox(
                                 &mut self.share_audio_enabled,
                                 RichText::new("🔊 Compartilhar Áudio").size(12.0).strong(),
