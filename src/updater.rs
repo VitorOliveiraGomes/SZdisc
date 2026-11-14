@@ -5,7 +5,7 @@ use std::process::Command;
 use std::sync::{Arc, Mutex};
 use std::thread;
 
-pub const CURRENT_VERSION: &str = "2.3.0";
+pub const CURRENT_VERSION: &str = "2.4.0";
 const VERSION_URL: &str = "https://raw.githubusercontent.com/VitorOliveiraGomes/SZdisc/main/VERSION.txt";
 const EXE_DOWNLOAD_URL: &str = "https://github.com/VitorOliveiraGomes/SZdisc/raw/main/DISC2.exe";
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
