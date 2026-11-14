@@ -2,23 +2,41 @@ use std::ffi::OsString;
 use std::fs;
 use std::mem::{size_of, zeroed};
 use std::os::windows::ffi::{OsStrExt, OsStringExt};
-use std::path::Path;
+use std::path::PathBuf;
 use std::ptr::null_mut;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use eframe::egui::{
     self, Color32, ColorImage, Context, Mesh, Pos2, Rect, RichText, Rounding, Stroke,
     TextureHandle, TextureOptions, Ui, Vec2,
 };
 use image::GenericImageView;
-use winapi::um::commdlg::{GetOpenFileNameW, OFN_FILEMUSTEXIST, OFN_NOCHANGEDIR, OFN_PATHMUSTEXIST, OPENFILENAMEW};
+use winapi::um::commdlg::{
+    GetOpenFileNameW, OFN_FILEMUSTEXIST, OFN_NOCHANGEDIR, OFN_PATHMUSTEXIST, OPENFILENAMEW,
+};
 
-const CONFIG_FILE: &str = "szdisc_settings.conf";
+fn get_user_config_path() -> PathBuf {
+    let base = std::env::var("APPDATA").unwrap_or_else(|_| ".".to_string());
+    let dir = PathBuf::from(base).join("SZdisc");
+    let _ = fs::create_dir_all(&dir);
+    dir.join("account_v2.conf")
+}
+
+fn generate_random_tag() -> String {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.subsec_nanos())
+        .unwrap_or(4829);
+    let num = 1000 + (nanos % 9000);
+    format!("#{}", num)
+}
 
 /// Abre a janela nativa do Windows para escolher uma imagem (PNG, JPG, JPEG, BMP)
 pub fn pick_image_file_dialog() -> Option<String> {
     unsafe {
         let mut file_buf = [0u16; 1024];
-        let filter_str = "Imagens (PNG, JPG, BMP)\0*.png;*.jpg;*.jpeg;*.bmp\0Todos os Arquivos\0*.*\0\0";
+        let filter_str =
+            "Imagens (PNG, JPG, BMP)\0*.png;*.jpg;*.jpeg;*.bmp\0Todos os Arquivos\0*.*\0\0";
         let filter_wide: Vec<u16> = OsString::from(filter_str).encode_wide().collect();
         let title_wide: Vec<u16> = OsString::from("Escolher Imagem\0").encode_wide().collect();
 
@@ -54,7 +72,6 @@ pub fn load_circular_avatar_texture(ctx: &Context, path: &str) -> Option<Texture
         return None;
     }
 
-    // Recorta quadrado central
     let side = w.min(h);
     let crop_x = (w - side) / 2;
     let crop_y = (h - side) / 2;
@@ -62,7 +79,6 @@ pub fn load_circular_avatar_texture(ctx: &Context, path: &str) -> Option<Texture
     let resized = cropped.resize_exact(128, 128, image::imageops::FilterType::Triangle);
     let mut rgba = resized.to_rgba8().into_raw();
 
-    // Aplica máscara circular anti-aliasing
     let center = 63.5_f32;
     let radius = 63.0_f32;
     for y in 0..128 {
@@ -190,7 +206,8 @@ impl ThemePreset {
 
 #[derive(Clone)]
 pub struct UserCustomization {
-    // Perfil estilo Discord
+    pub account_created: bool,
+    pub username_login: String,
     pub display_name: String,
     pub user_tag: String,
     pub custom_status: String,
@@ -229,10 +246,12 @@ pub struct UserCustomization {
 impl Default for UserCustomization {
     fn default() -> Self {
         let mut s = Self {
-            display_name: "Vitor".to_string(),
-            user_tag: "#0001".to_string(),
+            account_created: false,
+            username_login: String::new(),
+            display_name: String::new(),
+            user_tag: generate_random_tag(),
             custom_status: "Transmitindo em 1080p 60fps".to_string(),
-            bio: "Transmissão ultra-leve nativa em Rust.".to_string(),
+            bio: "Membro do SZdisc • 1080p 60fps".to_string(),
             presence: PresenceStatus::Online,
             avatar_image_path: String::new(),
             banner_image_path: String::new(),
@@ -246,7 +265,7 @@ impl Default for UserCustomization {
             badge_1080p: true,
             badge_rust: true,
             badge_gamer: true,
-            badge_crown: true,
+            badge_crown: false,
             custom_badge_enabled: false,
             custom_badge_text: "💎 VIP".to_string(),
             custom_badge_rgb: [236, 72, 153],
@@ -410,8 +429,11 @@ impl UserCustomization {
     }
 
     pub fn save_to_disk(&self) {
+        let cfg_path = get_user_config_path();
         let content = format!(
-            "display_name={}\nuser_tag={}\ncustom_status={}\nbio={}\npresence={}\navatar_image_path={}\nbanner_image_path={}\navatar_bg={},{},{}\nbanner_bg={},{},{}\nbanner_bg_2={},{},{}\nname_color_rgb={},{},{}\nring_color_rgb={},{},{}\navatar_ring_glow={}\nring_thickness={}\nbadge_1080p={}\nbadge_rust={}\nbadge_gamer={}\nbadge_crown={}\ncustom_badge_enabled={}\ncustom_badge_text={}\ncustom_badge_rgb={},{},{}\ntheme_preset={}\naccent_rgb={},{},{}\nbg_sidebar_rgb={},{},{}\nbg_stage_rgb={},{},{}\nbg_card_rgb={},{},{}\ntext_rgb={},{},{}\ncorner_radius={}\nborder_stroke_width={}\nui_scale={}\nshow_cursor_in_stream={}\n",
+            "account_created={}\nusername_login={}\ndisplay_name={}\nuser_tag={}\ncustom_status={}\nbio={}\npresence={}\navatar_image_path={}\nbanner_image_path={}\navatar_bg={},{},{}\nbanner_bg={},{},{}\nbanner_bg_2={},{},{}\nname_color_rgb={},{},{}\nring_color_rgb={},{},{}\navatar_ring_glow={}\nring_thickness={}\nbadge_1080p={}\nbadge_rust={}\nbadge_gamer={}\nbadge_crown={}\ncustom_badge_enabled={}\ncustom_badge_text={}\ncustom_badge_rgb={},{},{}\ntheme_preset={}\naccent_rgb={},{},{}\nbg_sidebar_rgb={},{},{}\nbg_stage_rgb={},{},{}\nbg_card_rgb={},{},{}\ntext_rgb={},{},{}\ncorner_radius={}\nborder_stroke_width={}\nui_scale={}\nshow_cursor_in_stream={}\n",
+            self.account_created,
+            self.username_login.replace('\n', " "),
             self.display_name.replace('\n', " "),
             self.user_tag.replace('\n', " "),
             self.custom_status.replace('\n', " "),
@@ -444,15 +466,16 @@ impl UserCustomization {
             self.ui_scale,
             self.show_cursor_in_stream
         );
-        let _ = fs::write(CONFIG_FILE, content);
+        let _ = fs::write(cfg_path, content);
     }
 
     pub fn load_from_disk() -> Self {
         let mut cfg = Self::default();
-        if !Path::new(CONFIG_FILE).exists() {
+        let cfg_path = get_user_config_path();
+        if !cfg_path.exists() {
             return cfg;
         }
-        let Ok(raw) = fs::read_to_string(CONFIG_FILE) else {
+        let Ok(raw) = fs::read_to_string(cfg_path) else {
             return cfg;
         };
 
@@ -461,6 +484,8 @@ impl UserCustomization {
                 continue;
             };
             match k.trim() {
+                "account_created" => cfg.account_created = v == "true",
+                "username_login" => cfg.username_login = v.to_string(),
                 "display_name" => cfg.display_name = v.to_string(),
                 "user_tag" => cfg.user_tag = v.to_string(),
                 "custom_status" => cfg.custom_status = v.to_string(),
@@ -539,6 +564,9 @@ impl UserCustomization {
                 _ => {}
             }
         }
+        if cfg.display_name.trim().is_empty() {
+            cfg.account_created = false;
+        }
         cfg
     }
 
@@ -583,7 +611,6 @@ fn parse_rgb(s: &str) -> Option<[u8; 3]> {
     }
 }
 
-/// Desenha o avatar do usuário (com Foto de Perfil circular se carregada ou iniciais + Anel Neon + Status)
 pub fn draw_discord_avatar(
     ui: &mut Ui,
     size: f32,
@@ -605,7 +632,7 @@ pub fn draw_discord_avatar(
         );
     } else {
         painter.circle_filled(center, radius - 2.0, cust.avatar_color());
-        let initial = cust.display_name.chars().next().unwrap_or('U');
+        let initial = cust.display_name.chars().next().unwrap_or('?');
         painter.text(
             center,
             egui::Align2::CENTER_CENTER,
@@ -623,14 +650,12 @@ pub fn draw_discord_avatar(
         );
     }
 
-    // Bolinha de status no canto inferior direito
     let dot_r = (size * 0.16).max(4.5);
     let dot_pos = Pos2::new(rect.right() - dot_r * 0.75, rect.bottom() - dot_r * 0.75);
     painter.circle_filled(dot_pos, dot_r + 2.0, Color32::from_rgb(17, 18, 20));
     painter.circle_filled(dot_pos, dot_r, cust.presence.color());
 }
 
-/// Desenha o Card Completo de Perfil Estilo Discord (com Imagem ou Gradiente de Banner, Foto de Perfil, Insígnias e Bio)
 pub fn draw_discord_profile_card(
     ui: &mut Ui,
     cust: &UserCustomization,
@@ -649,7 +674,6 @@ pub fn draw_discord_profile_card(
         .show(ui, |ui| {
             ui.set_width(card_width);
 
-            // Banner Superior (Imagem Customizada ou Gradiente de 2 Cores)
             let (banner_rect, _) =
                 ui.allocate_exact_size(Vec2::new(card_width, 72.0), egui::Sense::hover());
             let painter = ui.painter();
@@ -662,7 +686,6 @@ pub fn draw_discord_profile_card(
                     Color32::WHITE,
                 );
             } else {
-                // Desenha gradiente horizontal suave entre banner_bg e banner_bg_2
                 let mut mesh = Mesh::default();
                 let c1 = cust.banner_color();
                 let c2 = cust.banner_color_2();
@@ -690,7 +713,6 @@ pub fn draw_discord_profile_card(
                 );
             }
 
-            // Corpo do Card
             egui::Frame::none()
                 .inner_margin(egui::Margin::symmetric(14.0, 10.0))
                 .show(ui, |ui| {
@@ -698,9 +720,14 @@ pub fn draw_discord_profile_card(
                         draw_discord_avatar(ui, 54.0, cust, avatar_tex);
 
                         ui.vertical(|ui| {
+                            let shown_name = if cust.display_name.trim().is_empty() {
+                                "Novo Usuário"
+                            } else {
+                                cust.display_name.as_str()
+                            };
                             ui.horizontal_wrapped(|ui| {
                                 ui.label(
-                                    RichText::new(&cust.display_name)
+                                    RichText::new(shown_name)
                                         .strong()
                                         .size(16.0)
                                         .color(cust.name_color()),

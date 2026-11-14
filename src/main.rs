@@ -22,7 +22,7 @@ use eframe::egui::{
     self, Color32, ColorImage, Context, FontId, RichText, Rounding, Stroke, TextureHandle,
     TextureOptions, Vec2,
 };
-use jpeg_encoder::{ColorType, Encoder};
+use jpeg_encoder::{ColorType, Encoder, SamplingFactor};
 use network::{
     start_lan_discovery_listener, DiscoveredRoom, StreamHostServer, StreamViewerClient,
 };
@@ -98,8 +98,23 @@ struct LocalPreviewFrame {
     rgba: Vec<u8>,
 }
 
+/// Representa uma transmissão remota assistida simultaneamente no palco (Multi-Stream)
+struct RemoteStreamEntry {
+    id: u64,
+    label: String,
+    client: StreamViewerClient,
+    texture: Option<TextureHandle>,
+    video_size: (u32, u32),
+    measured_fps: u32,
+    measured_mbps: f32,
+    frame_counter: u32,
+    bytes_counter: usize,
+}
+
+const LOCAL_PREVIEW_TILE_ID: u64 = 0;
+
 struct Disc2App {
-    // Personalização do Perfil e do Aplicativo
+    // Personalização do Perfil, Conta e do Aplicativo
     custom: UserCustomization,
     user_avatar_tex: Option<TextureHandle>,
     user_banner_tex: Option<TextureHandle>,
@@ -121,10 +136,7 @@ struct Disc2App {
     jpeg_quality: u8,
     share_audio_enabled: bool,
     eco_hide_preview: bool,
-
-    // Volume de recepção (Assistindo)
-    viewer_volume_percent: Arc<AtomicU32>,
-    viewer_audio_muted: Arc<AtomicBool>,
+    show_own_preview_in_grid: bool,
 
     // Estado de Transmissão Local (Host)
     is_sharing: bool,
@@ -134,21 +146,22 @@ struct Disc2App {
     host_server: Option<Arc<StreamHostServer>>,
     host_res_label: Arc<Mutex<String>>,
 
-    // Estado de Visualização Remota (Viewer)
+    // Estado de Visualização Remota Simultânea (Multi-Stream: 3+ telas ao mesmo tempo)
     join_addr_input: String,
-    viewer_client: Option<StreamViewerClient>,
+    remote_streams: Vec<RemoteStreamEntry>,
+    next_stream_id: u64,
+    focused_tile_id: Option<u64>,
 
     // Salas Descobertas na Rede / VPN
     discovered_rooms: Arc<Mutex<HashMap<String, DiscoveredRoom>>>,
 
-    // Textura do Vídeo no Palco e Telemetria
-    video_texture: Option<TextureHandle>,
-    current_video_size: (u32, u32),
-    measured_fps: u32,
-    measured_mbps: f32,
+    // Textura do Vídeo Local (Host) e Telemetria
+    local_video_texture: Option<TextureHandle>,
+    local_video_size: (u32, u32),
+    local_measured_fps: u32,
+    local_measured_mbps: f32,
+    local_frame_counter: u32,
     ram_mb: f32,
-    frame_counter: u32,
-    bytes_counter: usize,
     last_metrics_tick: Instant,
     status_toast: Option<(String, Instant)>,
 
@@ -185,7 +198,7 @@ impl Disc2App {
             target_w: AtomicU32::new(1920),
             target_h: AtomicU32::new(1080),
             target_fps: AtomicU8::new(60),
-            jpeg_quality: AtomicU8::new(78),
+            jpeg_quality: AtomicU8::new(75),
             eco_hide_preview: AtomicBool::new(false),
             draw_cursor: AtomicBool::new(custom.show_cursor_in_stream),
             share_system_audio,
@@ -208,11 +221,10 @@ impl Disc2App {
             selected_source_idx: 0,
             res_preset: ResolutionPreset::P1080,
             fps_preset: 60,
-            jpeg_quality: 78,
+            jpeg_quality: 75,
             share_audio_enabled: true,
             eco_hide_preview: false,
-            viewer_volume_percent: Arc::new(AtomicU32::new(100)),
-            viewer_audio_muted: Arc::new(AtomicBool::new(false)),
+            show_own_preview_in_grid: true,
             is_sharing: false,
             stream_config,
             capture_stop_flag: None,
@@ -220,15 +232,16 @@ impl Disc2App {
             host_server: None,
             host_res_label: Arc::new(Mutex::new("1080p 60fps".to_string())),
             join_addr_input: String::new(),
-            viewer_client: None,
+            remote_streams: Vec::new(),
+            next_stream_id: 1,
+            focused_tile_id: None,
             discovered_rooms: start_lan_discovery_listener(),
-            video_texture: None,
-            current_video_size: (0, 0),
-            measured_fps: 0,
-            measured_mbps: 0.0,
+            local_video_texture: None,
+            local_video_size: (0, 0),
+            local_measured_fps: 0,
+            local_measured_mbps: 0.0,
+            local_frame_counter: 0,
             ram_mb: get_process_ram_mb(),
-            frame_counter: 0,
-            bytes_counter: 0,
             last_metrics_tick: Instant::now(),
             status_toast: None,
             update_status,
@@ -241,7 +254,6 @@ impl Disc2App {
 
     fn open_share_picker(&mut self, ctx: &Context) {
         self.refresh_sources_and_thumbnails(ctx);
-        // Se a aba atual estiver vazia, seleciona automaticamente uma aba que tenha fontes
         if !self.sources.iter().any(|s| s.category == self.share_tab) {
             self.share_tab = SourceCategory::Screen;
         }
@@ -322,7 +334,7 @@ impl Disc2App {
     }
 
     fn start_sharing(&mut self, ctx: Context) {
-        self.stop_watching();
+        // Permite transmitir sua tela E continuar assistindo as telas dos seus amigos ao mesmo tempo!
         self.stop_sharing();
 
         if self.sources.is_empty() {
@@ -352,7 +364,6 @@ impl Disc2App {
         let stop_flag = Arc::new(AtomicBool::new(false));
         self.capture_stop_flag = Some(Arc::clone(&stop_flag));
 
-        // Inicia a captura de áudio isolada do jogo/app selecionado (ou do sistema se for Tela Inteira)
         let audio_stop = Arc::clone(&stop_flag);
         let audio_enabled = Arc::clone(&self.stream_config.share_system_audio);
         let audio_pid = Arc::clone(&self.stream_config.target_audio_pid);
@@ -395,8 +406,11 @@ impl Disc2App {
                     {
                         if has_viewers {
                             let mut jpeg_buf =
-                                Vec::with_capacity((raw.width * raw.height / 4) as usize);
-                            let encoder = Encoder::new(&mut jpeg_buf, quality);
+                                Vec::with_capacity((raw.width * raw.height / 5) as usize);
+                            let mut encoder = Encoder::new(&mut jpeg_buf, quality);
+                            // Subsampling 4:2:0 reduz o tamanho do quadro em ~45% mantendo nitidez,
+                            // evitando qualquer gargalo no túnel de internet!
+                            encoder.set_sampling_factor(SamplingFactor::F_2_2);
                             if encoder
                                 .encode(
                                     &raw.rgb,
@@ -454,43 +468,265 @@ impl Disc2App {
         }
         self.local_preview_rx = None;
         self.is_sharing = false;
-        self.video_texture = None;
-        self.measured_fps = 0;
-        self.measured_mbps = 0.0;
-    }
-
-    fn start_watching(&mut self, addr: String) {
-        self.stop_sharing();
-        self.stop_watching();
-
-        let client = StreamViewerClient::connect(
-            &addr,
-            Arc::clone(&self.viewer_volume_percent),
-            Arc::clone(&self.viewer_audio_muted),
-        );
-        self.show_toast(format!("Conectando a {}...", client.remote_addr));
-        self.viewer_client = Some(client);
-    }
-
-    fn stop_watching(&mut self) {
-        if let Some(client) = self.viewer_client.take() {
-            client.stop();
+        self.local_video_texture = None;
+        self.local_measured_fps = 0;
+        self.local_measured_mbps = 0.0;
+        if self.focused_tile_id == Some(LOCAL_PREVIEW_TILE_ID) {
+            self.focused_tile_id = None;
         }
-        self.video_texture = None;
-        self.measured_fps = 0;
-        self.measured_mbps = 0.0;
     }
 
-    fn upload_rgba_to_gpu(&mut self, ctx: &Context, width: u32, height: u32, rgba: Vec<u8>) {
-        let image = ColorImage::from_rgba_unmultiplied([width as usize, height as usize], &rgba);
-        self.current_video_size = (width, height);
-        match &mut self.video_texture {
-            Some(tex) => tex.set(image, TextureOptions::LINEAR),
-            None => {
-                self.video_texture =
-                    Some(ctx.load_texture("stream_frame", image, TextureOptions::LINEAR));
+    /// Adiciona uma nova transmissão remota ao palco sem fechar as outras que já estão abertas
+    fn add_remote_stream(&mut self, ctx: &Context, raw_addr: String, custom_label: Option<String>) {
+        let trimmed = raw_addr.trim().to_string();
+        if trimmed.is_empty() {
+            return;
+        }
+
+        // Evita abrir duas conexões idênticas para o mesmo código/endereço
+        if self
+            .remote_streams
+            .iter()
+            .any(|s| s.client.display_label.eq_ignore_ascii_case(&trimmed) || s.client.remote_addr.eq_ignore_ascii_case(&trimmed))
+        {
+            self.show_toast(format!("Você já está assistindo {}!", trimmed));
+            return;
+        }
+
+        if self.remote_streams.len() >= 6 {
+            self.show_toast("Limite máximo de 6 transmissões simultâneas atingido.");
+            return;
+        }
+
+        let client = StreamViewerClient::connect(&trimmed, ctx.clone());
+        let id = self.next_stream_id;
+        self.next_stream_id += 1;
+
+        let label = custom_label.unwrap_or_else(|| format!("Sala {}", client.display_label));
+        self.show_toast(format!("Conectando a {}...", label));
+
+        self.remote_streams.push(RemoteStreamEntry {
+            id,
+            label,
+            client,
+            texture: None,
+            video_size: (0, 0),
+            measured_fps: 0,
+            measured_mbps: 0.0,
+            frame_counter: 0,
+            bytes_counter: 0,
+        });
+    }
+
+    fn remove_remote_stream(&mut self, id: u64) {
+        if let Some(pos) = self.remote_streams.iter().position(|s| s.id == id) {
+            let entry = self.remote_streams.remove(pos);
+            entry.client.stop();
+            if self.focused_tile_id == Some(id) {
+                self.focused_tile_id = None;
             }
         }
+    }
+
+    fn stop_all_remote_streams(&mut self) {
+        for entry in self.remote_streams.drain(..) {
+            entry.client.stop();
+        }
+        if self.focused_tile_id != Some(LOCAL_PREVIEW_TILE_ID) {
+            self.focused_tile_id = None;
+        }
+    }
+
+    fn upload_local_rgba_to_gpu(&mut self, ctx: &Context, width: u32, height: u32, rgba: Vec<u8>) {
+        let image = ColorImage::from_rgba_unmultiplied([width as usize, height as usize], &rgba);
+        self.local_video_size = (width, height);
+        match &mut self.local_video_texture {
+            Some(tex) => tex.set(image, TextureOptions::LINEAR),
+            None => {
+                self.local_video_texture =
+                    Some(ctx.load_texture("local_stream_frame", image, TextureOptions::LINEAR));
+            }
+        }
+    }
+
+    // ======================== TELA INICIAL DE CRIAÇÃO DE CONTA / LOGIN ========================
+    fn render_account_onboarding(&mut self, ctx: &Context) {
+        let accent = self.custom.accent_color();
+        let stage_bg = self.custom.stage_color();
+        let card_bg = self.custom.card_color();
+        let sidebar_bg = self.custom.sidebar_color();
+
+        egui::CentralPanel::default()
+            .frame(egui::Frame::none().fill(stage_bg))
+            .show(ctx, |ui| {
+                let avail = ui.available_size();
+                ui.vertical_centered(|ui| {
+                    ui.add_space((avail.y * 0.08).max(16.0));
+
+                    egui::Frame::none()
+                        .fill(card_bg)
+                        .rounding(Rounding::same(14.0))
+                        .stroke(Stroke::new(1.5_f32, accent))
+                        .inner_margin(egui::Margin::same(28.0))
+                        .show(ui, |ui| {
+                            ui.set_width(470.0);
+
+                            ui.vertical_centered(|ui| {
+                                ui.colored_label(
+                                    accent,
+                                    RichText::new("● Bem-vindo ao SZdisc")
+                                        .size(22.0)
+                                        .strong(),
+                                );
+                                ui.add_space(4.0);
+                                ui.label(
+                                    RichText::new(
+                                        "Crie sua conta para entrar e compartilhar telas com seus amigos",
+                                    )
+                                    .size(13.0)
+                                    .color(Color32::from_rgb(181, 186, 193)),
+                                );
+                            });
+
+                            ui.add_space(16.0);
+
+                            // Avatar + Botão de escolher foto
+                            ui.vertical_centered(|ui| {
+                                draw_discord_avatar(
+                                    ui,
+                                    72.0,
+                                    &self.custom,
+                                    self.user_avatar_tex.as_ref(),
+                                );
+                                ui.add_space(8.0);
+                                if ui.button("📷 Escolher Foto de Perfil (Opcional)").clicked() {
+                                    if let Some(path) = pick_image_file_dialog() {
+                                        if let Some(tex) = load_circular_avatar_texture(ctx, &path)
+                                        {
+                                            self.user_avatar_tex = Some(tex);
+                                            self.custom.avatar_image_path = path;
+                                        }
+                                    }
+                                }
+                            });
+
+                            ui.add_space(14.0);
+
+                            ui.label(
+                                RichText::new("SEU NOME DE EXIBIÇÃO (COMO SEUS AMIGOS VÃO TE VER) *")
+                                    .size(11.0)
+                                    .strong()
+                                    .color(Color32::from_rgb(181, 186, 193)),
+                            );
+                            ui.add_space(4.0);
+                            let name_edit = egui::TextEdit::singleline(&mut self.custom.display_name)
+                                .hint_text("Ex: Pedro, Lucas, Vitor...")
+                                .font(FontId::proportional(15.0))
+                                .desired_width(f32::INFINITY)
+                                .margin(egui::Vec2::new(10.0, 8.0));
+                            let name_resp = ui.add(name_edit);
+
+                            ui.add_space(10.0);
+
+                            ui.columns(2, |cols| {
+                                cols[0].label(
+                                    RichText::new("NOME DE USUÁRIO (@LOGIN)")
+                                        .size(11.0)
+                                        .strong()
+                                        .color(Color32::from_rgb(181, 186, 193)),
+                                );
+                                cols[0].add_space(4.0);
+                                cols[0].add(
+                                    egui::TextEdit::singleline(&mut self.custom.username_login)
+                                        .hint_text("Ex: pedro_gamer")
+                                        .desired_width(f32::INFINITY),
+                                );
+
+                                cols[1].label(
+                                    RichText::new("SUA TAG & COR DO NOME")
+                                        .size(11.0)
+                                        .strong()
+                                        .color(Color32::from_rgb(181, 186, 193)),
+                                );
+                                cols[1].add_space(4.0);
+                                cols[1].horizontal(|ui| {
+                                    ui.add(
+                                        egui::TextEdit::singleline(&mut self.custom.user_tag)
+                                            .desired_width(85.0),
+                                    );
+                                    ui.color_edit_button_srgb(&mut self.custom.name_color_rgb);
+                                    ui.color_edit_button_srgb(&mut self.custom.avatar_bg);
+                                });
+                            });
+
+                            ui.add_space(10.0);
+
+                            ui.label(
+                                RichText::new("RECADO / STATUS PERSONALIZADO")
+                                    .size(11.0)
+                                    .strong()
+                                    .color(Color32::from_rgb(181, 186, 193)),
+                            );
+                            ui.add_space(4.0);
+                            ui.add(
+                                egui::TextEdit::singleline(&mut self.custom.custom_status)
+                                    .hint_text("Ex: Jogando Valorant • 1080p 60fps")
+                                    .desired_width(f32::INFINITY),
+                            );
+
+                            ui.add_space(18.0);
+
+                            let valid_name = !self.custom.display_name.trim().is_empty();
+                            let enter_pressed = name_resp.lost_focus()
+                                && ui.input(|i| i.key_pressed(egui::Key::Enter))
+                                && valid_name;
+
+                            let create_btn = egui::Button::new(
+                                RichText::new("🚀 Criar Conta e Entrar no SZdisc")
+                                    .size(15.0)
+                                    .strong()
+                                    .color(Color32::WHITE),
+                            )
+                            .fill(if valid_name {
+                                Color32::from_rgb(35, 165, 90)
+                            } else {
+                                sidebar_bg
+                            })
+                            .min_size(Vec2::new(ui.available_width(), 42.0));
+
+                            if (ui.add_enabled(valid_name, create_btn).clicked() || enter_pressed)
+                                && valid_name
+                            {
+                                self.custom.display_name =
+                                    self.custom.display_name.trim().to_string();
+                                if self.custom.username_login.trim().is_empty() {
+                                    self.custom.username_login = self
+                                        .custom
+                                        .display_name
+                                        .to_lowercase()
+                                        .replace(' ', "_");
+                                }
+                                self.custom.account_created = true;
+                                self.custom.save_to_disk();
+                                self.show_toast(format!(
+                                    "Bem-vindo(a), {}!",
+                                    self.custom.display_name
+                                ));
+                            }
+
+                            if !valid_name {
+                                ui.add_space(6.0);
+                                ui.vertical_centered(|ui| {
+                                    ui.label(
+                                        RichText::new("Digite seu nome acima para liberar a entrada.")
+                                            .size(11.5)
+                                            .color(Color32::from_rgb(250, 204, 21)),
+                                    );
+                                });
+                            }
+                        });
+                });
+            });
     }
 
     // ======================== MODAL VISUAL DE COMPARTILHAMENTO ESTILO DISCORD ========================
@@ -561,7 +797,6 @@ impl Disc2App {
                     .filter(|s| s.category == SourceCategory::Screen)
                     .count();
 
-                // Barra de Abas + Pesquisa Rápida de Janela/App
                 egui::Frame::none()
                     .fill(sidebar_bg)
                     .rounding(Rounding::same(8.0))
@@ -755,7 +990,6 @@ impl Disc2App {
 
                 ui.add_space(10.0);
 
-                // Painel de Qualidade + Áudio da Transmissão estilo Discord
                 egui::Frame::none()
                     .fill(sidebar_bg)
                     .rounding(Rounding::same(8.0))
@@ -834,7 +1068,7 @@ impl Disc2App {
             });
     }
 
-    // ======================== MODAL DE PERSONALIZAÇÃO LIVRE (PERFIL COM FOTO + TEMA DO APP) ========================
+    // ======================== MODAL DE PERSONALIZAÇÃO LIVRE (PERFIL COM FOTO + TEMA DO APP + CONTA) ========================
     fn render_settings_modal(&mut self, ctx: &Context) {
         if !self.show_settings_modal {
             return;
@@ -845,11 +1079,11 @@ impl Disc2App {
         let sidebar_bg = self.custom.sidebar_color();
         let mut theme_changed = false;
 
-        egui::Window::new("⚙️ Personalização Livre do Perfil e do Aplicativo")
+        egui::Window::new("⚙️ Personalização Livre do Perfil, Conta e do Aplicativo")
             .collapsible(false)
             .resizable(false)
             .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
-            .fixed_size(Vec2::new(810.0, 540.0))
+            .fixed_size(Vec2::new(820.0, 550.0))
             .frame(
                 egui::Frame::none()
                     .fill(card_bg)
@@ -860,7 +1094,7 @@ impl Disc2App {
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
                     let tabs = [
-                        (SettingsTab::Profile, "👤 Meu Perfil & Foto"),
+                        (SettingsTab::Profile, "👤 Minha Conta & Foto"),
                         (SettingsTab::Appearance, "🎨 Cores e Estilo do App"),
                         (SettingsTab::Stream, "🔊 Áudio e Transmissão"),
                     ];
@@ -900,7 +1134,7 @@ impl Disc2App {
                 ui.columns(2, |cols| {
                     egui::ScrollArea::vertical()
                         .id_salt("settings_left_scroll")
-                        .max_height(430.0)
+                        .max_height(440.0)
                         .show(&mut cols[0], |ui| match self.settings_tab {
                             SettingsTab::Profile => {
                                 ui.label(
@@ -1067,6 +1301,21 @@ impl Disc2App {
                                     );
                                     ui.color_edit_button_srgb(&mut self.custom.custom_badge_rgb);
                                 });
+
+                                ui.add_space(10.0);
+                                ui.separator();
+                                ui.add_space(6.0);
+                                if ui
+                                    .button(
+                                        RichText::new("🚪 Trocar de Conta / Sair")
+                                            .color(Color32::from_rgb(242, 63, 67)),
+                                    )
+                                    .clicked()
+                                {
+                                    self.custom.account_created = false;
+                                    self.custom.save_to_disk();
+                                    self.show_settings_modal = false;
+                                }
                             }
 
                             SettingsTab::Appearance => {
@@ -1219,7 +1468,7 @@ impl Disc2App {
                                 if ui
                                     .checkbox(
                                         &mut self.share_audio_enabled,
-                                        "🔊 Transmitir áudio do sistema (WASAPI Loopback)",
+                                        "🔊 Transmitir áudio isolado do jogo/app (WASAPI Process Loopback)",
                                     )
                                     .changed()
                                 {
@@ -1250,7 +1499,6 @@ impl Disc2App {
                             }
                         });
 
-                    // Coluna da Direita: Prévia ao Vivo do Card de Perfil Estilo Discord
                     cols[1].vertical_centered(|ui| {
                         ui.label(
                             RichText::new("PRÉVIA DO SEU PERFIL AO VIVO")
@@ -1275,67 +1523,264 @@ impl Disc2App {
             self.custom.save_to_disk();
         }
     }
+
+    /// Renderiza um bloco de vídeo individual (seja transmissão remota de um amigo ou sua própria prévia)
+    fn render_stream_tile(
+        ui: &mut egui::Ui,
+        tile_rect: egui::Rect,
+        tile_id: u64,
+        title: &str,
+        subtitle: &str,
+        texture: Option<&TextureHandle>,
+        is_remote: bool,
+        volume_atomic: Option<&Arc<AtomicU32>>,
+        muted_atomic: Option<&Arc<AtomicBool>>,
+        is_focused: bool,
+        total_tiles: usize,
+        card_bg: Color32,
+        accent: Color32,
+        focus_action: &mut Option<u64>,
+        unfocus_action: &mut bool,
+        close_action: &mut Option<u64>,
+    ) {
+        let mut child_ui = ui.new_child(
+            egui::UiBuilder::new()
+                .max_rect(tile_rect)
+                .layout(egui::Layout::top_down(egui::Align::Center)),
+        );
+
+        let rounding = Rounding::same(8.0);
+        child_ui.painter().rect(
+            tile_rect,
+            rounding,
+            Color32::from_rgb(12, 13, 16),
+            Stroke::new(1.2, Color32::from_rgba_unmultiplied(255, 255, 255, 24)),
+        );
+
+        let header_h = 34.0;
+        let video_area_h = (tile_rect.height() - header_h).max(20.0);
+        let video_rect = egui::Rect::from_min_size(
+            tile_rect.min,
+            Vec2::new(tile_rect.width(), video_area_h),
+        );
+
+        // Desenha o quadro de vídeo mantendo a proporção 16:9 / nativa
+        if let Some(tex) = texture {
+            let tex_size = tex.size_vec2();
+            if tex_size.x > 0.0 && tex_size.y > 0.0 {
+                let scale =
+                    ((video_rect.width() - 6.0) / tex_size.x).min((video_rect.height() - 6.0) / tex_size.y);
+                let draw_size = Vec2::new(tex_size.x * scale, tex_size.y * scale);
+                let img_rect = egui::Rect::from_center_size(video_rect.center(), draw_size);
+                child_ui.painter().image(
+                    tex.id(),
+                    img_rect,
+                    egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                    Color32::WHITE,
+                );
+            }
+        } else {
+            child_ui.painter().text(
+                video_rect.center(),
+                egui::Align2::CENTER_CENTER,
+                "⏳ Recebendo transmissão...",
+                FontId::proportional(13.5),
+                Color32::from_rgb(160, 166, 174),
+            );
+        }
+
+        // Clique duplo no vídeo para expandir/voltar para a grade
+        let video_resp = child_ui.interact(
+            video_rect,
+            egui::Id::new(("tile_video_click", tile_id)),
+            egui::Sense::click(),
+        );
+        if video_resp.double_clicked() && total_tiles > 1 {
+            if is_focused {
+                *unfocus_action = true;
+            } else {
+                *focus_action = Some(tile_id);
+            }
+        }
+
+        // Barra inferior de controles individuais da tela
+        let bar_rect = egui::Rect::from_min_size(
+            egui::pos2(tile_rect.min.x, tile_rect.max.y - header_h),
+            Vec2::new(tile_rect.width(), header_h),
+        );
+        child_ui.painter().rect_filled(bar_rect, Rounding::same(6.0), card_bg);
+
+        let mut bar_ui = child_ui.new_child(
+            egui::UiBuilder::new()
+                .max_rect(bar_rect.shrink2(Vec2::new(8.0, 4.0)))
+                .layout(egui::Layout::left_to_right(egui::Align::Center)),
+        );
+
+        bar_ui.colored_label(
+            Color32::from_rgb(242, 63, 67),
+            RichText::new("●").size(12.0).strong(),
+        );
+        bar_ui.label(
+            RichText::new(title)
+                .size(12.0)
+                .strong()
+                .color(Color32::WHITE),
+        );
+        bar_ui.label(
+            RichText::new(subtitle)
+                .size(11.0)
+                .color(Color32::from_rgb(165, 170, 180)),
+        );
+
+        bar_ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if is_remote {
+                if ui
+                    .small_button("✕")
+                    .on_hover_text("Parar de assistir esta tela")
+                    .clicked()
+                {
+                    *close_action = Some(tile_id);
+                }
+            }
+
+            if total_tiles > 1 {
+                let focus_lbl = if is_focused { "🗗 Grade" } else { "🔍 Expandir" };
+                let btn = egui::Button::new(RichText::new(focus_lbl).size(11.0).color(Color32::WHITE))
+                    .fill(if is_focused { accent } else { Color32::from_rgb(45, 48, 56) });
+                if ui.add(btn).clicked() {
+                    if is_focused {
+                        *unfocus_action = true;
+                    } else {
+                        *focus_action = Some(tile_id);
+                    }
+                }
+            }
+
+            if let (Some(vol_arc), Some(mute_arc)) = (volume_atomic, muted_atomic) {
+                let mut vol = vol_arc.load(Ordering::Relaxed);
+                if ui
+                    .add(
+                        egui::Slider::new(&mut vol, 0..=150)
+                            .suffix("%")
+                            .show_value(true),
+                    )
+                    .changed()
+                {
+                    vol_arc.store(vol, Ordering::Relaxed);
+                }
+
+                let mut muted = mute_arc.load(Ordering::Relaxed);
+                if ui
+                    .small_button(if muted { "🔇" } else { "🔊" })
+                    .on_hover_text("Mutar/Desmutar som apenas desta tela")
+                    .clicked()
+                {
+                    muted = !muted;
+                    mute_arc.store(muted, Ordering::Relaxed);
+                }
+            }
+        });
+    }
 }
 
 impl eframe::App for Disc2App {
     fn update(&mut self, ctx: &Context, _frame: &mut eframe::Frame) {
-        // Recebe quadros locais
+        // Se o usuário ainda não criou sua conta neste PC, exibe a tela de criação de conta
+        if !self.custom.account_created {
+            self.render_account_onboarding(ctx);
+            return;
+        }
+
+        // Recebe quadros locais (Host)
         let mut new_local_frame = None;
         if let Some(rx) = &self.local_preview_rx {
             while let Ok(f) = rx.try_recv() {
                 new_local_frame = Some(f);
-                self.frame_counter += 1;
+                self.local_frame_counter += 1;
             }
         }
         if let Some(f) = new_local_frame {
-            self.upload_rgba_to_gpu(ctx, f.width, f.height, f.rgba);
+            self.upload_local_rgba_to_gpu(ctx, f.width, f.height, f.rgba);
         }
 
-        // Recebe quadros remotos
-        let mut new_remote_frame = None;
-        let mut remote_err = None;
-        if let Some(client) = &self.viewer_client {
-            while let Ok(f) = client.frame_rx.try_recv() {
-                self.frame_counter += 1;
-                self.bytes_counter += f.byte_len;
-                new_remote_frame = Some(f);
+        // Recebe quadros de TODAS as transmissões remotas simultâneas (Multi-Stream)
+        let mut disconnected_ids = Vec::new();
+        let mut toast_to_show = None;
+        let mut any_remote_active = false;
+
+        for entry in &mut self.remote_streams {
+            let mut latest_frame = None;
+            while let Ok(f) = entry.client.frame_rx.try_recv() {
+                entry.frame_counter += 1;
+                entry.bytes_counter += f.byte_len;
+                latest_frame = Some(f);
             }
-            if let Ok(mut err_guard) = client.error_msg.lock() {
-                if let Some(e) = err_guard.take() {
-                    remote_err = Some(e);
+            if let Some(f) = latest_frame {
+                entry.video_size = (f.width, f.height);
+                let img = ColorImage::from_rgba_unmultiplied(
+                    [f.width as usize, f.height as usize],
+                    &f.rgba,
+                );
+                match &mut entry.texture {
+                    Some(tex) => tex.set(img, TextureOptions::LINEAR),
+                    None => {
+                        entry.texture = Some(ctx.load_texture(
+                            format!("remote_stream_{}", entry.id),
+                            img,
+                            TextureOptions::LINEAR,
+                        ));
+                    }
                 }
             }
-            if client.connected.load(Ordering::Relaxed) {
-                ctx.request_repaint_after(Duration::from_millis(8));
+
+            if let Ok(mut err_guard) = entry.client.error_msg.lock() {
+                if let Some(e) = err_guard.take() {
+                    toast_to_show = Some(format!("{}: {}", entry.label, e));
+                    disconnected_ids.push(entry.id);
+                }
+            }
+
+            if entry.client.connected.load(Ordering::Relaxed) {
+                any_remote_active = true;
             }
         }
-        if let Some(f) = new_remote_frame {
-            self.upload_rgba_to_gpu(ctx, f.width, f.height, f.rgba);
+
+        if any_remote_active {
+            ctx.request_repaint_after(Duration::from_millis(12));
         }
-        if let Some(e) = remote_err {
-            self.stop_watching();
-            self.show_toast(e);
+
+        for id in disconnected_ids {
+            self.remove_remote_stream(id);
+        }
+        if let Some(msg) = toast_to_show {
+            self.show_toast(msg);
         }
 
         // Atualiza telemetria e uso de RAM a cada 1 segundo
         let elapsed_sec = self.last_metrics_tick.elapsed().as_secs_f32();
         if elapsed_sec >= 1.0 {
             self.ram_mb = get_process_ram_mb();
-            self.measured_fps = (self.frame_counter as f32 / elapsed_sec).round() as u32;
+            self.local_measured_fps =
+                (self.local_frame_counter as f32 / elapsed_sec).round() as u32;
             if self.is_sharing {
                 if let Some(srv) = &self.host_server {
                     let bps = srv.bytes_sent_per_sec.load(Ordering::Relaxed);
-                    self.measured_mbps = (bps as f32 * 8.0) / 1_000_000.0;
+                    self.local_measured_mbps = (bps as f32 * 8.0) / 1_000_000.0;
                 }
                 if self.eco_hide_preview {
-                    self.measured_fps = self.fps_preset as u32;
+                    self.local_measured_fps = self.fps_preset as u32;
                 }
-            } else {
-                self.measured_mbps =
-                    ((self.bytes_counter as f32 * 8.0) / elapsed_sec) / 1_000_000.0;
             }
-            self.frame_counter = 0;
-            self.bytes_counter = 0;
+            self.local_frame_counter = 0;
+
+            for entry in &mut self.remote_streams {
+                entry.measured_fps = (entry.frame_counter as f32 / elapsed_sec).round() as u32;
+                entry.measured_mbps =
+                    ((entry.bytes_counter as f32 * 8.0) / elapsed_sec) / 1_000_000.0;
+                entry.frame_counter = 0;
+                entry.bytes_counter = 0;
+            }
+
             self.last_metrics_tick = Instant::now();
         }
 
@@ -1347,10 +1792,10 @@ impl eframe::App for Disc2App {
         // ======================== BARRA LATERAL ESQUERDA (ESTILO DISCORD) ========================
         egui::SidePanel::left("sidebar_panel")
             .resizable(false)
-            .exact_width(285.0)
+            .exact_width(290.0)
             .frame(egui::Frame::none().fill(sidebar_bg))
             .show(ctx, |ui| {
-                // Rodapé fixo do Perfil de Usuário (igual à barra inferior do Discord)
+                // Rodapé fixo do Perfil de Usuário
                 egui::TopBottomPanel::bottom("discord_user_footer")
                     .exact_height(62.0)
                     .frame(
@@ -1409,7 +1854,7 @@ impl eframe::App for Disc2App {
                                 |ui| {
                                     if ui
                                         .button("⚙️")
-                                        .on_hover_text("Personalizar Perfil, Foto e Tema do App")
+                                        .on_hover_text("Personalizar Conta, Foto e Tema do App")
                                         .clicked()
                                     {
                                         self.show_settings_modal = true;
@@ -1433,7 +1878,7 @@ impl eframe::App for Disc2App {
                         ui.horizontal(|ui| {
                             ui.colored_label(accent, RichText::new("● SZdisc").strong().size(17.0));
                             ui.label(
-                                RichText::new("Rust Native")
+                                RichText::new(format!("v{}", CURRENT_VERSION))
                                     .size(11.0)
                                     .color(Color32::from_rgb(148, 155, 164)),
                             );
@@ -1546,7 +1991,7 @@ impl eframe::App for Disc2App {
 
                                         ui.label(
                                             RichText::new(format!(
-                                                "Assistindo agora: {}",
+                                                "Assistindo você agora: {}",
                                                 viewers
                                             ))
                                             .size(11.0)
@@ -1557,126 +2002,134 @@ impl eframe::App for Disc2App {
 
                             ui.add_space(6.0);
                             let stop_btn = egui::Button::new(
-                                RichText::new("⏹ Encerrar Transmissão")
-                                    .size(12.5)
+                                RichText::new("⏹ Encerrar Minha Transmissão")
+                                    .size(12.0)
                                     .strong()
                                     .color(Color32::WHITE),
                             )
                             .fill(Color32::from_rgb(242, 63, 67))
-                            .min_size(Vec2::new(ui.available_width(), 30.0));
+                            .min_size(Vec2::new(ui.available_width(), 28.0));
 
                             if ui.add(stop_btn).clicked() {
                                 self.stop_sharing();
                             }
                         }
 
-                        ui.add_space(12.0);
-
-                        ui.label(
-                            RichText::new("NO PALCO AGORA")
-                                .size(10.5)
-                                .strong()
-                                .color(Color32::from_rgb(148, 155, 164)),
-                        );
-                        ui.add_space(4.0);
-
-                        egui::Frame::none()
-                            .fill(card_bg)
-                            .rounding(Rounding::same(7.0))
-                            .inner_margin(egui::Margin::same(8.0))
-                            .show(ui, |ui| {
-                                ui.horizontal(|ui| {
-                                    draw_discord_avatar(
-                                        ui,
-                                        32.0,
-                                        &self.custom,
-                                        self.user_avatar_tex.as_ref(),
-                                    );
-                                    ui.vertical(|ui| {
-                                        ui.label(
-                                            RichText::new(format!(
-                                                "{} (Você)",
-                                                self.custom.display_name
-                                            ))
-                                            .strong()
-                                            .size(12.5)
-                                            .color(self.custom.name_color()),
-                                        );
-                                        let src_name = self
-                                            .sources
-                                            .get(self.selected_source_idx)
-                                            .map(|s| s.name.as_str())
-                                            .unwrap_or("Pronto");
-                                        let short_src: String = src_name.chars().take(22).collect();
-                                        ui.label(
-                                            RichText::new(if self.is_sharing {
-                                                short_src
-                                            } else {
-                                                "Na sala".to_string()
-                                            })
-                                            .size(10.5)
-                                            .color(Color32::from_rgb(160, 166, 174)),
-                                        );
-                                    });
-
-                                    if self.is_sharing {
-                                        ui.with_layout(
-                                            egui::Layout::right_to_left(egui::Align::Center),
-                                            |ui| {
-                                                egui::Frame::none()
-                                                    .fill(Color32::from_rgb(242, 63, 67))
-                                                    .rounding(Rounding::same(4.0))
-                                                    .inner_margin(egui::Margin::symmetric(5.0, 2.0))
-                                                    .show(ui, |ui| {
-                                                        ui.label(
-                                                            RichText::new("LIVE")
-                                                                .size(9.5)
-                                                                .strong()
-                                                                .color(Color32::WHITE),
-                                                        );
-                                                    });
-                                            },
-                                        );
-                                    }
-                                });
-                            });
-
-                        ui.add_space(12.0);
+                        ui.add_space(10.0);
                         ui.separator();
                         ui.add_space(8.0);
 
+                        // Conectar em múltiplas transmissões ao mesmo tempo (Multi-Stream)
                         ui.label(
-                            RichText::new("CONECTAR EM UMA SALA (CÓDIGO OU IP)")
-                                .size(10.5)
+                            RichText::new("ASSISTIR AMIGOS (ATÉ 3+ TELAS SIMULTÂNEAS)")
+                                .size(10.0)
                                 .strong()
                                 .color(Color32::from_rgb(148, 155, 164)),
                         );
                         ui.add_space(4.0);
                         ui.horizontal(|ui| {
-                            ui.add(
+                            let resp = ui.add(
                                 egui::TextEdit::singleline(&mut self.join_addr_input)
                                     .hint_text("Código (ex: 52735) ou IP")
                                     .desired_width(175.0),
                             );
-                            if ui.button("Entrar").clicked()
+                            let enter = resp.lost_focus()
+                                && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                            if (ui.button("➕ Assistir").clicked() || enter)
                                 && !self.join_addr_input.trim().is_empty()
                             {
                                 let target = self.join_addr_input.trim().to_string();
-                                self.start_watching(target);
+                                self.join_addr_input.clear();
+                                self.add_remote_stream(ctx, target, None);
                             }
                         });
 
-                        if self.viewer_client.is_some() {
+                        // Lista de telas remotas abertas simultaneamente
+                        if !self.remote_streams.is_empty() {
+                            ui.add_space(8.0);
+                            ui.horizontal(|ui| {
+                                ui.label(
+                                    RichText::new(format!(
+                                        "TELAS ABERTAS NO PALCO ({})",
+                                        self.remote_streams.len()
+                                    ))
+                                    .size(10.0)
+                                    .strong()
+                                    .color(Color32::from_rgb(134, 239, 172)),
+                                );
+                                ui.with_layout(
+                                    egui::Layout::right_to_left(egui::Align::Center),
+                                    |ui| {
+                                        if self.remote_streams.len() > 1
+                                            && ui.small_button("Fechar Todas").clicked()
+                                        {
+                                            self.stop_all_remote_streams();
+                                        }
+                                    },
+                                );
+                            });
                             ui.add_space(4.0);
-                            if ui.button("Desconectar da Sala").clicked() {
-                                self.stop_watching();
+
+                            let mut id_to_close = None;
+                            let mut id_to_focus = None;
+                            for s in &self.remote_streams {
+                                egui::Frame::none()
+                                    .fill(card_bg)
+                                    .rounding(Rounding::same(6.0))
+                                    .inner_margin(egui::Margin::symmetric(8.0, 5.0))
+                                    .show(ui, |ui| {
+                                        ui.horizontal(|ui| {
+                                            ui.colored_label(
+                                                Color32::from_rgb(242, 63, 67),
+                                                "●",
+                                            );
+                                            ui.label(
+                                                RichText::new(&s.label)
+                                                    .size(11.5)
+                                                    .strong()
+                                                    .color(Color32::WHITE),
+                                            );
+                                            ui.label(
+                                                RichText::new(format!("{}fps", s.measured_fps))
+                                                    .size(10.5)
+                                                    .color(Color32::from_rgb(160, 166, 174)),
+                                            );
+                                            ui.with_layout(
+                                                egui::Layout::right_to_left(egui::Align::Center),
+                                                |ui| {
+                                                    if ui.small_button("✕").clicked() {
+                                                        id_to_close = Some(s.id);
+                                                    }
+                                                    if ui.small_button("🔍").clicked() {
+                                                        if self.focused_tile_id == Some(s.id) {
+                                                            id_to_focus = Some(u64::MAX);
+                                                        } else {
+                                                            id_to_focus = Some(s.id);
+                                                        }
+                                                    }
+                                                },
+                                            );
+                                        });
+                                    });
+                                ui.add_space(3.0);
+                            }
+
+                            if let Some(id) = id_to_close {
+                                self.remove_remote_stream(id);
+                            }
+                            if let Some(id) = id_to_focus {
+                                if id == u64::MAX {
+                                    self.focused_tile_id = None;
+                                } else {
+                                    self.focused_tile_id = Some(id);
+                                }
                             }
                         }
 
-                        ui.add_space(10.0);
+                        ui.add_space(8.0);
                         ui.label(
-                            RichText::new("SALAS ATIVAS NA REDE / VPN")
-                                .size(10.5)
+                            RichText::new("SALAS DESCOBERTAS NA REDE / VPN")
+                                .size(10.0)
                                 .strong()
                                 .color(Color32::from_rgb(148, 155, 164)),
                         );
@@ -1690,9 +2143,11 @@ impl eframe::App for Disc2App {
 
                         if rooms_snapshot.is_empty() {
                             ui.label(
-                                RichText::new("Nenhuma outra transmissão ativa na rede.")
-                                    .size(11.0)
-                                    .color(Color32::from_rgb(128, 132, 142)),
+                                RichText::new(
+                                    "Use o Código de 5 dígitos acima para assistir amigos pela internet.",
+                                )
+                                .size(10.5)
+                                .color(Color32::from_rgb(128, 132, 142)),
                             );
                         } else {
                             egui::ScrollArea::vertical()
@@ -1727,10 +2182,14 @@ impl eframe::App for Disc2App {
                                                             egui::Align::Center,
                                                         ),
                                                         |ui| {
-                                                            if ui.small_button("Assistir").clicked()
+                                                            if ui
+                                                                .small_button("➕ Assistir")
+                                                                .clicked()
                                                             {
-                                                                self.start_watching(
+                                                                self.add_remote_stream(
+                                                                    ctx,
                                                                     room.addr.clone(),
+                                                                    Some(room.host_name.clone()),
                                                                 );
                                                             }
                                                         },
@@ -1744,7 +2203,7 @@ impl eframe::App for Disc2App {
                     });
             });
 
-        // ======================== BARRA SUPERIOR DO PALCO (QUALIDADE + ÁUDIO EM TEMPO REAL) ========================
+        // ======================== BARRA SUPERIOR DO PALCO (QUALIDADE + MULTI-STREAM + AUTO-UPDATER) ========================
         egui::TopBottomPanel::top("stage_top_bar")
             .exact_height(48.0)
             .frame(
@@ -1754,7 +2213,7 @@ impl eframe::App for Disc2App {
             )
             .show(ctx, |ui| {
                 ui.horizontal_centered(|ui| {
-                    if self.is_sharing || self.viewer_client.is_some() {
+                    if self.is_sharing || !self.remote_streams.is_empty() {
                         egui::Frame::none()
                             .fill(Color32::from_rgb(242, 63, 67))
                             .rounding(Rounding::same(4.0))
@@ -1801,7 +2260,7 @@ impl eframe::App for Disc2App {
                         self.sync_live_config();
                     }
 
-                    // Seletor de FPS em Tempo Real (60, 30, 15)
+                    // Seletor de FPS em Tempo Real
                     ui.label(RichText::new("Quadros:").size(12.0));
                     let prev_fps = self.fps_preset;
                     egui::ComboBox::from_id_salt("combo_fps")
@@ -1820,7 +2279,7 @@ impl eframe::App for Disc2App {
                     let prev_q = self.jpeg_quality;
                     let q_label = match self.jpeg_quality {
                         90 => "Ultra (90%)",
-                        78 => "Alta (78%)",
+                        75 => "Alta (75%)",
                         62 => "Média (62%)",
                         _ => "Leve (45%)",
                     };
@@ -1829,7 +2288,7 @@ impl eframe::App for Disc2App {
                         .width(92.0)
                         .show_ui(ui, |ui| {
                             ui.selectable_value(&mut self.jpeg_quality, 90, "Ultra (90%)");
-                            ui.selectable_value(&mut self.jpeg_quality, 78, "Alta (78%)");
+                            ui.selectable_value(&mut self.jpeg_quality, 75, "Alta (75%)");
                             ui.selectable_value(&mut self.jpeg_quality, 62, "Média (62%)");
                             ui.selectable_value(&mut self.jpeg_quality, 45, "Leve (45%)");
                         });
@@ -1837,7 +2296,6 @@ impl eframe::App for Disc2App {
                         self.sync_live_config();
                     }
 
-                    // Controle de Áudio (Host: Enviar Áudio | Viewer: Volume da Transmissão)
                     if self.is_sharing {
                         let prev_aud = self.share_audio_enabled;
                         ui.checkbox(&mut self.share_audio_enabled, "🔊 Áudio");
@@ -1845,26 +2303,23 @@ impl eframe::App for Disc2App {
                             self.sync_live_config();
                         }
 
-                        let prev_eco = self.eco_hide_preview;
-                        ui.checkbox(&mut self.eco_hide_preview, "Modo Jogo");
-                        if self.eco_hide_preview != prev_eco {
-                            self.sync_live_config();
+                        if !self.remote_streams.is_empty() {
+                            ui.checkbox(&mut self.show_own_preview_in_grid, "👁 Minha Tela");
+                        } else {
+                            let prev_eco = self.eco_hide_preview;
+                            ui.checkbox(&mut self.eco_hide_preview, "Modo Jogo");
+                            if self.eco_hide_preview != prev_eco {
+                                self.sync_live_config();
+                            }
                         }
-                    } else if self.viewer_client.is_some() {
-                        let mut muted = self.viewer_audio_muted.load(Ordering::Relaxed);
+                    }
+
+                    if self.focused_tile_id.is_some() {
                         if ui
-                            .button(if muted { "🔇 Mudo" } else { "🔊 Som" })
+                            .button("🗗 Voltar para Grade Multi-Telas")
                             .clicked()
                         {
-                            muted = !muted;
-                            self.viewer_audio_muted.store(muted, Ordering::Relaxed);
-                        }
-                        let mut vol = self.viewer_volume_percent.load(Ordering::Relaxed);
-                        if ui
-                            .add(egui::Slider::new(&mut vol, 0..=150).suffix("%"))
-                            .changed()
-                        {
-                            self.viewer_volume_percent.store(vol, Ordering::Relaxed);
+                            self.focused_tile_id = None;
                         }
                     }
 
@@ -1918,34 +2373,181 @@ impl eframe::App for Disc2App {
                             }
                         }
 
-                        if ui.button("🎨 Personalizar").clicked() {
+                        if ui.button("🎨 Conta & Tema").clicked() {
                             self.show_settings_modal = true;
-                        }
-
-                        if self.is_sharing || self.viewer_client.is_some() {
-                            ui.label(
-                                RichText::new(format!(
-                                    "{}×{} • {} FPS • {:.1} Mbps",
-                                    self.current_video_size.0,
-                                    self.current_video_size.1,
-                                    self.measured_fps,
-                                    self.measured_mbps
-                                ))
-                                .size(11.5)
-                                .color(Color32::from_rgb(181, 186, 193)),
-                            );
                         }
                     });
                 });
             });
 
-        // ======================== PALCO CENTRAL DE VÍDEO ========================
+        // ======================== PALCO CENTRAL DE VÍDEO (SUPORTE A 1, 2, 3, 4+ TELAS SIMULTÂNEAS) ========================
         egui::CentralPanel::default()
             .frame(egui::Frame::none().fill(stage_bg))
             .show(ctx, |ui| {
                 let avail = ui.available_size();
 
-                if self.is_sharing && self.eco_hide_preview {
+                let include_local_tile = self.is_sharing
+                    && !self.eco_hide_preview
+                    && (self.remote_streams.is_empty() || self.show_own_preview_in_grid);
+
+                let mut active_tile_ids: Vec<u64> = Vec::new();
+                for s in &self.remote_streams {
+                    active_tile_ids.push(s.id);
+                }
+                if include_local_tile {
+                    active_tile_ids.push(LOCAL_PREVIEW_TILE_ID);
+                }
+
+                let total_tiles = active_tile_ids.len();
+
+                if total_tiles > 0 {
+                    // Verifica se há uma tela focada/expandida
+                    let visible_ids: Vec<u64> = if let Some(foc) = self.focused_tile_id {
+                        if active_tile_ids.contains(&foc) {
+                            vec![foc]
+                        } else {
+                            self.focused_tile_id = None;
+                            active_tile_ids.clone()
+                        }
+                    } else {
+                        active_tile_ids.clone()
+                    };
+
+                    let stage_rect = ui.available_rect_before_wrap().shrink(8.0);
+                    let gap = 8.0;
+                    let count = visible_ids.len();
+
+                    // Calcula os retângulos responsivos para 1, 2, 3 ou 4+ transmissões simultâneas
+                    let mut tile_rects: Vec<(u64, egui::Rect)> = Vec::with_capacity(count);
+                    if count == 1 {
+                        tile_rects.push((visible_ids[0], stage_rect));
+                    } else if count == 2 {
+                        let w = (stage_rect.width() - gap) * 0.5;
+                        let r0 = egui::Rect::from_min_size(
+                            stage_rect.min,
+                            Vec2::new(w, stage_rect.height()),
+                        );
+                        let r1 = egui::Rect::from_min_size(
+                            egui::pos2(stage_rect.min.x + w + gap, stage_rect.min.y),
+                            Vec2::new(w, stage_rect.height()),
+                        );
+                        tile_rects.push((visible_ids[0], r0));
+                        tile_rects.push((visible_ids[1], r1));
+                    } else if count == 3 {
+                        // 2 telas em cima e 1 tela centralizada embaixo (estilo Discord Multi-Stream)
+                        let h = (stage_rect.height() - gap) * 0.5;
+                        let w_top = (stage_rect.width() - gap) * 0.5;
+                        let r0 = egui::Rect::from_min_size(stage_rect.min, Vec2::new(w_top, h));
+                        let r1 = egui::Rect::from_min_size(
+                            egui::pos2(stage_rect.min.x + w_top + gap, stage_rect.min.y),
+                            Vec2::new(w_top, h),
+                        );
+                        let w_bot = (stage_rect.width() * 0.62).max(w_top);
+                        let x_bot = stage_rect.min.x + (stage_rect.width() - w_bot) * 0.5;
+                        let r2 = egui::Rect::from_min_size(
+                            egui::pos2(x_bot, stage_rect.min.y + h + gap),
+                            Vec2::new(w_bot, h),
+                        );
+                        tile_rects.push((visible_ids[0], r0));
+                        tile_rects.push((visible_ids[1], r1));
+                        tile_rects.push((visible_ids[2], r2));
+                    } else {
+                        // Grade 2x2 ou 3x2 para 4 a 6 telas simultâneas
+                        let cols = if count <= 4 { 2 } else { 3 };
+                        let rows = (count + cols - 1) / cols;
+                        let cell_w =
+                            (stage_rect.width() - gap * (cols as f32 - 1.0)) / cols as f32;
+                        let cell_h =
+                            (stage_rect.height() - gap * (rows as f32 - 1.0)) / rows as f32;
+
+                        for (idx, tid) in visible_ids.iter().enumerate() {
+                            let c = idx % cols;
+                            let r = idx / cols;
+                            let min_pos = egui::pos2(
+                                stage_rect.min.x + c as f32 * (cell_w + gap),
+                                stage_rect.min.y + r as f32 * (cell_h + gap),
+                            );
+                            tile_rects.push((*tid, egui::Rect::from_min_size(min_pos, Vec2::new(cell_w, cell_h))));
+                        }
+                    }
+
+                    let mut focus_action = None;
+                    let mut unfocus_action = false;
+                    let mut close_action = None;
+
+                    for (tid, rect) in tile_rects {
+                        let is_focused = self.focused_tile_id == Some(tid);
+                        if tid == LOCAL_PREVIEW_TILE_ID {
+                            let title = format!("{} (Sua Transmissão)", self.custom.display_name);
+                            let sub = format!(
+                                "{}×{} • {} FPS • {:.1} Mbps",
+                                self.local_video_size.0,
+                                self.local_video_size.1,
+                                self.local_measured_fps,
+                                self.local_measured_mbps
+                            );
+                            Self::render_stream_tile(
+                                ui,
+                                rect,
+                                tid,
+                                &title,
+                                &sub,
+                                self.local_video_texture.as_ref(),
+                                false,
+                                None,
+                                None,
+                                is_focused,
+                                total_tiles,
+                                card_bg,
+                                accent,
+                                &mut focus_action,
+                                &mut unfocus_action,
+                                &mut close_action,
+                            );
+                        } else if let Some(entry) =
+                            self.remote_streams.iter().find(|s| s.id == tid)
+                        {
+                            let sub = if entry.video_size.0 > 0 {
+                                format!(
+                                    "{}×{} • {} FPS • {:.1} Mbps",
+                                    entry.video_size.0,
+                                    entry.video_size.1,
+                                    entry.measured_fps,
+                                    entry.measured_mbps
+                                )
+                            } else {
+                                "Conectado".to_string()
+                            };
+                            Self::render_stream_tile(
+                                ui,
+                                rect,
+                                tid,
+                                &entry.label,
+                                &sub,
+                                entry.texture.as_ref(),
+                                true,
+                                Some(&entry.client.volume_percent),
+                                Some(&entry.client.muted),
+                                is_focused,
+                                total_tiles,
+                                card_bg,
+                                accent,
+                                &mut focus_action,
+                                &mut unfocus_action,
+                                &mut close_action,
+                            );
+                        }
+                    }
+
+                    if unfocus_action {
+                        self.focused_tile_id = None;
+                    } else if let Some(fid) = focus_action {
+                        self.focused_tile_id = Some(fid);
+                    }
+                    if let Some(cid) = close_action {
+                        self.remove_remote_stream(cid);
+                    }
+                } else if self.is_sharing && self.eco_hide_preview {
                     ui.vertical_centered(|ui| {
                         ui.add_space(avail.y * 0.33);
                         ui.colored_label(
@@ -1968,18 +2570,6 @@ impl eframe::App for Disc2App {
                             self.sync_live_config();
                         }
                     });
-                } else if let Some(tex) = &self.video_texture {
-                    let tex_size = tex.size_vec2();
-                    if tex_size.x > 0.0 && tex_size.y > 0.0 {
-                        let scale = (avail.x / tex_size.x).min(avail.y / tex_size.y);
-                        let draw_size = Vec2::new(tex_size.x * scale, tex_size.y * scale);
-                        let pad_y = ((avail.y - draw_size.y) * 0.5).max(0.0);
-
-                        ui.vertical_centered(|ui| {
-                            ui.add_space(pad_y);
-                            ui.image((tex.id(), draw_size));
-                        });
-                    }
                 } else {
                     ui.vertical_centered(|ui| {
                         ui.add_space((avail.y * 0.12).max(14.0));
@@ -1994,7 +2584,7 @@ impl eframe::App for Disc2App {
                         ui.add_space(18.0);
                         ui.label(
                             RichText::new(
-                                "Pronto para Compartilhar sua Tela com Áudio em 1080p 60fps",
+                                "Compartilhe sua Tela ou Assista até 3+ Telas Simultaneamente",
                             )
                             .font(FontId::proportional(18.5))
                             .strong()
@@ -2003,7 +2593,7 @@ impl eframe::App for Disc2App {
                         ui.add_space(6.0);
                         ui.label(
                             RichText::new(
-                                "Transmita Aplicativos/Jogos, Guias do Google Chrome/Navegadores ou Tela Inteira com Áudio do Sistema.\nVocê pode alterar para 720p, 480p ou 360p a qualquer momento.",
+                                "Transmita Jogos com Áudio Isolado ou cole os Códigos de 5 dígitos dos seus amigos na barra lateral\npara assistir várias telas ao mesmo tempo em grade (Multi-Stream).",
                             )
                             .size(12.5)
                             .color(Color32::from_rgb(160, 166, 174)),
@@ -2028,7 +2618,7 @@ impl eframe::App for Disc2App {
                             }
 
                             let cust_btn = egui::Button::new(
-                                RichText::new("📷 Foto e Perfil")
+                                RichText::new("📷 Conta & Perfil")
                                     .size(13.5)
                                     .strong()
                                     .color(Color32::WHITE),
@@ -2044,7 +2634,6 @@ impl eframe::App for Disc2App {
                     });
                 }
 
-                // Popup do Perfil quando clicado no rodapé da barra lateral
                 if self.show_profile_popup {
                     egui::Area::new(egui::Id::new("discord_profile_popover"))
                         .fixed_pos(egui::Pos2::new(14.0, avail.y - 220.0))
@@ -2059,7 +2648,6 @@ impl eframe::App for Disc2App {
                         });
                 }
 
-                // Toast de status no rodapé
                 if let Some((msg, when)) = &self.status_toast {
                     if when.elapsed() < Duration::from_secs(4) {
                         egui::Area::new(egui::Id::new("toast_area"))
@@ -2088,9 +2676,9 @@ impl eframe::App for Disc2App {
 fn main() -> eframe::Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_title("SZdisc — Screen Share Leve em Rust (1080p 60fps + Áudio)")
-            .with_inner_size([1200.0, 740.0])
-            .with_min_inner_size([900.0, 560.0]),
+            .with_title("SZdisc — Screen Share & Multi-Stream Leve em Rust (1080p 60fps + Áudio)")
+            .with_inner_size([1220.0, 750.0])
+            .with_min_inner_size([920.0, 560.0]),
         ..Default::default()
     };
 

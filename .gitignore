@@ -1,4 +1,5 @@
 /target/
 *.log
+*.conf
 .DS_Store
 Thumbs.db
