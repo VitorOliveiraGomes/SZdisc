@@ -7,6 +7,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use eframe::egui::Context;
+use zune_jpeg::zune_core::colorspace::ColorSpace;
+use zune_jpeg::zune_core::options::DecoderOptions;
 use zune_jpeg::JpegDecoder;
 
 use crate::audio::StreamAudioPlayer;
@@ -120,23 +122,13 @@ impl RemotePeerStream {
 
                 if let Some(raw) = raw_opt {
                     let byte_len = raw.jpeg_bytes.len();
-                    let mut decoder = JpegDecoder::new(&raw.jpeg_bytes);
-                    if let Ok(rgb) = decoder.decode() {
+                    let opts = DecoderOptions::default().jpeg_set_out_colorspace(ColorSpace::RGBA);
+                    let mut decoder = JpegDecoder::new_with_options(&raw.jpeg_bytes, opts);
+                    if let Ok(rgba) = decoder.decode() {
                         let w = raw.width;
                         let h = raw.height;
-                        let pixel_count = (w * h) as usize;
-                        if rgb.len() >= pixel_count * 3 {
-                            let mut rgba = vec![0u8; pixel_count * 4];
-                            for (rgb_px, rgba_px) in rgb[..pixel_count * 3]
-                                .chunks_exact(3)
-                                .zip(rgba.chunks_exact_mut(4))
-                            {
-                                rgba_px[0] = rgb_px[0];
-                                rgba_px[1] = rgb_px[1];
-                                rgba_px[2] = rgb_px[2];
-                                rgba_px[3] = 255;
-                            }
-
+                        let expected_len = (w * h * 4) as usize;
+                        if rgba.len() >= expected_len {
                             if let Ok(mut latest) = stream_worker.latest_frame.lock() {
                                 *latest = Some(DecodedRemoteFrame {
                                     width: w,

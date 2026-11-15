@@ -1,6 +1,6 @@
 [package]
 name = "disc2"
-version = "2.9.1"
+version = "2.9.2"
 edition = "2021"
 authors = ["Vitor Oliveira Gomes"]
 description = "SZdisc - Aplicativo nativo ultra-leve em Rust para transmissao de tela e audio em 1080p 60fps"
@@ -38,5 +38,7 @@ winapi = { version = "0.3", features = [
 
 [profile.release]
 opt-level = 3
+lto = "thin"
+codegen-units = 1
 strip = "none"
 debug = false
