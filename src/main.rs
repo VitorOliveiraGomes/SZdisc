@@ -168,7 +168,6 @@ struct Disc2App {
     // Sistema Multi-Servidor + Salas Isoladas + Multi-Monitor + Tela Cheia
     room_hub: Option<Arc<RoomHub>>,
     new_room_name_input: String,
-    join_addr_input: String,
     remote_tiles: HashMap<u32, RemoteTileState>,
     tile_order: Vec<u32>,
     focused_tile_id: Option<u32>,
@@ -313,7 +312,6 @@ impl Disc2App {
             show_own_preview_in_grid: true,
             room_hub,
             new_room_name_input: String::new(),
-            join_addr_input: String::new(),
             remote_tiles: HashMap::new(),
             tile_order: Vec::new(),
             focused_tile_id: None,
@@ -2577,10 +2575,6 @@ impl eframe::App for Disc2App {
             }
         }
 
-        if !active_remote_ids.is_empty() {
-            ctx.request_repaint_after(Duration::from_millis(12));
-        }
-
         // Renderiza janelas destacadas em outros monitores (se houver)
         self.render_popout_windows(ctx);
 
@@ -3554,54 +3548,6 @@ impl eframe::App for Disc2App {
                                     ));
                                 }
 
-                                ui.add_space(4.0);
-                                ui.separator();
-                                ui.add_space(4.0);
-
-                                // Opção avançada recolhida caso alguém queira conectar por IP Radmin direto
-                                egui::CollapsingHeader::new(
-                                    RichText::new("🔧 Conexão Direta por IP / Radmin")
-                                        .size(10.5)
-                                        .color(Color32::from_rgb(160, 166, 174)),
-                                )
-                                .default_open(false)
-                                .show(ui, |ui| {
-                                    if let Some(hub) = &self.room_hub {
-                                        let radmin_ip =
-                                            hub.radmin_addr.lock().ok().and_then(|g| g.clone());
-                                        let my_ip =
-                                            radmin_ip.unwrap_or_else(|| hub.listen_addr.clone());
-                                        ui.horizontal(|ui| {
-                                            ui.label(
-                                                RichText::new(format!("Seu IP: {}", my_ip))
-                                                    .size(10.0)
-                                                    .color(Color32::from_rgb(160, 166, 174)),
-                                            );
-                                            if ui.small_button("Copiar").clicked() {
-                                                ctx.copy_text(my_ip);
-                                                self.show_toast("IP copiado!");
-                                            }
-                                        });
-                                    }
-                                    ui.horizontal(|ui| {
-                                        let resp = ui.add(
-                                            egui::TextEdit::singleline(&mut self.join_addr_input)
-                                                .hint_text("IP Radmin ou Porta")
-                                                .desired_width(155.0),
-                                        );
-                                        let enter = resp.lost_focus()
-                                            && ui.input(|i| i.key_pressed(egui::Key::Enter));
-                                        if (ui.small_button("Conectar").clicked() || enter)
-                                            && !self.join_addr_input.trim().is_empty()
-                                        {
-                                            let addr = self.join_addr_input.trim().to_string();
-                                            self.join_addr_input.clear();
-                                            if let Some(hub) = &self.room_hub {
-                                                hub.join_manual_address(&addr);
-                                            }
-                                        }
-                                    });
-                                });
                             } else {
                                 // Estado inicial quando o usuário ainda não entrou nem criou nenhum servidor!
                                 ui.vertical_centered(|ui| {

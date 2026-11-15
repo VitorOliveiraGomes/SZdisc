@@ -407,6 +407,11 @@ pub fn spawn_system_audio_loopback<F>(
             while !stop_flag.load(Ordering::Relaxed)
                 && target_pid.load(Ordering::Relaxed) == current_pid
             {
+                if !audio_enabled.load(Ordering::Relaxed) {
+                    accum_buf.clear();
+                    thread::sleep(Duration::from_millis(50));
+                    continue;
+                }
                 thread::sleep(Duration::from_millis(12));
 
                 let mut packet_length: UINT = 0;
@@ -526,7 +531,22 @@ impl StreamAudioPlayer {
                     }
                 }
 
-                let hdr = &mut headers[ring_idx];
+                // Procura um slot livre no anel (nunca sobrescreve buffer ainda em uso pelo waveOut!)
+                let mut chosen_idx = None;
+                for offset in 0..RING_SIZE {
+                    let idx = (ring_idx + offset) % RING_SIZE;
+                    let flags = headers[idx].dwFlags;
+                    if flags == 0 || (flags & 1) != 0 {
+                        chosen_idx = Some(idx);
+                        break;
+                    }
+                }
+                let Some(slot_idx) = chosen_idx else {
+                    // Todos os 12 buffers ainda estão tocando no driver; descarta para evitar use-after-free
+                    continue;
+                };
+
+                let hdr = &mut headers[slot_idx];
                 if (hdr.dwFlags & 1) != 0 {
                     let _ = waveOutUnprepareHeader(
                         h_wave_out,
@@ -535,10 +555,10 @@ impl StreamAudioPlayer {
                     );
                 }
 
-                buffers[ring_idx] = pcm;
+                buffers[slot_idx] = pcm;
                 *hdr = zeroed();
-                hdr.lpData = buffers[ring_idx].as_mut_ptr() as *mut i8;
-                hdr.dwBufferLength = buffers[ring_idx].len() as DWORD;
+                hdr.lpData = buffers[slot_idx].as_mut_ptr() as *mut i8;
+                hdr.dwBufferLength = buffers[slot_idx].len() as DWORD;
 
                 if waveOutPrepareHeader(
                     h_wave_out,
@@ -553,7 +573,7 @@ impl StreamAudioPlayer {
                     );
                 }
 
-                ring_idx = (ring_idx + 1) % RING_SIZE;
+                ring_idx = (slot_idx + 1) % RING_SIZE;
             }
 
             let _ = waveOutReset(h_wave_out);

@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{Read, Write};
-use std::net::{IpAddr, TcpListener, TcpStream, ToSocketAddrs, UdpSocket};
+use std::net::{TcpListener, TcpStream, ToSocketAddrs};
 use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
@@ -15,7 +15,6 @@ use crate::audio::StreamAudioPlayer;
 use crate::profile_theme::ServerProfile;
 
 pub const DEFAULT_STREAM_PORT: u16 = 47830;
-pub const LAN_DISCOVERY_PORT: u16 = 47831;
 const BORE_RELAY_HOST: &str = "bore.pub:7835";
 
 const MAGIC_HELLO: &[u8; 4] = b"HLO6";
@@ -24,18 +23,6 @@ const MAGIC_VIDEO: &[u8; 4] = b"VID6";
 const MAGIC_AUDIO: &[u8; 4] = b"AUD6";
 const MAGIC_STOP_STREAM: &[u8; 4] = b"STP6";
 const MAGIC_LEFT_ROOM: &[u8; 4] = b"BYE6";
-
-#[derive(Clone, Debug)]
-pub struct DiscoveredRoom {
-    pub host_peer_id: u32,
-    pub server_id: String,
-    pub current_room: String,
-    pub addr: String,
-    pub res_label: String,
-    pub is_sharing: bool,
-    pub is_radmin: bool,
-    pub last_seen: Instant,
-}
 
 /// Representa um membro online dentro de um Servidor específico (mesmo em outra sala daquele servidor)
 #[derive(Clone, Debug)]
@@ -167,13 +154,17 @@ impl Drop for RemotePeerStream {
     }
 }
 
+struct SlotQueues {
+    control: VecDeque<Arc<Vec<u8>>>,
+    audio: VecDeque<Arc<Vec<u8>>>,
+    latest_video_by_sender: HashMap<u32, Arc<Vec<u8>>>,
+}
+
 struct PeerConnectionSlot {
     conn_id: u64,
     is_outbound: bool,
     remote_peer_id: AtomicU32,
-    control_queue: Mutex<VecDeque<Arc<Vec<u8>>>>,
-    audio_queue: Mutex<VecDeque<Arc<Vec<u8>>>>,
-    latest_video_by_sender: Mutex<HashMap<u32, Arc<Vec<u8>>>>,
+    queues: Mutex<SlotQueues>,
     wakeup: Condvar,
     alive: AtomicBool,
 }
@@ -184,37 +175,39 @@ impl PeerConnectionSlot {
             conn_id,
             is_outbound,
             remote_peer_id: AtomicU32::new(0),
-            control_queue: Mutex::new(VecDeque::with_capacity(24)),
-            audio_queue: Mutex::new(VecDeque::with_capacity(24)),
-            latest_video_by_sender: Mutex::new(HashMap::new()),
+            queues: Mutex::new(SlotQueues {
+                control: VecDeque::with_capacity(24),
+                audio: VecDeque::with_capacity(24),
+                latest_video_by_sender: HashMap::new(),
+            }),
             wakeup: Condvar::new(),
             alive: AtomicBool::new(true),
         })
     }
 
     fn push_control(&self, pkt: Arc<Vec<u8>>) {
-        if let Ok(mut q) = self.control_queue.lock() {
-            if q.len() >= 32 {
-                q.pop_front();
+        if let Ok(mut q) = self.queues.lock() {
+            if q.control.len() >= 32 {
+                q.control.pop_front();
             }
-            q.push_back(pkt);
+            q.control.push_back(pkt);
             self.wakeup.notify_one();
         }
     }
 
     fn push_audio(&self, pkt: Arc<Vec<u8>>) {
-        if let Ok(mut q) = self.audio_queue.lock() {
-            if q.len() >= 18 {
-                q.pop_front();
+        if let Ok(mut q) = self.queues.lock() {
+            if q.audio.len() >= 18 {
+                q.audio.pop_front();
             }
-            q.push_back(pkt);
+            q.audio.push_back(pkt);
             self.wakeup.notify_one();
         }
     }
 
     fn push_video(&self, sender_id: u32, pkt: Arc<Vec<u8>>) {
-        if let Ok(mut map) = self.latest_video_by_sender.lock() {
-            map.insert(sender_id, pkt);
+        if let Ok(mut q) = self.queues.lock() {
+            q.latest_video_by_sender.insert(sender_id, pkt);
             self.wakeup.notify_one();
         }
     }
@@ -275,40 +268,6 @@ pub fn derive_room_port(server_id: &str, room_name: &str) -> u16 {
     port
 }
 
-pub fn get_radmin_ip() -> Option<String> {
-    if let Ok(sock) = UdpSocket::bind("0.0.0.0:0") {
-        if sock.connect("26.1.1.1:80").is_ok() {
-            if let Ok(local_addr) = sock.local_addr() {
-                if let IpAddr::V4(ip) = local_addr.ip() {
-                    let s = ip.to_string();
-                    if s.starts_with("26.") {
-                        return Some(s);
-                    }
-                }
-            }
-        }
-    }
-    None
-}
-
-pub fn get_local_ip() -> String {
-    if let Some(radmin) = get_radmin_ip() {
-        return radmin;
-    }
-    if let Ok(sock) = UdpSocket::bind("0.0.0.0:0") {
-        if sock.connect("8.8.8.8:80").is_ok() {
-            if let Ok(local_addr) = sock.local_addr() {
-                if let IpAddr::V4(ip) = local_addr.ip() {
-                    if !ip.is_loopback() {
-                        return ip.to_string();
-                    }
-                }
-            }
-        }
-    }
-    "127.0.0.1".to_string()
-}
-
 fn build_packet(
     magic: &[u8; 4],
     sender_id: u32,
@@ -363,18 +322,25 @@ fn read_exact_interruptible(
     stop: &AtomicBool,
 ) -> bool {
     let mut filled = 0;
+    let mut last_progress = Instant::now();
     while filled < buf.len() {
         if !alive.load(Ordering::Relaxed) || stop.load(Ordering::Relaxed) {
             return false;
         }
         match stream.read(&mut buf[filled..]) {
             Ok(0) => return false,
-            Ok(n) => filled += n,
+            Ok(n) => {
+                filled += n;
+                last_progress = Instant::now();
+            }
             Err(ref e)
                 if e.kind() == std::io::ErrorKind::WouldBlock
                     || e.kind() == std::io::ErrorKind::TimedOut
                     || e.kind() == std::io::ErrorKind::Interrupted =>
             {
+                if last_progress.elapsed() >= Duration::from_secs(12) {
+                    return false;
+                }
                 thread::sleep(Duration::from_millis(1));
                 continue;
             }
@@ -439,9 +405,6 @@ fn parse_bore_connection_uuid(msg: &str) -> Option<String> {
 /// - Dentro de cada Servidor, basta clicar em qualquer sala para entrar/sair sem precisar de código!
 pub struct RoomHub {
     pub my_peer_id: Arc<AtomicU32>,
-    pub bound_port: u16,
-    pub listen_addr: String,
-    pub radmin_addr: Mutex<Option<String>>,
     pub in_room: Arc<AtomicBool>,
     pub viewed_server_id: Arc<Mutex<String>>,
     pub connected_server_id: Arc<Mutex<String>>,
@@ -451,7 +414,6 @@ pub struct RoomHub {
     pub server_rooms_map: Arc<Mutex<HashMap<String, Vec<String>>>>,
     pub server_names_map: Arc<Mutex<HashMap<String, String>>>,
     pub server_members: Arc<Mutex<HashMap<u32, ServerMemberPresence>>>,
-    pub lan_discovered: Arc<Mutex<HashMap<u32, DiscoveredRoom>>>,
     pub is_connecting_outbound: Arc<AtomicBool>,
     pub status_notice: Arc<Mutex<Option<String>>>,
     pub my_info: Arc<Mutex<PeerInfo>>,
@@ -473,12 +435,10 @@ impl RoomHub {
         ctx: Context,
     ) -> Result<Arc<Self>, String> {
         let mut bound_listener = None;
-        let mut bound_port = DEFAULT_STREAM_PORT;
 
         for p in DEFAULT_STREAM_PORT..=DEFAULT_STREAM_PORT + 15 {
             if let Ok(l) = TcpListener::bind(("0.0.0.0", p)) {
                 bound_listener = Some(l);
-                bound_port = p;
                 break;
             }
         }
@@ -486,10 +446,6 @@ impl RoomHub {
         let listener =
             bound_listener.ok_or_else(|| "Não foi possível abrir porta TCP local".to_string())?;
         let _ = listener.set_nonblocking(true);
-
-        let ip = get_local_ip();
-        let listen_addr = format!("{}:{}", ip, bound_port);
-        let radmin_addr = get_radmin_ip().map(|rip| format!("{}:{}", rip, bound_port));
 
         let mut rooms_map = HashMap::new();
         let mut names_map = HashMap::new();
@@ -518,9 +474,6 @@ impl RoomHub {
 
         let hub = Arc::new(Self {
             my_peer_id,
-            bound_port,
-            listen_addr,
-            radmin_addr: Mutex::new(radmin_addr),
             in_room: Arc::new(AtomicBool::new(false)),
             viewed_server_id: Arc::new(Mutex::new(initial_viewed)),
             connected_server_id: Arc::new(Mutex::new(String::new())),
@@ -530,7 +483,6 @@ impl RoomHub {
             server_rooms_map: Arc::new(Mutex::new(rooms_map)),
             server_names_map: Arc::new(Mutex::new(names_map)),
             server_members: Arc::new(Mutex::new(HashMap::new())),
-            lan_discovered: Arc::new(Mutex::new(HashMap::new())),
             is_connecting_outbound: Arc::new(AtomicBool::new(false)),
             status_notice: Arc::new(Mutex::new(None)),
             my_info,
@@ -565,13 +517,7 @@ impl RoomHub {
             }
         });
 
-        // 2. Thread de escuta UDP (Radmin VPN + LAN) isolada por Servidor (`server_id`)
-        let hub_udp_rx = Arc::clone(&hub);
-        thread::spawn(move || {
-            hub_udp_rx.udp_discovery_listener_loop();
-        });
-
-        // 3. Thread Automática da Sala via Internet (`bore.pub` com porta determinística de `server_id + room_name`)
+        // 2. Thread Automática da Sala via Internet (`bore.pub` com porta determinística de `server_id + room_name`)
         let hub_tunnel = Arc::clone(&hub);
         thread::spawn(move || {
             hub_tunnel.room_internet_auto_mesh_loop();
@@ -583,20 +529,10 @@ impl RoomHub {
             hub_lobby.server_lobby_sync_loop();
         });
 
-        // 5. Thread de Heartbeat (1.2s), limpeza de fantasmas e anúncio no Radmin VPN + LAN
+        // 4. Thread de Heartbeat (1.2s) e limpeza de fantasmas
         let hub_beacon = Arc::clone(&hub);
         thread::spawn(move || {
-            let udp_any = UdpSocket::bind("0.0.0.0:0").ok();
-            if let Some(ref s) = udp_any {
-                let _ = s.set_broadcast(true);
-            }
-
             while !hub_beacon.stop_flag.load(Ordering::Relaxed) {
-                if let Some(rip) = get_radmin_ip() {
-                    if let Ok(mut g) = hub_beacon.radmin_addr.lock() {
-                        *g = Some(format!("{}:{}", rip, hub_beacon.bound_port));
-                    }
-                }
 
                 // Expira participantes inativos na sala (> 6s)
                 let mut expired_ids = Vec::new();
@@ -680,98 +616,6 @@ impl RoomHub {
                                 c.push_control(Arc::clone(&pkt));
                             }
                         }
-                    }
-
-                    // Anuncia presença no Radmin VPN + LAN apenas para quem participa do MESMO servidor (`active_srv`)
-                    if !active_srv.is_empty() {
-                        let my_id = hub_beacon.my_peer_id.load(Ordering::Relaxed);
-                        let clean_name = info.name.replace('|', " ");
-                        let clean_srv_id = active_srv.replace('|', "");
-                        let clean_srv_name = srv_name.replace('|', " ");
-                        let clean_room = curr_room.replace('|', " ");
-                        let clean_res = if info.is_sharing {
-                            info.res_label.replace('|', " ")
-                        } else {
-                            "Na sala".to_string()
-                        };
-                        let share_bit = if info.is_sharing { "1" } else { "0" };
-                        let rooms_csv = rooms_snapshot
-                            .iter()
-                            .map(|r| r.replace('|', " ").replace(';', " ").trim().to_string())
-                            .filter(|r| !r.is_empty())
-                            .collect::<Vec<_>>()
-                            .join(";");
-
-                        // DISC6|peer_id|port|host_name|server_id|server_name|current_room|is_sharing|res_label|rooms_csv
-                        let payload = format!(
-                            "DISC6|{}|{}|{}|{}|{}|{}|{}|{}|{}",
-                            my_id,
-                            hub_beacon.bound_port,
-                            clean_name,
-                            clean_srv_id,
-                            clean_srv_name,
-                            clean_room,
-                            share_bit,
-                            clean_res,
-                            rooms_csv
-                        );
-
-                        if let Some(ref s) = udp_any {
-                            let _ = s.send_to(
-                                payload.as_bytes(),
-                                ("255.255.255.255", LAN_DISCOVERY_PORT),
-                            );
-                            let _ = s.send_to(
-                                payload.as_bytes(),
-                                ("26.255.255.255", LAN_DISCOVERY_PORT),
-                            );
-                        }
-
-                        if let Some(radmin_ip) = get_radmin_ip() {
-                            if let Ok(rsock) = UdpSocket::bind((radmin_ip.as_str(), 0)) {
-                                let _ = rsock.set_broadcast(true);
-                                let _ = rsock.send_to(
-                                    payload.as_bytes(),
-                                    ("26.255.255.255", LAN_DISCOVERY_PORT),
-                                );
-                                let _ = rsock.send_to(
-                                    payload.as_bytes(),
-                                    ("255.255.255.255", LAN_DISCOVERY_PORT),
-                                );
-                            }
-                        }
-                    }
-                }
-
-                // Se houver alguém no Radmin/LAN no MESMO Servidor (`conn_srv`) e na MESMA Sala (`curr_room`), conecta automaticamente!
-                if in_room && !conn_srv.is_empty() && !curr_room.is_empty() {
-                    let lan_target = hub_beacon.lan_discovered.lock().ok().and_then(|map| {
-                        for d in map.values() {
-                            if d.server_id.eq_ignore_ascii_case(&conn_srv)
-                                && d.current_room.eq_ignore_ascii_case(&curr_room)
-                                && d.last_seen.elapsed() < Duration::from_secs(4)
-                            {
-                                let already_conn = hub_beacon
-                                    .connections
-                                    .lock()
-                                    .map(|cs| {
-                                        cs.iter().any(|c| {
-                                            c.alive.load(Ordering::Relaxed)
-                                                && c.remote_peer_id.load(Ordering::Relaxed)
-                                                    == d.host_peer_id
-                                        })
-                                    })
-                                    .unwrap_or(false);
-                                if !already_conn {
-                                    return Some(d.addr.clone());
-                                }
-                            }
-                        }
-                        None
-                    });
-
-                    if let Some(addr) = lan_target {
-                        hub_beacon.spawn_outbound_connect(addr, true);
                     }
                 }
 
@@ -862,114 +706,25 @@ impl RoomHub {
         }
     }
 
-    fn udp_discovery_listener_loop(self: Arc<Self>) {
-        let sock = match UdpSocket::bind(("0.0.0.0", LAN_DISCOVERY_PORT)) {
-            Ok(s) => s,
-            Err(_) => return,
-        };
-        let _ = sock.set_read_timeout(Some(Duration::from_millis(800)));
-
-        let mut buf = [0u8; 1024];
-        while !self.stop_flag.load(Ordering::Relaxed) {
-            if let Ok((len, src)) = sock.recv_from(&mut buf) {
-                if let Ok(msg) = std::str::from_utf8(&buf[..len]) {
-                    let parts: Vec<&str> = msg.split('|').collect();
-                    // DISC6|peer_id|port|host_name|server_id|server_name|current_room|is_sharing|res_label|rooms_csv
-                    if parts.len() >= 10 && parts[0] == "DISC6" {
-                        let host_peer_id = parts[1].parse::<u32>().unwrap_or(0);
-                        let my_id = self.my_peer_id.load(Ordering::Relaxed);
-                        let server_id = parts[4].trim().to_uppercase();
-
-                        // Só processa pacotes de Servidores dos quais nós fazemos parte!
-                        if host_peer_id != 0
-                            && host_peer_id != my_id
-                            && self.is_member_of_server(&server_id)
-                        {
-                            let port = parts[2];
-                            let host_name = parts[3].trim().to_string();
-                            let server_name = parts[5].trim();
-                            let current_room = parts[6].trim().to_string();
-                            let is_sharing = parts[7] == "1";
-                            let res_label = parts[8].trim().to_string();
-                            let rooms_csv = parts[9];
-
-                            self.merge_server_metadata(&server_id, server_name, rooms_csv);
-                            if !current_room.is_empty() {
-                                self.merge_server_metadata(&server_id, server_name, &current_room);
-                            }
-
-                            if let Ok(mut members) = self.server_members.lock() {
-                                members.insert(
-                                    host_peer_id,
-                                    ServerMemberPresence {
-                                        peer_id: host_peer_id,
-                                        name: host_name,
-                                        server_id: server_id.clone(),
-                                        current_room: current_room.clone(),
-                                        is_sharing,
-                                        res_label: res_label.clone(),
-                                        last_seen: Instant::now(),
-                                    },
-                                );
-                            }
-
-                            let ip_str = src.ip().to_string();
-                            let is_radmin = ip_str.starts_with("26.");
-                            let addr = format!("{}:{}", ip_str, port);
-
-                            if let Ok(mut map) = self.lan_discovered.lock() {
-                                let should_update = match map.get(&host_peer_id) {
-                                    Some(existing) if existing.is_radmin && !is_radmin => false,
-                                    _ => true,
-                                };
-                                if should_update {
-                                    map.insert(
-                                        host_peer_id,
-                                        DiscoveredRoom {
-                                            host_peer_id,
-                                            server_id,
-                                            current_room,
-                                            addr,
-                                            res_label,
-                                            is_sharing,
-                                            is_radmin,
-                                            last_seen: Instant::now(),
-                                        },
-                                    );
-                                } else if let Some(existing) = map.get_mut(&host_peer_id) {
-                                    existing.last_seen = Instant::now();
-                                    existing.server_id = server_id;
-                                    existing.current_room = current_room;
-                                    existing.is_sharing = is_sharing;
-                                    existing.res_label = res_label;
-                                }
-                            }
-                            self.ctx.request_repaint();
-                        }
-                    }
-                }
-            }
-
-            if let Ok(mut map) = self.lan_discovered.lock() {
-                map.retain(|_, v| v.last_seen.elapsed() < Duration::from_secs(4));
-            }
-        }
-    }
-
     /// Loop automático da Sala via Internet (`bore.pub` usando porta exclusiva `derive_room_port(server_id, room_name)`)
     fn room_internet_auto_mesh_loop(self: Arc<Self>) {
+        let mut port_offset: u16 = 0;
         while !self.stop_flag.load(Ordering::Relaxed) {
             if !self.in_room.load(Ordering::Relaxed) {
                 self.holding_bore_port.store(0, Ordering::Relaxed);
-                thread::sleep(Duration::from_millis(500));
+                port_offset = 0;
+                thread::sleep(Duration::from_millis(400));
                 continue;
             }
 
-            let target_port = self.desired_bore_port.load(Ordering::Relaxed);
-            if target_port == 0 {
-                thread::sleep(Duration::from_millis(500));
+            let base_port = self.desired_bore_port.load(Ordering::Relaxed);
+            if base_port == 0 {
+                port_offset = 0;
+                thread::sleep(Duration::from_millis(400));
                 continue;
             }
+
+            let target_port = 21000 + ((base_port - 21000 + port_offset * 137) % 36000);
 
             let has_alive_outbound = self
                 .connections
@@ -1017,14 +772,16 @@ impl RoomHub {
             let mut pending = Vec::with_capacity(512);
             let mut temp = [0u8; 256];
             let mut port_already_in_use = false;
+            let mut last_ctrl_activity = Instant::now();
 
             while !self.stop_flag.load(Ordering::Relaxed)
                 && self.in_room.load(Ordering::Relaxed)
-                && self.desired_bore_port.load(Ordering::Relaxed) == target_port
+                && self.desired_bore_port.load(Ordering::Relaxed) == base_port
             {
                 match ctrl.read(&mut temp) {
                     Ok(0) => break,
                     Ok(n) => {
+                        last_ctrl_activity = Instant::now();
                         pending.extend_from_slice(&temp[..n]);
                         while let Some(pos) = pending.iter().position(|&b| b == 0) {
                             let msg_bytes: Vec<u8> = pending.drain(..=pos).collect();
@@ -1066,6 +823,9 @@ impl RoomHub {
                         if e.kind() == std::io::ErrorKind::WouldBlock
                             || e.kind() == std::io::ErrorKind::TimedOut =>
                     {
+                        if last_ctrl_activity.elapsed() >= Duration::from_secs(40) {
+                            break;
+                        }
                         continue;
                     }
                     Err(_) => break,
@@ -1077,11 +837,17 @@ impl RoomHub {
 
             if port_already_in_use
                 && self.in_room.load(Ordering::Relaxed)
-                && self.desired_bore_port.load(Ordering::Relaxed) == target_port
+                && self.desired_bore_port.load(Ordering::Relaxed) == base_port
             {
                 let bore_room_target = format!("bore.pub:{}", target_port);
                 self.spawn_outbound_connect(bore_room_target, true);
-                thread::sleep(Duration::from_millis(1500));
+                thread::sleep(Duration::from_millis(2200));
+                if !self.has_connected_peers() {
+                    // Porta provavelmente ocupada por outro usuário no bore.pub: avança para próxima porta determinística
+                    port_offset = (port_offset + 1) % 6;
+                } else {
+                    port_offset = 0;
+                }
             } else {
                 thread::sleep(Duration::from_millis(800));
             }
@@ -1090,9 +856,8 @@ impl RoomHub {
 
     /// Sincroniza as salas e os membros online APENAS do Servidor atualmente selecionado (`viewed_server_id`)!
     fn server_lobby_sync_loop(self: Arc<Self>) {
-        let lobby_clients: Arc<Mutex<Vec<TcpStream>>> = Arc::new(Mutex::new(Vec::new()));
-
         while !self.stop_flag.load(Ordering::Relaxed) {
+            let lobby_clients: Arc<Mutex<Vec<TcpStream>>> = Arc::new(Mutex::new(Vec::new()));
             let current_srv = self
                 .viewed_server_id
                 .lock()
@@ -1468,25 +1233,6 @@ impl RoomHub {
         self.ctx.request_repaint();
     }
 
-    pub fn join_manual_address(self: &Arc<Self>, raw_target: &str) {
-        let trimmed = raw_target.trim().trim_start_matches('#');
-        if trimmed.is_empty() {
-            return;
-        }
-
-        let addr_str = if !trimmed.contains('.') && !trimmed.contains(':') {
-            format!("bore.pub:{}", trimmed)
-        } else if trimmed.contains(':') {
-            trimmed.to_string()
-        } else {
-            format!("{}:{}", trimmed, DEFAULT_STREAM_PORT)
-        };
-
-        self.disconnect_all_connections();
-        self.in_room.store(true, Ordering::Relaxed);
-        self.spawn_outbound_connect(addr_str, false);
-    }
-
     fn spawn_outbound_connect(self: &Arc<Self>, addr_str: String, is_silent_auto: bool) {
         if self
             .is_connecting_outbound
@@ -1532,9 +1278,14 @@ impl RoomHub {
     fn disconnect_all_connections(&self) {
         let my_id = self.my_peer_id.load(Ordering::Relaxed);
         let bye_pkt = build_packet(MAGIC_LEFT_ROOM, my_id, 0, 0, 0, &[0]);
-        if let Ok(mut conns) = self.connections.lock() {
+        if let Ok(conns) = self.connections.lock() {
             for c in conns.iter() {
                 c.push_control(Arc::clone(&bye_pkt));
+            }
+        }
+        thread::sleep(Duration::from_millis(25));
+        if let Ok(mut conns) = self.connections.lock() {
+            for c in conns.iter() {
                 c.alive.store(false, Ordering::Relaxed);
                 c.wakeup.notify_all();
             }
@@ -1755,71 +1506,48 @@ impl RoomHub {
             conns.push(Arc::clone(&slot));
         }
 
-        // Thread de ESCRITA
+        // Thread de ESCRITA (fila única sob 1 Mutex + 1 Condvar: zero missed wakeups)
         let slot_writer = Arc::clone(&slot);
         thread::spawn(move || {
             while slot_writer.alive.load(Ordering::Relaxed) {
-                let mut sent_anything = false;
-
-                loop {
-                    let next_ctrl = slot_writer
-                        .control_queue
-                        .lock()
-                        .ok()
-                        .and_then(|mut q| q.pop_front());
-                    if let Some(pkt) = next_ctrl {
-                        sent_anything = true;
-                        if !write_all_interruptible(&mut write_stream, &pkt, &slot_writer.alive) {
-                            slot_writer.alive.store(false, Ordering::Relaxed);
-                            return;
-                        }
-                    } else {
-                        break;
+                let (ctrl_pkts, aud_pkts, video_pkts) = {
+                    let mut guard = match slot_writer.queues.lock() {
+                        Ok(g) => g,
+                        Err(_) => return,
+                    };
+                    if guard.control.is_empty()
+                        && guard.audio.is_empty()
+                        && guard.latest_video_by_sender.is_empty()
+                    {
+                        let (g, _) = match slot_writer
+                            .wakeup
+                            .wait_timeout(guard, Duration::from_millis(45))
+                        {
+                            Ok(res) => res,
+                            Err(_) => return,
+                        };
+                        guard = g;
                     }
-                }
-
-                loop {
-                    let next_aud = slot_writer
-                        .audio_queue
-                        .lock()
-                        .ok()
-                        .and_then(|mut q| q.pop_front());
-                    if let Some(pkt) = next_aud {
-                        sent_anything = true;
-                        if !write_all_interruptible(&mut write_stream, &pkt, &slot_writer.alive) {
-                            slot_writer.alive.store(false, Ordering::Relaxed);
-                            return;
-                        }
-                    } else {
-                        break;
-                    }
-                }
-
-                let video_pkts: Vec<Arc<Vec<u8>>> = {
-                    if let Ok(mut map) = slot_writer.latest_video_by_sender.lock() {
-                        map.drain().map(|(_, v)| v).collect()
-                    } else {
-                        Vec::new()
-                    }
+                    let c: Vec<Arc<Vec<u8>>> = guard.control.drain(..).collect();
+                    let a: Vec<Arc<Vec<u8>>> = guard.audio.drain(..).collect();
+                    let v: Vec<Arc<Vec<u8>>> =
+                        guard.latest_video_by_sender.drain().map(|(_, p)| p).collect();
+                    (c, a, v)
                 };
 
+                for pkt in ctrl_pkts.into_iter().chain(aud_pkts.into_iter()) {
+                    if !write_all_interruptible(&mut write_stream, &pkt, &slot_writer.alive) {
+                        slot_writer.alive.store(false, Ordering::Relaxed);
+                        return;
+                    }
+                }
+
                 for pkt in video_pkts {
-                    sent_anything = true;
                     if !write_all_interruptible(&mut write_stream, &pkt, &slot_writer.alive) {
                         slot_writer.alive.store(false, Ordering::Relaxed);
                         return;
                     }
                     let _ = write_stream.flush();
-                }
-
-                if !sent_anything {
-                    if let Ok(guard) = slot_writer.latest_video_by_sender.lock() {
-                        if guard.is_empty() {
-                            let _ = slot_writer
-                                .wakeup
-                                .wait_timeout(guard, Duration::from_millis(45));
-                        }
-                    }
                 }
             }
         });
@@ -1873,23 +1601,36 @@ impl RoomHub {
                     || slot_reader.remote_peer_id.load(Ordering::Relaxed) == 0
                 {
                     slot_reader.remote_peer_id.store(sender_id, Ordering::Relaxed);
+                    let mut should_drop_self = false;
                     if let Ok(mut conns) = hub_reader.connections.lock() {
+                        let prefer_outbound = my_id < sender_id;
                         for other in conns.iter() {
                             if other.conn_id != slot_reader.conn_id
+                                && other.alive.load(Ordering::Relaxed)
                                 && other.remote_peer_id.load(Ordering::Relaxed) == sender_id
                             {
-                                other.alive.store(false, Ordering::Relaxed);
-                                other.wakeup.notify_all();
+                                // Desempate determinístico: ambos os lados escolhem a mesma conexão
+                                if other.is_outbound == prefer_outbound
+                                    && slot_reader.is_outbound != prefer_outbound
+                                {
+                                    should_drop_self = true;
+                                } else {
+                                    other.alive.store(false, Ordering::Relaxed);
+                                    other.wakeup.notify_all();
+                                }
                             }
                         }
                         conns.retain(|c| c.alive.load(Ordering::Relaxed));
+                    }
+                    if should_drop_self {
+                        break;
                     }
                 }
 
                 let direct_peer_id = slot_reader.remote_peer_id.load(Ordering::Relaxed);
 
-                // Repassa pacotes diretos para os outros membros da mesma sala
-                if sender_id == direct_peer_id {
+                // Apenas o host do túnel (conexões de entrada: !is_outbound) repassa pacotes para outros membros
+                if sender_id == direct_peer_id && !slot_reader.is_outbound {
                     let relay_magic = if &magic == MAGIC_HELLO {
                         MAGIC_INFO
                     } else {

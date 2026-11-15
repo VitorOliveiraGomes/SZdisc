@@ -4,9 +4,24 @@ use std::os::windows::ffi::OsStringExt;
 use std::path::Path;
 use std::ptr::null_mut;
 
+use std::time::Instant;
+
+use winapi::shared::dxgi::{IDXGIDevice, IDXGIOutput, IDXGIResource};
+use winapi::shared::dxgi1_2::{IDXGIOutput1, IDXGIOutputDuplication, DXGI_OUTDUPL_FRAME_INFO};
+use winapi::shared::dxgiformat::DXGI_FORMAT_B8G8R8A8_UNORM;
+use winapi::shared::dxgitype::DXGI_SAMPLE_DESC;
 use winapi::shared::minwindef::{BOOL, DWORD, FALSE, LPARAM, TRUE, UINT};
 use winapi::shared::windef::{HBITMAP, HDC, HGDIOBJ, HMONITOR, HWND, RECT};
+use winapi::shared::winerror::{DXGI_ERROR_ACCESS_LOST, DXGI_ERROR_WAIT_TIMEOUT, SUCCEEDED};
+use winapi::um::d3d11::{
+    D3D11CreateDevice, ID3D11Device, ID3D11DeviceContext, ID3D11Resource, ID3D11Texture2D,
+    D3D11_BOX, D3D11_CPU_ACCESS_READ, D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_MAP_READ,
+    D3D11_MAPPED_SUBRESOURCE, D3D11_SDK_VERSION, D3D11_TEXTURE2D_DESC, D3D11_USAGE_STAGING,
+};
+use winapi::um::d3dcommon::D3D_DRIVER_TYPE_HARDWARE;
 use winapi::um::dwmapi::{DwmGetWindowAttribute, DWMWA_CLOAKED};
+use winapi::um::unknwnbase::IUnknown;
+use winapi::Interface;
 use winapi::um::handleapi::CloseHandle;
 use winapi::um::processthreadsapi::{GetCurrentProcess, GetCurrentProcessId, OpenProcess};
 use winapi::um::psapi::{GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS};
@@ -358,10 +373,285 @@ pub fn is_szdisc_in_foreground() -> bool {
     }
 }
 
-/// Capturador Persistente de Alta Velocidade (`CreateDIBSection` Zero-Copy + `BitBlt` 1:1 sem `PrintWindow`):
-/// - Não cria nem destrói objetos GDI a cada frame (mantém `mem_dc` e `dib_bmp` mapeados em RAM).
-/// - Nunca chama `PrintWindow` durante a transmissão ao vivo (evita travar a thread de renderização de jogos DirectX/Vulkan/OpenGL).
-/// - Faz o downscaling (`1080p -> 720p/900p`) e a conversão `BGRA -> RGB` em uma única passagem direta via ponteiro de memória.
+enum DxgiCaptureResult {
+    NewFrame,
+    Unchanged,
+    Unavailable,
+}
+
+struct DxgiDuplicator {
+    device: *mut ID3D11Device,
+    context: *mut ID3D11DeviceContext,
+    dupl: *mut IDXGIOutputDuplication,
+    staging: *mut ID3D11Texture2D,
+    staging_w: u32,
+    staging_h: u32,
+    output_idx: usize,
+    out_left: i32,
+    out_top: i32,
+    out_w: i32,
+    out_h: i32,
+}
+
+impl DxgiDuplicator {
+    unsafe fn release_all(&mut self) {
+        if !self.staging.is_null() {
+            (*self.staging).Release();
+            self.staging = null_mut();
+        }
+        if !self.dupl.is_null() {
+            (*self.dupl).Release();
+            self.dupl = null_mut();
+        }
+        if !self.context.is_null() {
+            (*self.context).Release();
+            self.context = null_mut();
+        }
+        if !self.device.is_null() {
+            (*self.device).Release();
+            self.device = null_mut();
+        }
+        self.staging_w = 0;
+        self.staging_h = 0;
+    }
+
+    unsafe fn init_for_output(output_idx: usize) -> Option<Self> {
+        let mut device: *mut ID3D11Device = null_mut();
+        let mut context: *mut ID3D11DeviceContext = null_mut();
+        let hr = D3D11CreateDevice(
+            null_mut(),
+            D3D_DRIVER_TYPE_HARDWARE,
+            null_mut(),
+            D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+            null_mut(),
+            0,
+            D3D11_SDK_VERSION,
+            &mut device,
+            null_mut(),
+            &mut context,
+        );
+        if !SUCCEEDED(hr) || device.is_null() || context.is_null() {
+            return None;
+        }
+
+        let mut dxgi_dev: *mut IDXGIDevice = null_mut();
+        if !SUCCEEDED((*device).QueryInterface(
+            &IDXGIDevice::uuidof(),
+            &mut dxgi_dev as *mut _ as *mut _,
+        )) || dxgi_dev.is_null()
+        {
+            (*context).Release();
+            (*device).Release();
+            return None;
+        }
+
+        let mut adapter = null_mut();
+        let hr_ad = (*dxgi_dev).GetAdapter(&mut adapter);
+        (*dxgi_dev).Release();
+        if !SUCCEEDED(hr_ad) || adapter.is_null() {
+            (*context).Release();
+            (*device).Release();
+            return None;
+        }
+
+        let mut output: *mut IDXGIOutput = null_mut();
+        let hr_out = (*adapter).EnumOutputs(output_idx as UINT, &mut output);
+        (*adapter).Release();
+        if !SUCCEEDED(hr_out) || output.is_null() {
+            (*context).Release();
+            (*device).Release();
+            return None;
+        }
+
+        let mut desc = zeroed();
+        let _ = (*output).GetDesc(&mut desc);
+        let out_left = desc.DesktopCoordinates.left;
+        let out_top = desc.DesktopCoordinates.top;
+        let out_w = desc.DesktopCoordinates.right - desc.DesktopCoordinates.left;
+        let out_h = desc.DesktopCoordinates.bottom - desc.DesktopCoordinates.top;
+
+        let mut output1: *mut IDXGIOutput1 = null_mut();
+        let hr_o1 = (*output).QueryInterface(
+            &IDXGIOutput1::uuidof(),
+            &mut output1 as *mut _ as *mut _,
+        );
+        (*output).Release();
+        if !SUCCEEDED(hr_o1) || output1.is_null() {
+            (*context).Release();
+            (*device).Release();
+            return None;
+        }
+
+        let mut dupl: *mut IDXGIOutputDuplication = null_mut();
+        let hr_dup = (*output1).DuplicateOutput(device as *mut IUnknown, &mut dupl);
+        (*output1).Release();
+        if !SUCCEEDED(hr_dup) || dupl.is_null() {
+            (*context).Release();
+            (*device).Release();
+            return None;
+        }
+
+        Some(Self {
+            device,
+            context,
+            dupl,
+            staging: null_mut(),
+            staging_w: 0,
+            staging_h: 0,
+            output_idx,
+            out_left,
+            out_top,
+            out_w,
+            out_h,
+        })
+    }
+
+    unsafe fn ensure_staging(&mut self, w: u32, h: u32) -> bool {
+        if !self.staging.is_null() && self.staging_w == w && self.staging_h == h {
+            return true;
+        }
+        if !self.staging.is_null() {
+            (*self.staging).Release();
+            self.staging = null_mut();
+        }
+        let desc = D3D11_TEXTURE2D_DESC {
+            Width: w,
+            Height: h,
+            MipLevels: 1,
+            ArraySize: 1,
+            Format: DXGI_FORMAT_B8G8R8A8_UNORM,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Usage: D3D11_USAGE_STAGING,
+            BindFlags: 0,
+            CPUAccessFlags: D3D11_CPU_ACCESS_READ,
+            MiscFlags: 0,
+        };
+        let hr = (*self.device).CreateTexture2D(&desc, null_mut(), &mut self.staging);
+        if SUCCEEDED(hr) && !self.staging.is_null() {
+            self.staging_w = w;
+            self.staging_h = h;
+            true
+        } else {
+            self.staging = null_mut();
+            self.staging_w = 0;
+            self.staging_h = 0;
+            false
+        }
+    }
+
+    unsafe fn capture_crop_bgra(
+        &mut self,
+        src_left: i32,
+        src_top: i32,
+        src_w: i32,
+        src_h: i32,
+        out_bgra: &mut Vec<u8>,
+    ) -> DxgiCaptureResult {
+        if src_left < self.out_left
+            || src_top < self.out_top
+            || src_left + src_w > self.out_left + self.out_w
+            || src_top + src_h > self.out_top + self.out_h
+        {
+            return DxgiCaptureResult::Unavailable;
+        }
+
+        let mut frame_info: DXGI_OUTDUPL_FRAME_INFO = zeroed();
+        let mut resource: *mut IDXGIResource = null_mut();
+        let hr = (*self.dupl).AcquireNextFrame(0, &mut frame_info, &mut resource);
+        if hr == DXGI_ERROR_WAIT_TIMEOUT {
+            return DxgiCaptureResult::Unchanged;
+        }
+        if hr == DXGI_ERROR_ACCESS_LOST || !SUCCEEDED(hr) || resource.is_null() {
+            if !resource.is_null() {
+                (*resource).Release();
+            }
+            return DxgiCaptureResult::Unavailable;
+        }
+
+        if frame_info.AccumulatedFrames == 0 && frame_info.TotalMetadataBufferSize == 0 {
+            (*resource).Release();
+            let _ = (*self.dupl).ReleaseFrame();
+            return DxgiCaptureResult::Unchanged;
+        }
+
+        let mut tex: *mut ID3D11Texture2D = null_mut();
+        let hr_tex = (*resource).QueryInterface(
+            &ID3D11Texture2D::uuidof(),
+            &mut tex as *mut _ as *mut _,
+        );
+        (*resource).Release();
+        if !SUCCEEDED(hr_tex) || tex.is_null() {
+            let _ = (*self.dupl).ReleaseFrame();
+            return DxgiCaptureResult::Unavailable;
+        }
+
+        let uw = src_w as u32;
+        let uh = src_h as u32;
+        if !self.ensure_staging(uw, uh) {
+            (*tex).Release();
+            let _ = (*self.dupl).ReleaseFrame();
+            return DxgiCaptureResult::Unavailable;
+        }
+
+        let rel_left = (src_left - self.out_left) as u32;
+        let rel_top = (src_top - self.out_top) as u32;
+        let src_box = D3D11_BOX {
+            left: rel_left,
+            top: rel_top,
+            front: 0,
+            right: rel_left + uw,
+            bottom: rel_top + uh,
+            back: 1,
+        };
+        (*self.context).CopySubresourceRegion(
+            self.staging as *mut ID3D11Resource,
+            0,
+            0,
+            0,
+            0,
+            tex as *mut ID3D11Resource,
+            0,
+            &src_box,
+        );
+        (*tex).Release();
+        let _ = (*self.dupl).ReleaseFrame();
+
+        let mut mapped: D3D11_MAPPED_SUBRESOURCE = zeroed();
+        let hr_map = (*self.context).Map(
+            self.staging as *mut ID3D11Resource,
+            0,
+            D3D11_MAP_READ,
+            0,
+            &mut mapped,
+        );
+        if !SUCCEEDED(hr_map) || mapped.pData.is_null() {
+            return DxgiCaptureResult::Unavailable;
+        }
+
+        let row_bytes = (uw as usize) * 4;
+        out_bgra.resize(row_bytes * (uh as usize), 0);
+        let src_ptr = mapped.pData as *const u8;
+        let pitch = mapped.RowPitch as usize;
+        if pitch == row_bytes {
+            std::ptr::copy_nonoverlapping(src_ptr, out_bgra.as_mut_ptr(), out_bgra.len());
+        } else {
+            for y in 0..(uh as usize) {
+                std::ptr::copy_nonoverlapping(
+                    src_ptr.add(y * pitch),
+                    out_bgra.as_mut_ptr().add(y * row_bytes),
+                    row_bytes,
+                );
+            }
+        }
+        (*self.context).Unmap(self.staging as *mut ID3D11Resource, 0);
+        DxgiCaptureResult::NewFrame
+    }
+}
+
+/// Capturador Persistente de Alta Velocidade (DXGI Desktop Duplication GPU-side + fallback GDI `BitBlt`):
 pub struct FastCapturer {
     mem_dc: HDC,
     dib_bmp: HBITMAP,
@@ -372,6 +662,9 @@ pub struct FastCapturer {
     x_byte_offsets: Vec<usize>,
     cached_src_w: i32,
     cached_out_w: u32,
+    dxgi: Option<DxgiDuplicator>,
+    dxgi_bgra_buf: Vec<u8>,
+    last_sent_at: Instant,
 }
 
 unsafe impl Send for FastCapturer {}
@@ -388,10 +681,16 @@ impl FastCapturer {
             x_byte_offsets: Vec::new(),
             cached_src_w: 0,
             cached_out_w: 0,
+            dxgi: None,
+            dxgi_bgra_buf: Vec::new(),
+            last_sent_at: Instant::now() - std::time::Duration::from_secs(2),
         }
     }
 
     unsafe fn release_gdi(&mut self) {
+        if let Some(mut d) = self.dxgi.take() {
+            d.release_all();
+        }
         if !self.mem_dc.is_null() {
             if !self.old_obj.is_null() {
                 SelectObject(self.mem_dc, self.old_obj);
@@ -516,50 +815,102 @@ impl FastCapturer {
             let out_w = (((src_w as f32 * scale) as u32) & !1).max(64);
             let out_h = (((src_h as f32 * scale) as u32) & !1).max(64);
 
-            let screen_dc = GetDC(null_mut());
-            if screen_dc.is_null() {
-                return None;
+            // Tenta primeiro via DXGI Desktop Duplication (GPU-side, sem travar DWM)
+            let desired_output = match source.kind {
+                CaptureSourceKind::Monitor { index, .. } => index,
+                CaptureSourceKind::Window { .. } => 0,
+            };
+            if self.dxgi.as_ref().map(|d| d.output_idx) != Some(desired_output) {
+                if let Some(mut old) = self.dxgi.take() {
+                    old.release_all();
+                }
+                self.dxgi = DxgiDuplicator::init_for_output(desired_output);
             }
 
-            if !self.ensure_dib_surface(screen_dc, src_w, src_h) {
-                ReleaseDC(null_mut(), screen_dc);
-                return None;
-            }
-
-            // Cópia 1:1 acelerada por GPU direto do compositor DWM (NUNCA trava o jogo!)
-            let blt_ok = BitBlt(
-                self.mem_dc,
-                0,
-                0,
-                src_w,
-                src_h,
-                screen_dc,
-                src_left,
-                src_top,
-                SRCCOPY,
-            );
-            ReleaseDC(null_mut(), screen_dc);
-
-            if blt_ok == 0 {
-                return None;
-            }
-
-            if draw_cursor {
-                let mut ci: CURSORINFO = zeroed();
-                ci.cbSize = size_of::<CURSORINFO>() as DWORD;
-                if GetCursorInfo(&mut ci) != 0 && (ci.flags & CURSOR_SHOWING) != 0 {
-                    let cx = ci.ptScreenPos.x - src_left;
-                    let cy = ci.ptScreenPos.y - src_top;
-                    if cx >= 0 && cy >= 0 && cx < src_w && cy < src_h {
-                        DrawIconEx(self.mem_dc, cx, cy, ci.hCursor, 0, 0, 0, null_mut(), DI_NORMAL);
+            let mut used_dxgi = false;
+            if let Some(ref mut dupl) = self.dxgi {
+                match dupl.capture_crop_bgra(
+                    src_left,
+                    src_top,
+                    src_w,
+                    src_h,
+                    &mut self.dxgi_bgra_buf,
+                ) {
+                    DxgiCaptureResult::NewFrame => {
+                        used_dxgi = true;
+                        self.last_sent_at = Instant::now();
+                    }
+                    DxgiCaptureResult::Unchanged => {
+                        if self.last_sent_at.elapsed() < std::time::Duration::from_secs(1) {
+                            return None;
+                        }
+                        // Reenvio periódico (1s) para quem acabou de entrar na sala
+                    }
+                    DxgiCaptureResult::Unavailable => {
+                        if let Some(mut old) = self.dxgi.take() {
+                            old.release_all();
+                        }
                     }
                 }
             }
 
-            GdiFlush();
+            let bgra_slice: &[u8] = if used_dxgi {
+                &self.dxgi_bgra_buf
+            } else {
+                let screen_dc = GetDC(null_mut());
+                if screen_dc.is_null() {
+                    return None;
+                }
 
-            let src_total_bytes = (src_w as usize) * (src_h as usize) * 4;
-            let bgra_slice = std::slice::from_raw_parts(self.dib_ptr, src_total_bytes);
+                if !self.ensure_dib_surface(screen_dc, src_w, src_h) {
+                    ReleaseDC(null_mut(), screen_dc);
+                    return None;
+                }
+
+                let blt_ok = BitBlt(
+                    self.mem_dc,
+                    0,
+                    0,
+                    src_w,
+                    src_h,
+                    screen_dc,
+                    src_left,
+                    src_top,
+                    SRCCOPY,
+                );
+                ReleaseDC(null_mut(), screen_dc);
+
+                if blt_ok == 0 {
+                    return None;
+                }
+
+                if draw_cursor {
+                    let mut ci: CURSORINFO = zeroed();
+                    ci.cbSize = size_of::<CURSORINFO>() as DWORD;
+                    if GetCursorInfo(&mut ci) != 0 && (ci.flags & CURSOR_SHOWING) != 0 {
+                        let cx = ci.ptScreenPos.x - src_left;
+                        let cy = ci.ptScreenPos.y - src_top;
+                        if cx >= 0 && cy >= 0 && cx < src_w && cy < src_h {
+                            DrawIconEx(
+                                self.mem_dc,
+                                cx,
+                                cy,
+                                ci.hCursor,
+                                0,
+                                0,
+                                0,
+                                null_mut(),
+                                DI_NORMAL,
+                            );
+                        }
+                    }
+                }
+
+                GdiFlush();
+                self.last_sent_at = Instant::now();
+                let src_total_bytes = (src_w as usize) * (src_h as usize) * 4;
+                std::slice::from_raw_parts(self.dib_ptr, src_total_bytes)
+            };
 
             let out_pixels = (out_w * out_h) as usize;
             let mut rgb = vec![0u8; out_pixels * 3];
