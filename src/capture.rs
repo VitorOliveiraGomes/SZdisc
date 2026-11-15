@@ -1420,19 +1420,22 @@ mod platform {
         let mut sources = Vec::new();
         if let Ok(monitors) = Monitor::all() {
             for (idx, m) in monitors.into_iter().enumerate() {
-                let w = m.width() as i32;
-                let h = m.height() as i32;
+                let w = m.width().unwrap_or(0) as i32;
+                let h = m.height().unwrap_or(0) as i32;
+                if w <= 0 || h <= 0 {
+                    continue;
+                }
                 sources.push(CaptureSource {
                     id: format!("mon_{}", idx),
                     name: format!("Tela {} ({}x{})", idx + 1, w, h),
-                    subtitle: m.name().to_string(),
+                    subtitle: m.name().unwrap_or_default(),
                     exe_name: "Monitor".to_string(),
                     pid: 0,
                     category: SourceCategory::Screen,
                     kind: CaptureSourceKind::Monitor {
                         index: idx,
-                        left: m.x(),
-                        top: m.y(),
+                        left: m.x().unwrap_or(0),
+                        top: m.y().unwrap_or(0),
                         width: w,
                         height: h,
                     },
@@ -1441,14 +1444,17 @@ mod platform {
         }
         if let Ok(windows) = Window::all() {
             for w in windows {
-                if w.is_minimized() || w.width() < 80 || w.height() < 80 {
+                if w.is_minimized().unwrap_or(false)
+                    || w.width().unwrap_or(0) < 80
+                    || w.height().unwrap_or(0) < 80
+                {
                     continue;
                 }
-                let title = w.title().trim().to_string();
+                let title = w.title().unwrap_or_default().trim().to_string();
                 if title.is_empty() || title.contains("SZdisc") {
                     continue;
                 }
-                let app = w.app_name().to_string();
+                let app = w.app_name().unwrap_or_default();
                 let lower = app.to_lowercase();
                 let category = if lower.contains("chrome")
                     || lower.contains("firefox")
@@ -1460,15 +1466,16 @@ mod platform {
                 } else {
                     SourceCategory::Application
                 };
+                let wid = w.id().unwrap_or(0);
                 sources.push(CaptureSource {
-                    id: format!("win_{}", w.id()),
+                    id: format!("win_{}", wid),
                     name: title,
                     subtitle: app.clone(),
                     exe_name: app,
-                    pid: w.process_id(),
+                    pid: w.pid().unwrap_or(0),
                     category,
                     kind: CaptureSourceKind::Window {
-                        hwnd: w.id() as usize,
+                        hwnd: wid as usize,
                     },
                 });
             }
@@ -1485,7 +1492,7 @@ mod platform {
                 Window::all()
                     .ok()?
                     .into_iter()
-                    .find(|w| w.id() as usize == hwnd)?
+                    .find(|w| w.id().ok() == Some(hwnd as u32))?
                     .capture_image()
                     .ok()?
             }
@@ -1523,7 +1530,7 @@ mod platform {
                     Window::all()
                         .ok()?
                         .into_iter()
-                        .find(|w| w.id() as usize == hwnd)?
+                        .find(|w| w.id().ok() == Some(hwnd as u32))?
                         .capture_image()
                         .ok()?
                 }
