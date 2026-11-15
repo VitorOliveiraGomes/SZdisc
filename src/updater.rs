@@ -12,7 +12,7 @@ use winapi::um::wininet::{
     INTERNET_FLAG_NO_CACHE_WRITE, INTERNET_FLAG_RELOAD, INTERNET_OPEN_TYPE_PRECONFIG,
 };
 
-pub const CURRENT_VERSION: &str = "2.9.0";
+pub const CURRENT_VERSION: &str = "2.9.1";
 const VERSION_URL: &str =
     "https://raw.githubusercontent.com/VitorOliveiraGomes/SZdisc/main/VERSION.txt";
 const EXE_DOWNLOAD_URL: &str =

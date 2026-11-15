@@ -196,8 +196,38 @@ struct Disc2App {
     update_status: Arc<Mutex<UpdateStatus>>,
 }
 
+fn install_system_emoji_fonts(ctx: &Context) {
+    let mut fonts = egui::FontDefinitions::default();
+    if let Ok(bytes) = std::fs::read(r"C:\Windows\Fonts\seguiemj.ttf") {
+        fonts.font_data.insert(
+            "segoe_ui_emoji".to_owned(),
+            egui::FontData::from_owned(bytes),
+        );
+        if let Some(fam) = fonts.families.get_mut(&egui::FontFamily::Proportional) {
+            fam.push("segoe_ui_emoji".to_owned());
+        }
+        if let Some(fam) = fonts.families.get_mut(&egui::FontFamily::Monospace) {
+            fam.push("segoe_ui_emoji".to_owned());
+        }
+    }
+    if let Ok(bytes) = std::fs::read(r"C:\Windows\Fonts\seguisym.ttf") {
+        fonts.font_data.insert(
+            "segoe_ui_symbol".to_owned(),
+            egui::FontData::from_owned(bytes),
+        );
+        if let Some(fam) = fonts.families.get_mut(&egui::FontFamily::Proportional) {
+            fam.push("segoe_ui_symbol".to_owned());
+        }
+        if let Some(fam) = fonts.families.get_mut(&egui::FontFamily::Monospace) {
+            fam.push("segoe_ui_symbol".to_owned());
+        }
+    }
+    ctx.set_fonts(fonts);
+}
+
 impl Disc2App {
     fn new(cc: &eframe::CreationContext<'_>) -> Self {
+        install_system_emoji_fonts(&cc.egui_ctx);
         cleanup_old_exe();
         let update_status = Arc::new(Mutex::new(UpdateStatus::Idle));
         check_for_updates_async(Arc::clone(&update_status));
