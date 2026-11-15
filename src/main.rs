@@ -15,8 +15,8 @@ use std::time::{Duration, Instant};
 
 use audio::spawn_system_audio_loopback;
 use capture::{
-    capture_frame, capture_thumbnail_rgba, get_process_ram_mb, list_capture_sources, CaptureSource,
-    SourceCategory,
+    capture_thumbnail_rgba, get_process_ram_mb, is_szdisc_in_foreground, list_capture_sources,
+    CaptureSource, FastCapturer, SourceCategory,
 };
 use eframe::egui::{
     self, Color32, ColorImage, Context, FontId, RichText, Rounding, Stroke, TextureHandle,
@@ -37,6 +37,7 @@ use updater::{
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ResolutionPreset {
     P1080,
+    P900,
     P720,
     P480,
     P360,
@@ -46,6 +47,7 @@ impl ResolutionPreset {
     fn dimensions(self) -> (u32, u32) {
         match self {
             Self::P1080 => (1920, 1080),
+            Self::P900 => (1600, 900),
             Self::P720 => (1280, 720),
             Self::P480 => (854, 480),
             Self::P360 => (640, 360),
@@ -55,7 +57,8 @@ impl ResolutionPreset {
     fn label(self) -> &'static str {
         match self {
             Self::P1080 => "1080p (Full HD)",
-            Self::P720 => "720p (HD Leve)",
+            Self::P900 => "900p (HD+ Gamer)",
+            Self::P720 => "720p (HD Turbo 60fps)",
             Self::P480 => "480p (SD Rápido)",
             Self::P360 => "360p (Ultra Leve)",
         }
@@ -64,6 +67,7 @@ impl ResolutionPreset {
     fn short_label(self) -> &'static str {
         match self {
             Self::P1080 => "1080p",
+            Self::P900 => "900p",
             Self::P720 => "720p",
             Self::P480 => "480p",
             Self::P360 => "360p",
@@ -90,9 +94,11 @@ struct LiveStreamConfig {
     target_fps: AtomicU8,
     jpeg_quality: AtomicU8,
     eco_hide_preview: AtomicBool,
+    auto_game_eco: AtomicBool,
     draw_cursor: AtomicBool,
     share_system_audio: Arc<AtomicBool>,
     target_audio_pid: Arc<AtomicU32>,
+    encoded_frames_counter: Arc<AtomicU32>,
     active_source: Mutex<Option<CaptureSource>>,
 }
 
@@ -156,6 +162,7 @@ struct Disc2App {
     jpeg_quality: u8,
     share_audio_enabled: bool,
     eco_hide_preview: bool,
+    auto_game_eco: bool,
     show_own_preview_in_grid: bool,
 
     // Sistema Multi-Servidor + Salas Isoladas + Multi-Monitor + Tela Cheia
@@ -235,14 +242,16 @@ impl Disc2App {
         let share_system_audio = Arc::new(AtomicBool::new(true));
         let target_audio_pid = Arc::new(AtomicU32::new(initial_pid));
         let stream_config = Arc::new(LiveStreamConfig {
-            target_w: AtomicU32::new(1920),
-            target_h: AtomicU32::new(1080),
+            target_w: AtomicU32::new(1280),
+            target_h: AtomicU32::new(720),
             target_fps: AtomicU8::new(60),
-            jpeg_quality: AtomicU8::new(75),
+            jpeg_quality: AtomicU8::new(65),
             eco_hide_preview: AtomicBool::new(false),
+            auto_game_eco: AtomicBool::new(true),
             draw_cursor: AtomicBool::new(custom.show_cursor_in_stream),
             share_system_audio,
             target_audio_pid,
+            encoded_frames_counter: Arc::new(AtomicU32::new(0)),
             active_source: Mutex::new(sources.first().cloned()),
         });
 
@@ -265,11 +274,12 @@ impl Disc2App {
             sources,
             source_thumbnails: HashMap::new(),
             selected_source_idx: 0,
-            res_preset: ResolutionPreset::P1080,
+            res_preset: ResolutionPreset::P720,
             fps_preset: 60,
-            jpeg_quality: 75,
+            jpeg_quality: 65,
             share_audio_enabled: true,
             eco_hide_preview: false,
+            auto_game_eco: true,
             show_own_preview_in_grid: true,
             room_hub,
             new_room_name_input: String::new(),
@@ -374,6 +384,9 @@ impl Disc2App {
             .eco_hide_preview
             .store(self.eco_hide_preview, Ordering::Relaxed);
         self.stream_config
+            .auto_game_eco
+            .store(self.auto_game_eco, Ordering::Relaxed);
+        self.stream_config
             .draw_cursor
             .store(self.custom.show_cursor_in_stream, Ordering::Relaxed);
         self.stream_config
@@ -470,15 +483,71 @@ impl Disc2App {
             hub_for_audio.broadcast_my_audio(pcm_bytes);
         });
 
-        let (preview_tx, preview_rx) = sync_channel::<LocalPreviewFrame>(2);
+        let (preview_tx, preview_rx) = sync_channel::<LocalPreviewFrame>(1);
         self.local_preview_rx = Some(preview_rx);
+
+        // Canal de 1 slot (Zero-Lag) entre a Thread de Captura (DWM BitBlt) e a Thread de Codificação JPEG!
+        let (encode_tx, encode_rx) = sync_channel::<(u32, u32, u8, u8, Vec<u8>)>(1);
 
         let cfg = Arc::clone(&self.stream_config);
         let bytes_per_sec = Arc::clone(&hub.bytes_sent_per_sec);
+        let encoded_counter = Arc::clone(&self.stream_config.encoded_frames_counter);
+        let stop_for_encoder = Arc::clone(&stop_flag);
+        let hub_for_encoder = Arc::clone(&hub);
 
+        // ESTÁGIO 2: Thread dedicada de Codificação JPEG + Controle Adaptativo de Bitrate (não bloqueia a captura!)
         thread::spawn(move || {
             let mut sec_timer = Instant::now();
             let mut sec_bytes: u32 = 0;
+            let mut jpeg_buf = Vec::with_capacity(196_608);
+            let mut adaptive_penalty: i16 = 0;
+
+            while !stop_for_encoder.load(Ordering::Relaxed) {
+                match encode_rx.recv_timeout(Duration::from_millis(60)) {
+                    Ok((width, height, fps, base_quality, rgb)) => {
+                        let eff_quality =
+                            ((base_quality as i16) - adaptive_penalty).clamp(40, 92) as u8;
+                        jpeg_buf.clear();
+                        let mut encoder = Encoder::new(&mut jpeg_buf, eff_quality);
+                        encoder.set_sampling_factor(SamplingFactor::F_2_2);
+
+                        if encoder
+                            .encode(&rgb, width as u16, height as u16, ColorType::Rgb)
+                            .is_ok()
+                        {
+                            let frame_bytes = jpeg_buf.len();
+                            // Bitrate Adaptativo Inteligente: evita engasgar o túnel bore.pub/Radmin em cenas de muita ação a 60 FPS
+                            if fps >= 45 && frame_bytes > 58_000 {
+                                adaptive_penalty = (adaptive_penalty + 4).min(24);
+                            } else if frame_bytes < 36_000 && adaptive_penalty > 0 {
+                                adaptive_penalty = (adaptive_penalty - 2).max(0);
+                            }
+
+                            sec_bytes = sec_bytes.saturating_add(frame_bytes as u32);
+                            encoded_counter.fetch_add(1, Ordering::Relaxed);
+                            hub_for_encoder.broadcast_my_video(
+                                width as u16,
+                                height as u16,
+                                fps,
+                                &jpeg_buf,
+                            );
+                        }
+                    }
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                }
+
+                if sec_timer.elapsed() >= Duration::from_secs(1) {
+                    bytes_per_sec.store(sec_bytes, Ordering::Relaxed);
+                    sec_bytes = 0;
+                    sec_timer = Instant::now();
+                }
+            }
+        });
+
+        // ESTÁGIO 1: Thread de Captura Ultra-Rápida (DWM `CreateDIBSection` Zero-Copy, sem `PrintWindow`)
+        thread::spawn(move || {
+            let mut fast_capturer = FastCapturer::new();
 
             while !stop_flag.load(Ordering::Relaxed) {
                 let frame_start = Instant::now();
@@ -489,44 +558,30 @@ impl Disc2App {
                 let target_h = cfg.target_h.load(Ordering::Relaxed);
                 let quality = cfg.jpeg_quality.load(Ordering::Relaxed);
                 let hide_preview = cfg.eco_hide_preview.load(Ordering::Relaxed);
+                let auto_eco = cfg.auto_game_eco.load(Ordering::Relaxed);
                 let draw_cursor = cfg.draw_cursor.load(Ordering::Relaxed);
                 let has_peers = hub.has_connected_peers();
 
-                if hide_preview && !has_peers {
-                    thread::sleep(Duration::from_millis(80));
+                // Quando você está focado dentro do jogo (SZdisc em 2º plano), pausa automaticamente
+                // a prévia local para usar 0% de GPU/OpenGL extra e mandar 100% do FPS para seus amigos!
+                let app_focused = is_szdisc_in_foreground();
+                let need_local_preview = !hide_preview && (!auto_eco || app_focused);
+
+                if !need_local_preview && !has_peers {
+                    thread::sleep(Duration::from_millis(60));
                     continue;
                 }
 
                 let source_opt = cfg.active_source.lock().ok().and_then(|g| g.clone());
                 if let Some(source) = source_opt {
-                    if let Some(raw) =
-                        capture_frame(&source, target_w, target_h, !hide_preview, draw_cursor)
-                    {
-                        if has_peers {
-                            let mut jpeg_buf =
-                                Vec::with_capacity((raw.width * raw.height / 5) as usize);
-                            let mut encoder = Encoder::new(&mut jpeg_buf, quality);
-                            encoder.set_sampling_factor(SamplingFactor::F_2_2);
-                            if encoder
-                                .encode(
-                                    &raw.rgb,
-                                    raw.width as u16,
-                                    raw.height as u16,
-                                    ColorType::Rgb,
-                                )
-                                .is_ok()
-                            {
-                                sec_bytes = sec_bytes.saturating_add(jpeg_buf.len() as u32);
-                                hub.broadcast_my_video(
-                                    raw.width as u16,
-                                    raw.height as u16,
-                                    fps,
-                                    &jpeg_buf,
-                                );
-                            }
-                        }
-
-                        if !hide_preview {
+                    if let Some(raw) = fast_capturer.capture_live_frame(
+                        &source,
+                        target_w,
+                        target_h,
+                        need_local_preview,
+                        draw_cursor,
+                    ) {
+                        if need_local_preview && !raw.rgba.is_empty() {
                             let _ = preview_tx.try_send(LocalPreviewFrame {
                                 width: raw.width,
                                 height: raw.height,
@@ -534,13 +589,19 @@ impl Disc2App {
                             });
                             ctx.request_repaint();
                         }
-                    }
-                }
 
-                if sec_timer.elapsed() >= Duration::from_secs(1) {
-                    bytes_per_sec.store(sec_bytes, Ordering::Relaxed);
-                    sec_bytes = 0;
-                    sec_timer = Instant::now();
+                        if has_peers {
+                            let _ = encode_tx.try_send((
+                                raw.width,
+                                raw.height,
+                                fps,
+                                quality,
+                                raw.rgb,
+                            ));
+                        } else {
+                            cfg.encoded_frames_counter.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
                 }
 
                 let elapsed = frame_start.elapsed();
@@ -1351,6 +1412,7 @@ impl Disc2App {
                             );
                             for preset in [
                                 ResolutionPreset::P1080,
+                                ResolutionPreset::P900,
                                 ResolutionPreset::P720,
                                 ResolutionPreset::P480,
                                 ResolutionPreset::P360,
@@ -1848,8 +1910,19 @@ impl Disc2App {
                                 ui.add_space(6.0);
                                 if ui
                                     .checkbox(
+                                        &mut self.auto_game_eco,
+                                        "⚡ Modo Jogo Inteligente (Pausar prévia local automaticamente quando você estiver focado no jogo)",
+                                    )
+                                    .changed()
+                                {
+                                    self.sync_live_config();
+                                }
+
+                                ui.add_space(6.0);
+                                if ui
+                                    .checkbox(
                                         &mut self.eco_hide_preview,
-                                        "🎮 Modo Jogo (Ocultar prévia local enquanto transmite sozinho)",
+                                        "🎮 Ocultar prévia local sempre (mesmo com o SZdisc aberto na tela)",
                                     )
                                     .changed()
                                 {
@@ -2485,18 +2558,21 @@ impl eframe::App for Disc2App {
         let elapsed_sec = self.last_metrics_tick.elapsed().as_secs_f32();
         if elapsed_sec >= 1.0 {
             self.ram_mb = get_process_ram_mb();
-            self.local_measured_fps =
-                (self.local_frame_counter as f32 / elapsed_sec).round() as u32;
+            let enc_frames = self
+                .stream_config
+                .encoded_frames_counter
+                .swap(0, Ordering::Relaxed);
+            let prev_frames = self.local_frame_counter;
+            self.local_frame_counter = 0;
+
+            let best_frames = enc_frames.max(prev_frames);
+            self.local_measured_fps = (best_frames as f32 / elapsed_sec).round() as u32;
             if self.is_sharing {
                 if let Some(hub) = &self.room_hub {
                     let bps = hub.bytes_sent_per_sec.load(Ordering::Relaxed);
                     self.local_measured_mbps = (bps as f32 * 8.0) / 1_000_000.0;
                 }
-                if self.eco_hide_preview {
-                    self.local_measured_fps = self.fps_preset as u32;
-                }
             }
-            self.local_frame_counter = 0;
 
             for tile in self.remote_tiles.values_mut() {
                 tile.measured_fps = (tile.frame_counter as f32 / elapsed_sec).round() as u32;
@@ -3588,6 +3664,11 @@ impl eframe::App for Disc2App {
                                 );
                                 ui.selectable_value(
                                     &mut self.res_preset,
+                                    ResolutionPreset::P900,
+                                    ResolutionPreset::P900.label(),
+                                );
+                                ui.selectable_value(
+                                    &mut self.res_preset,
                                     ResolutionPreset::P720,
                                     ResolutionPreset::P720.label(),
                                 );
@@ -3623,7 +3704,7 @@ impl eframe::App for Disc2App {
                         let q_label = match self.jpeg_quality {
                             90 => "Ultra",
                             75 => "Alta",
-                            62 => "Média",
+                            65 => "Turbo",
                             _ => "Leve",
                         };
                         egui::ComboBox::from_id_salt("combo_quality")
@@ -3632,11 +3713,47 @@ impl eframe::App for Disc2App {
                             .show_ui(ui, |ui| {
                                 ui.selectable_value(&mut self.jpeg_quality, 90, "Ultra (90%)");
                                 ui.selectable_value(&mut self.jpeg_quality, 75, "Alta (75%)");
-                                ui.selectable_value(&mut self.jpeg_quality, 62, "Média (62%)");
-                                ui.selectable_value(&mut self.jpeg_quality, 45, "Leve (45%)");
+                                ui.selectable_value(
+                                    &mut self.jpeg_quality,
+                                    65,
+                                    "Turbo 60fps (65%)",
+                                );
+                                ui.selectable_value(&mut self.jpeg_quality, 48, "Leve (48%)");
                             });
                         if self.jpeg_quality != prev_q {
                             self.sync_live_config();
+                        }
+
+                        let is_turbo_preset = self.res_preset == ResolutionPreset::P720
+                            && self.fps_preset == 60
+                            && self.jpeg_quality == 65
+                            && self.auto_game_eco;
+                        let turbo_btn = egui::Button::new(
+                            RichText::new("⚡ Modo Turbo Jogos")
+                                .size(11.0)
+                                .strong()
+                                .color(Color32::WHITE),
+                        )
+                        .fill(if is_turbo_preset {
+                            Color32::from_rgb(35, 165, 90)
+                        } else {
+                            Color32::from_rgb(52, 56, 66)
+                        });
+                        if ui
+                            .add(turbo_btn)
+                            .on_hover_text(
+                                "Ativa 720p HD a 60 FPS + Bitrate Adaptativo + Pausa automática da prévia local enquanto você joga (Zero peso no PC!)",
+                            )
+                            .clicked()
+                        {
+                            self.res_preset = ResolutionPreset::P720;
+                            self.fps_preset = 60;
+                            self.jpeg_quality = 65;
+                            self.auto_game_eco = true;
+                            self.sync_live_config();
+                            self.show_toast(
+                                "⚡ Modo Turbo Jogos ativado: 720p 60 FPS com Zero Peso enquanto você joga!",
+                            );
                         }
 
                         if self.is_sharing {

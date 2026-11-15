@@ -63,31 +63,114 @@ pub struct DecodedRemoteFrame {
     pub rgba: Vec<u8>,
 }
 
-/// Estado de recepção de vídeo e áudio de um participante específico na sala
+struct RawCompressedVideo {
+    width: u32,
+    height: u32,
+    jpeg_bytes: Vec<u8>,
+}
+
+/// Estado de recepção de vídeo e áudio de um participante específico na sala.
+/// Possui uma thread decodificadora dedicada (Zero-Backpressure) para que a leitura do socket TCP
+/// nunca trave esperando decodificação JPEG e sempre processe o quadro mais recente em tempo real!
 pub struct RemotePeerStream {
     pub latest_frame: Mutex<Option<DecodedRemoteFrame>>,
+    raw_video_slot: Mutex<Option<RawCompressedVideo>>,
+    raw_video_wakeup: Condvar,
+    stop_decoder: AtomicBool,
     pub volume_percent: Arc<AtomicU32>,
     pub muted: Arc<AtomicBool>,
     pub audio_player: StreamAudioPlayer,
 }
 
 impl RemotePeerStream {
-    fn new() -> Arc<Self> {
+    fn new(ctx: Context) -> Arc<Self> {
         let volume_percent = Arc::new(AtomicU32::new(100));
         let muted = Arc::new(AtomicBool::new(false));
         let audio_player =
             StreamAudioPlayer::start(Arc::clone(&volume_percent), Arc::clone(&muted));
-        Arc::new(Self {
+        let stream = Arc::new(Self {
             latest_frame: Mutex::new(None),
+            raw_video_slot: Mutex::new(None),
+            raw_video_wakeup: Condvar::new(),
+            stop_decoder: AtomicBool::new(false),
             volume_percent,
             muted,
             audio_player,
-        })
+        });
+
+        let stream_worker = Arc::clone(&stream);
+        thread::spawn(move || {
+            while !stream_worker.stop_decoder.load(Ordering::Relaxed) {
+                let raw_opt = {
+                    let mut guard = match stream_worker.raw_video_slot.lock() {
+                        Ok(g) => g,
+                        Err(_) => break,
+                    };
+                    if guard.is_none() {
+                        guard = match stream_worker
+                            .raw_video_wakeup
+                            .wait_timeout(guard, Duration::from_millis(40))
+                        {
+                            Ok((g, _)) => g,
+                            Err(_) => break,
+                        };
+                    }
+                    guard.take()
+                };
+
+                if let Some(raw) = raw_opt {
+                    let byte_len = raw.jpeg_bytes.len();
+                    let mut decoder = JpegDecoder::new(&raw.jpeg_bytes);
+                    if let Ok(rgb) = decoder.decode() {
+                        let w = raw.width;
+                        let h = raw.height;
+                        let pixel_count = (w * h) as usize;
+                        if rgb.len() >= pixel_count * 3 {
+                            let mut rgba = vec![0u8; pixel_count * 4];
+                            for (rgb_px, rgba_px) in rgb[..pixel_count * 3]
+                                .chunks_exact(3)
+                                .zip(rgba.chunks_exact_mut(4))
+                            {
+                                rgba_px[0] = rgb_px[0];
+                                rgba_px[1] = rgb_px[1];
+                                rgba_px[2] = rgb_px[2];
+                                rgba_px[3] = 255;
+                            }
+
+                            if let Ok(mut latest) = stream_worker.latest_frame.lock() {
+                                *latest = Some(DecodedRemoteFrame {
+                                    width: w,
+                                    height: h,
+                                    byte_len,
+                                    rgba,
+                                });
+                            }
+                            ctx.request_repaint();
+                        }
+                    }
+                }
+            }
+        });
+
+        stream
+    }
+
+    fn push_compressed_video(&self, width: u32, height: u32, jpeg_bytes: Vec<u8>) {
+        if let Ok(mut slot) = self.raw_video_slot.lock() {
+            *slot = Some(RawCompressedVideo {
+                width,
+                height,
+                jpeg_bytes,
+            });
+            self.raw_video_wakeup.notify_one();
+        }
     }
 }
 
 impl Drop for RemotePeerStream {
     fn drop(&mut self) {
+        self.stop_decoder.store(true, Ordering::Relaxed);
+        self.raw_video_wakeup.notify_all();
         self.audio_player.stop();
     }
 }
@@ -300,7 +383,7 @@ fn read_exact_interruptible(
                     || e.kind() == std::io::ErrorKind::TimedOut
                     || e.kind() == std::io::ErrorKind::Interrupted =>
             {
-                thread::sleep(Duration::from_millis(5));
+                thread::sleep(Duration::from_millis(1));
                 continue;
             }
             Err(_) => return false,
@@ -328,10 +411,10 @@ fn write_all_interruptible(stream: &mut TcpStream, buf: &[u8], alive: &AtomicBoo
                     || e.kind() == std::io::ErrorKind::Interrupted =>
             {
                 retries += 1;
-                if retries > 40 {
+                if retries > 300 {
                     return false;
                 }
-                thread::sleep(Duration::from_millis(15));
+                thread::sleep(Duration::from_millis(2));
                 continue;
             }
             Err(_) => return false,
@@ -1948,60 +2031,42 @@ impl RoomHub {
                     }
                     hub_reader.ctx.request_repaint();
                 } else if &magic == MAGIC_VIDEO {
-                    let mut decoder = JpegDecoder::new(&payload);
-                    if let Ok(rgb) = decoder.decode() {
-                        let w = width as u32;
-                        let h = height as u32;
-                        let pixel_count = (w * h) as usize;
-                        if rgb.len() >= pixel_count * 3 {
-                            let mut rgba = vec![0u8; pixel_count * 4];
-                            for i in 0..pixel_count {
-                                rgba[i * 4] = rgb[i * 3];
-                                rgba[i * 4 + 1] = rgb[i * 3 + 1];
-                                rgba[i * 4 + 2] = rgb[i * 3 + 2];
-                                rgba[i * 4 + 3] = 255;
-                            }
-
-                            if let Ok(mut peers_map) = hub_reader.peers.lock() {
-                                let entry =
-                                    peers_map.entry(sender_id).or_insert_with(|| PeerInfo {
-                                        peer_id: sender_id,
-                                        name: format!("Amigo #{}", sender_id % 1000),
-                                        is_sharing: true,
-                                        res_label: format!("{}p {}fps", h, fps),
-                                        last_seen: Instant::now(),
-                                    });
-                                entry.is_sharing = true;
-                                entry.last_seen = Instant::now();
-                            }
-
-                            let stream_arc = {
-                                let mut streams = hub_reader.remote_streams.lock().unwrap();
-                                Arc::clone(
-                                    streams
-                                        .entry(sender_id)
-                                        .or_insert_with(RemotePeerStream::new),
-                                )
-                            };
-
-                            if let Ok(mut latest) = stream_arc.latest_frame.lock() {
-                                *latest = Some(DecodedRemoteFrame {
-                                    width: w,
-                                    height: h,
-                                    byte_len: payload_len,
-                                    rgba,
+                    let w = width as u32;
+                    let h = height as u32;
+                    if w > 0 && h > 0 {
+                        if let Ok(mut peers_map) = hub_reader.peers.lock() {
+                            let entry =
+                                peers_map.entry(sender_id).or_insert_with(|| PeerInfo {
+                                    peer_id: sender_id,
+                                    name: format!("Amigo #{}", sender_id % 1000),
+                                    is_sharing: true,
+                                    res_label: format!("{}p {}fps", h, fps),
+                                    last_seen: Instant::now(),
                                 });
-                            }
-                            hub_reader.ctx.request_repaint();
+                            entry.is_sharing = true;
+                            entry.last_seen = Instant::now();
                         }
+
+                        let stream_arc = {
+                            let mut streams = hub_reader.remote_streams.lock().unwrap();
+                            let ctx_clone = hub_reader.ctx.clone();
+                            Arc::clone(
+                                streams
+                                    .entry(sender_id)
+                                    .or_insert_with(|| RemotePeerStream::new(ctx_clone)),
+                            )
+                        };
+
+                        stream_arc.push_compressed_video(w, h, payload);
                     }
                 } else if &magic == MAGIC_AUDIO {
                     let stream_arc = {
                         let mut streams = hub_reader.remote_streams.lock().unwrap();
+                        let ctx_clone = hub_reader.ctx.clone();
                         Arc::clone(
                             streams
                                 .entry(sender_id)
-                                .or_insert_with(RemotePeerStream::new),
+                                .or_insert_with(|| RemotePeerStream::new(ctx_clone)),
                         )
                     };
                     let _ = stream_arc.audio_player.clone_sender().try_send(payload);
