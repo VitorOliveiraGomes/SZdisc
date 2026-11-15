@@ -51,16 +51,17 @@ jobs:
 
       - name: Build release
         run: |
-          set -o pipefail
+          set +e
           if [ -n "${{ matrix.target }}" ]; then
-            cargo build --release --target ${{ matrix.target }} 2>&1 | tee build.log
+            cargo build --release --target ${{ matrix.target }} > build.log 2>&1
           else
-            cargo build --release 2>&1 | tee build.log
+            cargo build --release > build.log 2>&1
           fi
-          rc=${PIPESTATUS[0]}
+          rc=$?
+          cat build.log
           if [ $rc -ne 0 ]; then
-            grep -E "error(\[|:)|Caused by:|panicked at|ld:|undefined|cannot find|fatal error" build.log | head -n 8 | while IFS= read -r l; do echo "::error::$l"; done
-            tail -n 2 build.log | while IFS= read -r l; do echo "::error::$l"; done
+            grep -E "error(\[|:)|Caused by:|panicked at|ld:|undefined|cannot find|fatal error" build.log | head -n 7 | while IFS= read -r l; do echo "::error::$l"; done
+            tail -n 3 build.log | while IFS= read -r l; do echo "::error::$l"; done
             exit $rc
           fi
         shell: bash
