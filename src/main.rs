@@ -4249,6 +4249,7 @@ impl eframe::App for Disc2App {
 }
 
 fn main() -> eframe::Result<()> {
+    #[cfg(windows)]
     unsafe {
         winapi::um::timeapi::timeBeginPeriod(1);
     }

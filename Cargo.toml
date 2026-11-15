@@ -11,6 +11,7 @@ egui = "0.29"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "bmp"] }
 jpeg-encoder = { version = "0.6", features = ["simd"] }
 zune-jpeg = "0.4"
+[target.'cfg(windows)'.dependencies]
 winapi = { version = "0.3", features = [
   "winuser",
   "wingdi",
@@ -40,6 +41,12 @@ winapi = { version = "0.3", features = [
   "mmreg",
   "wininet"
 ] }
+
+[target.'cfg(not(windows))'.dependencies]
+xcap = "0.0.14"
+cpal = "0.15"
+rfd = "0.15"
+ureq = "2"
 
 [profile.release]
 opt-level = 3

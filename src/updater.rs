@@ -1,18 +1,21 @@
-use std::ffi::CString;
 use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
-use std::ptr::null_mut;
 use std::sync::{Arc, Mutex};
 use std::thread;
+use std::time::{SystemTime, UNIX_EPOCH};
 
+#[cfg(windows)]
+use std::ffi::CString;
+#[cfg(windows)]
+use std::ptr::null_mut;
+#[cfg(windows)]
 use winapi::shared::minwindef::DWORD;
+#[cfg(windows)]
 use winapi::um::wininet::{
     InternetCloseHandle, InternetOpenA, InternetOpenUrlA, InternetReadFile,
     INTERNET_FLAG_NO_CACHE_WRITE, INTERNET_FLAG_RELOAD, INTERNET_OPEN_TYPE_PRECONFIG,
 };
-
-use std::time::{SystemTime, UNIX_EPOCH};
 
 pub const CURRENT_VERSION: &str = "2.11.0";
 const VERSION_URL: &str =
@@ -50,8 +53,7 @@ pub enum UpdateStatus {
     Failed,
 }
 
-/// Faz download HTTPS usando a API oficial nativa do Windows (wininet.dll),
-/// sem abrir processos ocultos como curl.exe ou powershell.exe (evita falsos positivos de antivírus).
+#[cfg(windows)]
 fn fetch_https_bytes_wininet(url: &str, max_bytes: usize) -> Option<Vec<u8>> {
     unsafe {
         let agent = CString::new("SZdisc-Desktop/2.5 (Windows NT 10.0; Win64; x64)").ok()?;
@@ -102,6 +104,22 @@ fn fetch_https_bytes_wininet(url: &str, max_bytes: usize) -> Option<Vec<u8>> {
         } else {
             Some(out)
         }
+    }
+}
+
+#[cfg(not(windows))]
+fn fetch_https_bytes_wininet(url: &str, max_bytes: usize) -> Option<Vec<u8>> {
+    use std::io::Read;
+    let resp = ureq::get(url).call().ok()?;
+    let mut out = Vec::new();
+    resp.into_reader()
+        .take(max_bytes as u64)
+        .read_to_end(&mut out)
+        .ok()?;
+    if out.is_empty() {
+        None
+    } else {
+        Some(out)
     }
 }
 

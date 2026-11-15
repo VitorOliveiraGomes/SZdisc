@@ -1,9 +1,5 @@
-use std::ffi::OsString;
 use std::fs;
-use std::mem::{size_of, zeroed};
-use std::os::windows::ffi::{OsStrExt, OsStringExt};
 use std::path::PathBuf;
-use std::ptr::null_mut;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use eframe::egui::{
@@ -11,6 +7,15 @@ use eframe::egui::{
     TextureHandle, TextureOptions, Ui, Vec2,
 };
 use image::GenericImageView;
+#[cfg(windows)]
+use std::ffi::OsString;
+#[cfg(windows)]
+use std::mem::{size_of, zeroed};
+#[cfg(windows)]
+use std::os::windows::ffi::{OsStrExt, OsStringExt};
+#[cfg(windows)]
+use std::ptr::null_mut;
+#[cfg(windows)]
 use winapi::um::commdlg::{
     GetOpenFileNameW, OFN_FILEMUSTEXIST, OFN_NOCHANGEDIR, OFN_PATHMUSTEXIST, OPENFILENAMEW,
 };
@@ -132,7 +137,8 @@ impl ServerProfile {
     }
 }
 
-/// Abre a janela nativa do Windows para escolher uma imagem (PNG, JPG, JPEG, BMP)
+/// Abre a janela nativa do sistema para escolher uma imagem (PNG, JPG, JPEG, BMP)
+#[cfg(windows)]
 pub fn pick_image_file_dialog() -> Option<String> {
     unsafe {
         let mut file_buf = [0u16; 1024];
@@ -163,6 +169,14 @@ pub fn pick_image_file_dialog() -> Option<String> {
         }
         None
     }
+}
+
+#[cfg(not(windows))]
+pub fn pick_image_file_dialog() -> Option<String> {
+    rfd::FileDialog::new()
+        .add_filter("Imagens", &["png", "jpg", "jpeg", "bmp"])
+        .pick_file()
+        .map(|p| p.to_string_lossy().to_string())
 }
 
 /// Carrega uma imagem do disco e aplica máscara circular suave (estilo foto de perfil do Discord)
@@ -790,6 +804,14 @@ fn parse_rgb(s: &str) -> Option<[u8; 3]> {
     } else {
         None
     }
+}
+
+#[cfg(not(windows))]
+pub fn pick_image_file_dialog() -> Option<String> {
+    rfd::FileDialog::new()
+        .add_filter("Imagens", &["png", "jpg", "jpeg", "bmp"])
+        .pick_file()
+        .map(|p| p.to_string_lossy().to_string())
 }
 
 pub fn draw_discord_avatar(

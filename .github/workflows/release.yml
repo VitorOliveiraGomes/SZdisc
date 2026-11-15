@@ -1,0 +1,95 @@
+name: Build & Release (Windows, Linux, macOS)
+
+on:
+  push:
+    branches: ["main"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build (${{ matrix.name }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Windows-x64
+            os: windows-latest
+            bin: target/release/disc2.exe
+            asset: SZdisc-Windows-x64.exe
+          - name: Linux-x64
+            os: ubuntu-latest
+            bin: target/release/disc2
+            asset: SZdisc-Linux-x64
+          - name: macOS-arm64
+            os: macos-latest
+            target: aarch64-apple-darwin
+            bin: target/aarch64-apple-darwin/release/disc2
+            asset: SZdisc-macOS-arm64
+          - name: macOS-x64
+            os: macos-latest
+            target: x86_64-apple-darwin
+            bin: target/x86_64-apple-darwin/release/disc2
+            asset: SZdisc-macOS-x64
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Linux system dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libxcb1-dev libxrandr-dev libdbus-1-dev libasound2-dev libgtk-3-dev libpipewire-0.3-dev libclang-dev pkg-config
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target || '' }}
+
+      - name: Build release
+        run: |
+          if [ -n "${{ matrix.target }}" ]; then
+            cargo build --release --target ${{ matrix.target }}
+          else
+            cargo build --release
+          fi
+        shell: bash
+
+      - name: Stage artifact
+        run: |
+          mkdir -p dist
+          cp "${{ matrix.bin }}" "dist/${{ matrix.asset }}"
+        shell: bash
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: dist/${{ matrix.asset }}
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Read version
+        id: ver
+        run: echo "version=$(tr -d '[:space:]' < VERSION.txt)" >> $GITHUB_OUTPUT
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ steps.ver.outputs.version }}
+          name: SZdisc v${{ steps.ver.outputs.version }}
+          files: artifacts/*
+          make_latest: true
