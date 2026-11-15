@@ -544,10 +544,10 @@ impl Disc2App {
                             .is_ok()
                         {
                             let frame_bytes = jpeg_buf.len();
-                            // Bitrate Adaptativo Inteligente: evita engasgar o túnel bore.pub/Radmin em cenas de muita ação a 60 FPS
-                            if fps >= 45 && frame_bytes > 58_000 {
-                                adaptive_penalty = (adaptive_penalty + 4).min(24);
-                            } else if frame_bytes < 36_000 && adaptive_penalty > 0 {
+                            // Bitrate Adaptativo Inteligente: evita engasgar o túnel bore.pub
+                            if fps >= 45 && frame_bytes > 26_000 {
+                                adaptive_penalty = (adaptive_penalty + 4).min(30);
+                            } else if frame_bytes < 16_000 && adaptive_penalty > 0 {
                                 adaptive_penalty = (adaptive_penalty - 2).max(0);
                             }
 
@@ -573,9 +573,10 @@ impl Disc2App {
             }
         });
 
-        // ESTÁGIO 1: Thread de Captura Ultra-Rápida (DWM `CreateDIBSection` Zero-Copy, sem `PrintWindow`)
+        // ESTÁGIO 1: Thread de Captura Ultra-Rápida (DXGI GPU + fallback GDI)
         thread::spawn(move || {
             let mut fast_capturer = FastCapturer::new();
+            let mut last_preview_sent = Instant::now() - Duration::from_secs(1);
 
             while !stop_flag.load(Ordering::Relaxed) {
                 let frame_start = Instant::now();
@@ -593,7 +594,9 @@ impl Disc2App {
                 // Quando você está focado dentro do jogo (SZdisc em 2º plano), pausa automaticamente
                 // a prévia local para usar 0% de GPU/OpenGL extra e mandar 100% do FPS para seus amigos!
                 let app_focused = is_szdisc_in_foreground();
-                let need_local_preview = !hide_preview && (!auto_eco || app_focused);
+                let need_local_preview = !hide_preview
+                    && (!auto_eco || app_focused)
+                    && last_preview_sent.elapsed() >= Duration::from_millis(33);
 
                 if !need_local_preview && !has_peers {
                     thread::sleep(Duration::from_millis(60));
@@ -610,6 +613,7 @@ impl Disc2App {
                         draw_cursor,
                     ) {
                         if need_local_preview && !raw.rgba.is_empty() {
+                            last_preview_sent = Instant::now();
                             let _ = preview_tx.try_send(LocalPreviewFrame {
                                 width: raw.width,
                                 height: raw.height,

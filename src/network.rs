@@ -841,9 +841,14 @@ impl RoomHub {
             {
                 let bore_room_target = format!("bore.pub:{}", target_port);
                 self.spawn_outbound_connect(bore_room_target, true);
-                thread::sleep(Duration::from_millis(2200));
-                if !self.has_connected_peers() {
-                    // Porta provavelmente ocupada por outro usuário no bore.pub: avança para próxima porta determinística
+                thread::sleep(Duration::from_millis(2400));
+                let has_valid_peer = self
+                    .peers
+                    .lock()
+                    .map(|p| !p.is_empty())
+                    .unwrap_or(false);
+                if !has_valid_peer {
+                    // Porta ocupada por outro serviço no bore.pub (sem handshake SZdisc): avança para próxima porta
                     port_offset = (port_offset + 1) % 6;
                 } else {
                     port_offset = 0;
