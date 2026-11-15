@@ -495,7 +495,7 @@ impl RoomHub {
             ctx,
         });
 
-        // 1. Thread que aceita conexões TCP locais / Radmin VPN
+        // 1. Thread que aceita conexões TCP de entrada
         let hub_accept = Arc::clone(&hub);
         thread::spawn(move || {
             while !hub_accept.stop_flag.load(Ordering::Relaxed) {
@@ -1321,12 +1321,11 @@ impl RoomHub {
     pub fn update_my_status(
         &self,
         name: String,
-        user_tag: &str,
+        _user_tag: &str,
         is_sharing: bool,
         res_label: String,
     ) {
-        let new_id = derive_persistent_peer_id(&name, user_tag);
-        self.my_peer_id.store(new_id, Ordering::Relaxed);
+        let stable_id = self.my_peer_id.load(Ordering::Relaxed);
 
         let conn_srv = self
             .connected_server_id
@@ -1359,7 +1358,7 @@ impl RoomHub {
             if info.is_sharing && !is_sharing {
                 stopped_sharing = true;
             }
-            info.peer_id = new_id;
+            info.peer_id = stable_id;
             info.name = name;
             info.is_sharing = is_sharing;
             info.res_label = res_label;
@@ -1375,7 +1374,7 @@ impl RoomHub {
         };
 
         let stop_pkt = if stopped_sharing {
-            Some(build_packet(MAGIC_STOP_STREAM, new_id, 0, 0, 0, &[0]))
+            Some(build_packet(MAGIC_STOP_STREAM, stable_id, 0, 0, 0, &[0]))
         } else {
             None
         };

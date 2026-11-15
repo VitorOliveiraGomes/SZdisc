@@ -12,11 +12,33 @@ use winapi::um::wininet::{
     INTERNET_FLAG_NO_CACHE_WRITE, INTERNET_FLAG_RELOAD, INTERNET_OPEN_TYPE_PRECONFIG,
 };
 
-pub const CURRENT_VERSION: &str = "2.10.1";
+use std::time::{SystemTime, UNIX_EPOCH};
+
+pub const CURRENT_VERSION: &str = "2.11.0";
 const VERSION_URL: &str =
     "https://raw.githubusercontent.com/VitorOliveiraGomes/SZdisc/main/VERSION.txt";
 const EXE_DOWNLOAD_URL: &str =
     "https://github.com/VitorOliveiraGomes/SZdisc/raw/main/DISC2.exe";
+
+fn parse_semver(ver: &str) -> (u32, u32, u32) {
+    let mut parts = ver.trim().split('.');
+    let maj = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+    let min = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+    let pat = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+    (maj, min, pat)
+}
+
+fn is_remote_newer(remote: &str, current: &str) -> bool {
+    parse_semver(remote) > parse_semver(current)
+}
+
+fn cache_busted_url(base: &str) -> String {
+    let ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    format!("{}?t={}", base, ts)
+}
 
 #[derive(Clone, Debug)]
 pub enum UpdateStatus {
@@ -99,14 +121,15 @@ pub fn check_for_updates_async(status: Arc<Mutex<UpdateStatus>>) {
     }
 
     thread::spawn(move || {
-        if let Some(bytes) = fetch_https_bytes_wininet(VERSION_URL, 256) {
+        let ver_url = cache_busted_url(VERSION_URL);
+        if let Some(bytes) = fetch_https_bytes_wininet(&ver_url, 256) {
             let remote_ver = String::from_utf8_lossy(&bytes).trim().to_string();
             if !remote_ver.is_empty()
                 && remote_ver.len() <= 16
                 && remote_ver.chars().all(|c| c.is_ascii_digit() || c == '.')
             {
                 if let Ok(mut s) = status.lock() {
-                    if remote_ver != CURRENT_VERSION {
+                    if is_remote_newer(&remote_ver, CURRENT_VERSION) {
                         *s = UpdateStatus::UpdateAvailable(remote_ver);
                     } else {
                         *s = UpdateStatus::UpToDate;
@@ -129,6 +152,18 @@ pub fn download_and_apply_update_async(status: Arc<Mutex<UpdateStatus>>) {
     }
 
     thread::spawn(move || {
+        // Confirma primeiro se realmente existe versão mais nova no GitHub (nunca faz downgrade!)
+        let ver_url = cache_busted_url(VERSION_URL);
+        if let Some(bytes) = fetch_https_bytes_wininet(&ver_url, 256) {
+            let remote_ver = String::from_utf8_lossy(&bytes).trim().to_string();
+            if !remote_ver.is_empty() && !is_remote_newer(&remote_ver, CURRENT_VERSION) {
+                if let Ok(mut s) = status.lock() {
+                    *s = UpdateStatus::UpToDate;
+                }
+                return;
+            }
+        }
+
         let current_exe: PathBuf = match std::env::current_exe() {
             Ok(p) => p,
             Err(_) => {
@@ -142,7 +177,8 @@ pub fn download_and_apply_update_async(status: Arc<Mutex<UpdateStatus>>) {
         let temp_new = current_exe.with_extension("new.exe");
         let temp_old = current_exe.with_extension("old.exe");
 
-        let Some(exe_bytes) = fetch_https_bytes_wininet(EXE_DOWNLOAD_URL, 45_000_000) else {
+        let exe_url = cache_busted_url(EXE_DOWNLOAD_URL);
+        let Some(exe_bytes) = fetch_https_bytes_wininet(&exe_url, 45_000_000) else {
             if let Ok(mut s) = status.lock() {
                 *s = UpdateStatus::Failed;
             }

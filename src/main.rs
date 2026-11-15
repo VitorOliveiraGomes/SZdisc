@@ -3813,20 +3813,43 @@ impl eframe::App for Disc2App {
                                         ));
                                     }
                                 }
-                                _ => {
+                                UpdateStatus::UpToDate => {
                                     if ui
-                                        .button(format!("🔄 Atualizar (v{})", CURRENT_VERSION))
+                                        .button(format!("✅ v{} (Atualizado)", CURRENT_VERSION))
                                         .on_hover_text(
-                                            "Clique para baixar a versão mais recente direto do GitHub e reiniciar automaticamente",
+                                            "Você já está na versão mais recente! Clique para verificar novamente",
                                         )
                                         .clicked()
                                     {
-                                        download_and_apply_update_async(Arc::clone(
-                                            &self.update_status,
-                                        ));
+                                        check_for_updates_async(Arc::clone(&self.update_status));
+                                    }
+                                }
+                                _ => {
+                                    if ui
+                                        .button(format!("🔍 Verificar (v{})", CURRENT_VERSION))
+                                        .on_hover_text(
+                                            "Verifica no GitHub se há uma versão mais nova disponível",
+                                        )
+                                        .clicked()
+                                    {
+                                        check_for_updates_async(Arc::clone(&self.update_status));
                                     }
                                 }
                             }
+
+                            egui::Frame::none()
+                                .fill(Color32::from_rgba_unmultiplied(35, 165, 90, 42))
+                                .stroke(Stroke::new(1.0_f32, Color32::from_rgb(35, 165, 90)))
+                                .rounding(Rounding::same(6.0))
+                                .inner_margin(egui::Margin::symmetric(8.0, 3.0))
+                                .show(ui, |ui| {
+                                    ui.label(
+                                        RichText::new(format!("⚡ v{} • DXGI GPU", CURRENT_VERSION))
+                                            .size(11.0)
+                                            .strong()
+                                            .color(Color32::from_rgb(134, 239, 172)),
+                                    );
+                                });
 
                             if ui.button("🎨 Conta & Tema").clicked() {
                                 self.show_settings_modal = true;
@@ -4226,9 +4249,16 @@ impl eframe::App for Disc2App {
 }
 
 fn main() -> eframe::Result<()> {
+    unsafe {
+        winapi::um::timeapi::timeBeginPeriod(1);
+    }
+
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_title("SZdisc — Servidores & Screen Share em Rust (1080p 60fps + Áudio)")
+            .with_title(format!(
+                "SZdisc v{} — DXGI GPU Screen Share (Sem VPN)",
+                CURRENT_VERSION
+            ))
             .with_inner_size([1280.0, 760.0])
             .with_min_inner_size([960.0, 560.0]),
         ..Default::default()

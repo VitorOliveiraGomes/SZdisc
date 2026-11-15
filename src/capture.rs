@@ -659,9 +659,6 @@ pub struct FastCapturer {
     dib_ptr: *mut u8,
     dib_w: i32,
     dib_h: i32,
-    x_byte_offsets: Vec<usize>,
-    cached_src_w: i32,
-    cached_out_w: u32,
     dxgi: Option<DxgiDuplicator>,
     dxgi_bgra_buf: Vec<u8>,
     last_sent_at: Instant,
@@ -678,9 +675,6 @@ impl FastCapturer {
             dib_ptr: null_mut(),
             dib_w: 0,
             dib_h: 0,
-            x_byte_offsets: Vec::new(),
-            cached_src_w: 0,
-            cached_out_w: 0,
             dxgi: None,
             dxgi_bgra_buf: Vec::new(),
             last_sent_at: Instant::now() - std::time::Duration::from_secs(2),
@@ -784,7 +778,13 @@ impl FastCapturer {
                         return None;
                     }
                     let mut rect: RECT = zeroed();
-                    if GetWindowRect(hwnd_ptr, &mut rect) == 0 {
+                    let dwm_ok = DwmGetWindowAttribute(
+                        hwnd_ptr,
+                        9, // DWMWA_EXTENDED_FRAME_BOUNDS
+                        &mut rect as *mut _ as *mut _,
+                        size_of::<RECT>() as DWORD,
+                    ) == 0;
+                    if !dwm_ok && GetWindowRect(hwnd_ptr, &mut rect) == 0 {
                         return None;
                     }
                     // Recorta bordas invisíveis do Windows 10/11 (ex: -8px em janelas maximizadas)
@@ -949,67 +949,103 @@ impl FastCapturer {
                     }
                 }
             } else {
-                // Caminho Downscale em 1 passagem com tabela LUT pré-calculada (sem StretchBlt lento na GDI)
-                if self.cached_src_w != src_w || self.cached_out_w != out_w {
-                    self.x_byte_offsets.clear();
-                    self.x_byte_offsets.reserve(out_w as usize);
-                    for dx in 0..(out_w as usize) {
-                        let sx = (dx * (src_w as usize)) / (out_w as usize);
-                        self.x_byte_offsets.push(sx * 4);
-                    }
-                    self.cached_src_w = src_w;
-                    self.cached_out_w = out_w;
-                }
-
+                // Downscale Bilinear 2x2 em inteiros (texto muito mais nítido e JPEG menor!)
                 let src_row_stride = (src_w as usize) * 4;
                 let out_w_usize = out_w as usize;
                 let out_h_usize = out_h as usize;
-                let src_h_usize = src_h as usize;
+                let max_sx = (src_w as usize).saturating_sub(2);
+                let max_sy = (src_h as usize).saturating_sub(2);
+                let scale_x_fp = ((src_w as usize) << 16) / out_w_usize.max(1);
+                let scale_y_fp = ((src_h as usize) << 16) / out_h_usize.max(1);
 
-                if need_rgba_preview {
-                    for dy in 0..out_h_usize {
-                        let sy = (dy * src_h_usize) / out_h_usize;
-                        let src_row =
-                            &bgra_slice[sy * src_row_stride..(sy + 1) * src_row_stride];
-                        let dst_rgb_row =
-                            &mut rgb[dy * out_w_usize * 3..(dy + 1) * out_w_usize * 3];
+                for dy in 0..out_h_usize {
+                    let sy_fp = dy * scale_y_fp;
+                    let sy = (sy_fp >> 16).min(max_sy);
+                    let wy = (sy_fp & 0xFFFF) >> 8; // 0..255
+                    let inv_wy = 256 - wy;
+
+                    let row0 = &bgra_slice[sy * src_row_stride..(sy + 1) * src_row_stride];
+                    let row1 = &bgra_slice[(sy + 1) * src_row_stride..(sy + 2) * src_row_stride];
+                    let dst_rgb_row =
+                        &mut rgb[dy * out_w_usize * 3..(dy + 1) * out_w_usize * 3];
+
+                    if need_rgba_preview {
                         let dst_rgba_row =
                             &mut rgba[dy * out_w_usize * 4..(dy + 1) * out_w_usize * 4];
+                        for dx in 0..out_w_usize {
+                            let sx_fp = dx * scale_x_fp;
+                            let sx = (sx_fp >> 16).min(max_sx);
+                            let wx = (sx_fp & 0xFFFF) >> 8;
+                            let inv_wx = 256 - wx;
 
-                        for ((&x_off, rgb_px), rgba_px) in self
-                            .x_byte_offsets
-                            .iter()
-                            .zip(dst_rgb_row.chunks_exact_mut(3))
-                            .zip(dst_rgba_row.chunks_exact_mut(4))
-                        {
-                            let b = src_row[x_off];
-                            let g = src_row[x_off + 1];
-                            let r = src_row[x_off + 2];
-                            rgb_px[0] = r;
-                            rgb_px[1] = g;
-                            rgb_px[2] = b;
-                            rgba_px[0] = r;
-                            rgba_px[1] = g;
-                            rgba_px[2] = b;
-                            rgba_px[3] = 255;
+                            let i0 = sx * 4;
+                            let i1 = i0 + 4;
+                            let w00 = inv_wx * inv_wy;
+                            let w10 = wx * inv_wy;
+                            let w01 = inv_wx * wy;
+                            let w11 = wx * wy;
+
+                            let b = ((row0[i0] as usize * w00
+                                + row0[i1] as usize * w10
+                                + row1[i0] as usize * w01
+                                + row1[i1] as usize * w11)
+                                >> 16) as u8;
+                            let g = ((row0[i0 + 1] as usize * w00
+                                + row0[i1 + 1] as usize * w10
+                                + row1[i0 + 1] as usize * w01
+                                + row1[i1 + 1] as usize * w11)
+                                >> 16) as u8;
+                            let r = ((row0[i0 + 2] as usize * w00
+                                + row0[i1 + 2] as usize * w10
+                                + row1[i0 + 2] as usize * w01
+                                + row1[i1 + 2] as usize * w11)
+                                >> 16) as u8;
+
+                            let r_off = dx * 3;
+                            dst_rgb_row[r_off] = r;
+                            dst_rgb_row[r_off + 1] = g;
+                            dst_rgb_row[r_off + 2] = b;
+
+                            let a_off = dx * 4;
+                            dst_rgba_row[a_off] = r;
+                            dst_rgba_row[a_off + 1] = g;
+                            dst_rgba_row[a_off + 2] = b;
+                            dst_rgba_row[a_off + 3] = 255;
                         }
-                    }
-                } else {
-                    for dy in 0..out_h_usize {
-                        let sy = (dy * src_h_usize) / out_h_usize;
-                        let src_row =
-                            &bgra_slice[sy * src_row_stride..(sy + 1) * src_row_stride];
-                        let dst_rgb_row =
-                            &mut rgb[dy * out_w_usize * 3..(dy + 1) * out_w_usize * 3];
+                    } else {
+                        for dx in 0..out_w_usize {
+                            let sx_fp = dx * scale_x_fp;
+                            let sx = (sx_fp >> 16).min(max_sx);
+                            let wx = (sx_fp & 0xFFFF) >> 8;
+                            let inv_wx = 256 - wx;
 
-                        for (&x_off, rgb_px) in self
-                            .x_byte_offsets
-                            .iter()
-                            .zip(dst_rgb_row.chunks_exact_mut(3))
-                        {
-                            rgb_px[0] = src_row[x_off + 2];
-                            rgb_px[1] = src_row[x_off + 1];
-                            rgb_px[2] = src_row[x_off];
+                            let i0 = sx * 4;
+                            let i1 = i0 + 4;
+                            let w00 = inv_wx * inv_wy;
+                            let w10 = wx * inv_wy;
+                            let w01 = inv_wx * wy;
+                            let w11 = wx * wy;
+
+                            let b = ((row0[i0] as usize * w00
+                                + row0[i1] as usize * w10
+                                + row1[i0] as usize * w01
+                                + row1[i1] as usize * w11)
+                                >> 16) as u8;
+                            let g = ((row0[i0 + 1] as usize * w00
+                                + row0[i1 + 1] as usize * w10
+                                + row1[i0 + 1] as usize * w01
+                                + row1[i1 + 1] as usize * w11)
+                                >> 16) as u8;
+                            let r = ((row0[i0 + 2] as usize * w00
+                                + row0[i1 + 2] as usize * w10
+                                + row1[i0 + 2] as usize * w01
+                                + row1[i1 + 2] as usize * w11)
+                                >> 16) as u8;
+
+                            let r_off = dx * 3;
+                            dst_rgb_row[r_off] = r;
+                            dst_rgb_row[r_off + 1] = g;
+                            dst_rgb_row[r_off + 2] = b;
                         }
                     }
                 }
