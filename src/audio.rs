@@ -618,7 +618,9 @@ mod platform {
     use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 
     pub const AUDIO_SAMPLE_RATE: u32 = 24000;
+    #[allow(dead_code)]
     pub const AUDIO_CHANNELS: u16 = 2;
+    #[allow(dead_code)]
     pub const AUDIO_BITS_PER_SAMPLE: u16 = 16;
 
     pub fn spawn_system_audio_loopback<F>(
