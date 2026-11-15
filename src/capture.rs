@@ -1398,11 +1398,12 @@ mod platform {
         },
     }
 
-    #[derive(Clone, Debug)]
+    #[derive(Clone, Debug, PartialEq)]
     pub struct CaptureSource {
         pub id: String,
         pub name: String,
         pub subtitle: String,
+        pub exe_name: String,
         pub pid: u32,
         pub category: SourceCategory,
         pub kind: CaptureSourceKind,
@@ -1425,6 +1426,7 @@ mod platform {
                     id: format!("mon_{}", idx),
                     name: format!("Tela {} ({}x{})", idx + 1, w, h),
                     subtitle: m.name().to_string(),
+                    exe_name: "Monitor".to_string(),
                     pid: 0,
                     category: SourceCategory::Screen,
                     kind: CaptureSourceKind::Monitor {
@@ -1461,8 +1463,9 @@ mod platform {
                 sources.push(CaptureSource {
                     id: format!("win_{}", w.id()),
                     name: title,
-                    subtitle: app,
-                    pid: 0,
+                    subtitle: app.clone(),
+                    exe_name: app,
+                    pid: w.process_id(),
                     category,
                     kind: CaptureSourceKind::Window {
                         hwnd: w.id() as usize,
