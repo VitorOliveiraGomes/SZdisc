@@ -806,14 +806,6 @@ fn parse_rgb(s: &str) -> Option<[u8; 3]> {
     }
 }
 
-#[cfg(not(windows))]
-pub fn pick_image_file_dialog() -> Option<String> {
-    rfd::FileDialog::new()
-        .add_filter("Imagens", &["png", "jpg", "jpeg", "bmp"])
-        .pick_file()
-        .map(|p| p.to_string_lossy().to_string())
-}
-
 pub fn draw_discord_avatar(
     ui: &mut Ui,
     size: f32,

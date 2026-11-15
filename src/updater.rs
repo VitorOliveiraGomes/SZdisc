@@ -109,17 +109,14 @@ fn fetch_https_bytes_wininet(url: &str, max_bytes: usize) -> Option<Vec<u8>> {
 
 #[cfg(not(windows))]
 fn fetch_https_bytes_wininet(url: &str, max_bytes: usize) -> Option<Vec<u8>> {
-    use std::io::Read;
-    let resp = ureq::get(url).call().ok()?;
-    let mut out = Vec::new();
-    resp.into_reader()
-        .take(max_bytes as u64)
-        .read_to_end(&mut out)
+    let out = Command::new("curl")
+        .args(["-fsSL", "--max-time", "20", url])
+        .output()
         .ok()?;
-    if out.is_empty() {
+    if !out.status.success() || out.stdout.is_empty() || out.stdout.len() > max_bytes {
         None
     } else {
-        Some(out)
+        Some(out.stdout)
     }
 }
 
