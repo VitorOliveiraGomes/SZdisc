@@ -2,6 +2,7 @@ import type { WsStreamStats } from '@/models/types'
 
 interface TileCanvasPipeline {
   canvas: HTMLCanvasElement
+  ctx: CanvasRenderingContext2D | null
   busy: boolean
   latestBuffer: ArrayBuffer | null
   framesInWindow: number
@@ -9,6 +10,11 @@ interface TileCanvasPipeline {
 }
 
 const BRIDGE_WS_URL = 'ws://127.0.0.1:47839/ws'
+
+/** Contexto 2D opaco e de baixa latência (sem composição alpha, sem sincronizar com o DOM). */
+function acquireContext(canvas: HTMLCanvasElement): CanvasRenderingContext2D | null {
+  return canvas.getContext('2d', { alpha: false, desynchronized: true })
+}
 
 /**
  * Cliente WebSocket binário com trava anti-backpressure por `tileId`.
@@ -37,12 +43,22 @@ class VideoStreamClient {
     this.statsTimer = window.setInterval(() => {
       const fpsByTile: Record<number, number> = {}
       const kbpsByTile: Record<number, number> = {}
+      let changed = false
       for (const [tid, pipe] of this.pipelines.entries()) {
         fpsByTile[tid] = pipe.framesInWindow
         kbpsByTile[tid] = Math.round((pipe.bytesInWindow * 8) / 1000)
+        if (
+          this.stats.fpsByTile[tid] !== fpsByTile[tid] ||
+          this.stats.kbpsByTile[tid] !== kbpsByTile[tid]
+        ) {
+          changed = true
+        }
         pipe.framesInWindow = 0
         pipe.bytesInWindow = 0
       }
+      if (Object.keys(this.stats.fpsByTile).length !== this.pipelines.size) changed = true
+      // Evita re-render do App a cada segundo quando nada mudou (ex.: sala ociosa)
+      if (!changed) return
       this.stats = {
         ...this.stats,
         fpsByTile,
@@ -75,11 +91,15 @@ class VideoStreamClient {
     }
     const existing = this.pipelines.get(tileId)
     if (existing) {
-      existing.canvas = canvas
+      if (existing.canvas !== canvas) {
+        existing.canvas = canvas
+        existing.ctx = acquireContext(canvas)
+      }
       return
     }
     this.pipelines.set(tileId, {
       canvas,
+      ctx: acquireContext(canvas),
       busy: false,
       latestBuffer: null,
       framesInWindow: 0,
@@ -168,20 +188,20 @@ class VideoStreamClient {
         const width = view.getUint16(4, true)
         const height = view.getUint16(6, true)
 
-        const blob = new Blob([buffer.slice(8)], { type: 'image/jpeg' })
-        const bitmap = await createImageBitmap(blob)
-        if (pipe.canvas.width !== width || pipe.canvas.height !== height) {
-          pipe.canvas.width = width
-          pipe.canvas.height = height
+        try {
+          // View sobre o ArrayBuffer (sem a cópia intermediária de `buffer.slice(8)`)
+          const blob = new Blob([new Uint8Array(buffer, 8)], { type: 'image/jpeg' })
+          const bitmap = await createImageBitmap(blob)
+          if (pipe.canvas.width !== width || pipe.canvas.height !== height) {
+            pipe.canvas.width = width
+            pipe.canvas.height = height
+          }
+          pipe.ctx?.drawImage(bitmap, 0, 0, pipe.canvas.width, pipe.canvas.height)
+          bitmap.close()
+        } catch {
+          // Quadro corrompido: descarta só este e segue drenando os próximos
         }
-        const ctx2d = pipe.canvas.getContext('2d')
-        if (ctx2d) {
-          ctx2d.drawImage(bitmap, 0, 0, pipe.canvas.width, pipe.canvas.height)
-        }
-        bitmap.close()
       }
-    } catch {
-      // Ignora quadro corrompido ou canvas desmontado
     } finally {
       pipe.busy = false
     }

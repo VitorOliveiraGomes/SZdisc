@@ -188,9 +188,9 @@ fn classify_window(
     let browser_suffixes = [
         (" - Google Chrome", "Google Chrome"),
         (" — Mozilla Firefox", "Mozilla Firefox"),
-        (" - Microsoft​ Edge", "Microsoft Edge"),
+        (" - Microsoft\u{200B} Edge", "Microsoft Edge"),
         (" - Microsoft Edge", "Microsoft Edge"),
-        (" - Pessoal — Microsoft​ Edge", "Microsoft Edge"),
+        (" - Pessoal — Microsoft\u{200B} Edge", "Microsoft Edge"),
         (" - Brave", "Brave"),
         (" - Opera", "Opera"),
         (" - Opera GX", "Opera GX"),
@@ -663,6 +663,8 @@ pub struct FastCapturer {
     dib_h: i32,
     dxgi: Option<DxgiDuplicator>,
     dxgi_bgra_buf: Vec<u8>,
+    /// Buffer RGB reaproveitado entre frames (devolvido pelo encoder via `recycle_rgb`).
+    spare_rgb: Vec<u8>,
     last_sent_at: Instant,
 }
 
@@ -679,7 +681,15 @@ impl FastCapturer {
             dib_h: 0,
             dxgi: None,
             dxgi_bgra_buf: Vec::new(),
+            spare_rgb: Vec::new(),
             last_sent_at: Instant::now() - std::time::Duration::from_secs(2),
+        }
+    }
+
+    /// Devolve um buffer RGB já usado para ser reaproveitado no próximo frame (zero alocação).
+    pub fn recycle_rgb(&mut self, buf: Vec<u8>) {
+        if buf.capacity() > self.spare_rgb.capacity() {
+            self.spare_rgb = buf;
         }
     }
 
@@ -915,7 +925,12 @@ impl FastCapturer {
             };
 
             let out_pixels = (out_w * out_h) as usize;
-            let mut rgb = vec![0u8; out_pixels * 3];
+            // Reaproveita o buffer devolvido pelo encoder: todos os bytes são sobrescritos abaixo,
+            // então só redimensiona quando o tamanho de saída muda.
+            let mut rgb = std::mem::take(&mut self.spare_rgb);
+            if rgb.len() != out_pixels * 3 {
+                rgb.resize(out_pixels * 3, 0);
+            }
             let mut rgba = if need_rgba_preview {
                 vec![0u8; out_pixels * 4]
             } else {
@@ -1513,6 +1528,8 @@ mod platform {
         pub fn new() -> Self {
             Self
         }
+
+        pub fn recycle_rgb(&mut self, _buf: Vec<u8>) {}
 
         pub fn capture_live_frame(
             &mut self,

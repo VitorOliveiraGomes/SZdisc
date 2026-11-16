@@ -370,6 +370,12 @@ fn parse_json(s: &str) -> Result<JsonVal, String> {
 fn json_str(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 2);
     out.push('"');
+    // Caminho rápido: strings sem caracteres a escapar (ex.: data URLs base64 de avatar/banner)
+    if !s.bytes().any(|b| b == b'"' || b == b'\\' || b < 0x20) {
+        out.push_str(s);
+        out.push('"');
+        return out;
+    }
     for ch in s.chars() {
         match ch {
             '"' => out.push_str("\\\""),
@@ -397,7 +403,7 @@ fn json_rgb(rgb: [u8; 3]) -> String {
 
 struct WsClientSlot {
     filter_tile_id: Option<u32>,
-    slots: Mutex<HashMap<u32, Vec<u8>>>,
+    slots: Mutex<HashMap<u32, Arc<Vec<u8>>>>,
     wakeup: Condvar,
     alive: AtomicBool,
 }
@@ -412,14 +418,14 @@ impl WsClientSlot {
         })
     }
 
-    fn push_packet(&self, tile_id: u32, packet: &[u8]) {
+    fn push_packet(&self, tile_id: u32, packet: &Arc<Vec<u8>>) {
         if let Some(filter) = self.filter_tile_id {
             if filter != tile_id {
                 return;
             }
         }
         if let Ok(mut guard) = self.slots.lock() {
-            guard.insert(tile_id, packet.to_vec());
+            guard.insert(tile_id, Arc::clone(packet));
             self.wakeup.notify_one();
         }
     }
@@ -457,11 +463,16 @@ pub fn publish_video_frame(tile_id: u32, width: u16, height: u16, jpeg_bytes: &[
         return;
     }
 
-    let mut packet = Vec::with_capacity(8 + jpeg_bytes.len());
+    // Frame WebSocket completo (cabeçalho WS + cabeçalho do tile + JPEG) montado UMA vez
+    // e compartilhado via Arc entre todos os clientes: zero cópias por cliente, 1 write por envio.
+    let payload_len = 8 + jpeg_bytes.len();
+    let mut packet = Vec::with_capacity(10 + payload_len);
+    push_ws_binary_header(&mut packet, payload_len);
     packet.extend_from_slice(&tile_id.to_le_bytes());
     packet.extend_from_slice(&width.to_le_bytes());
     packet.extend_from_slice(&height.to_le_bytes());
     packet.extend_from_slice(jpeg_bytes);
+    let packet = Arc::new(packet);
 
     if let Ok(mut clients) = b.clients.lock() {
         clients.retain(|c| c.alive.load(Ordering::Relaxed));
@@ -472,27 +483,18 @@ pub fn publish_video_frame(tile_id: u32, width: u16, height: u16, jpeg_bytes: &[
     }
 }
 
-fn write_ws_binary_frame(stream: &mut TcpStream, payload: &[u8]) -> std::io::Result<()> {
-    let len = payload.len();
-    let mut header = [0u8; 10];
-    let header_len = if len < 126 {
-        header[0] = 0x82;
-        header[1] = len as u8;
-        2
+/// Escreve o cabeçalho de um frame WebSocket binário (FIN + opcode 0x2, sem máscara).
+fn push_ws_binary_header(out: &mut Vec<u8>, len: usize) {
+    out.push(0x82);
+    if len < 126 {
+        out.push(len as u8);
     } else if len <= 65535 {
-        header[0] = 0x82;
-        header[1] = 126;
-        header[2..4].copy_from_slice(&(len as u16).to_be_bytes());
-        4
+        out.push(126);
+        out.extend_from_slice(&(len as u16).to_be_bytes());
     } else {
-        header[0] = 0x82;
-        header[1] = 127;
-        header[2..10].copy_from_slice(&(len as u64).to_be_bytes());
-        10
-    };
-    stream.write_all(&header[..header_len])?;
-    stream.write_all(payload)?;
-    Ok(())
+        out.push(127);
+        out.extend_from_slice(&(len as u64).to_be_bytes());
+    }
 }
 
 fn serve_websocket_client(mut stream: TcpStream, key: &str, filter_tile_id: Option<u32>) {
@@ -541,7 +543,7 @@ fn serve_websocket_client(mut stream: TcpStream, key: &str, filter_tile_id: Opti
     }
 
     while slot.alive.load(Ordering::Relaxed) {
-        let pending: Vec<Vec<u8>> = {
+        let pending: Vec<Arc<Vec<u8>>> = {
             let mut guard = match slot.slots.lock() {
                 Ok(g) => g,
                 Err(_) => break,
@@ -556,7 +558,7 @@ fn serve_websocket_client(mut stream: TcpStream, key: &str, filter_tile_id: Opti
         };
 
         for pkt in pending {
-            if write_ws_binary_frame(&mut stream, &pkt).is_err() {
+            if stream.write_all(&pkt).is_err() {
                 slot.alive.store(false, Ordering::Relaxed);
                 break;
             }
@@ -869,22 +871,14 @@ fn capture_sources_json() -> String {
 fn capture_thumbnails_json() -> String {
     let sources = list_capture_sources();
     let mut entries = Vec::new();
-    let mut rgb_buf = Vec::new();
     let mut jpeg_buf = Vec::new();
 
     for src in &sources {
         if let Some((w, h, rgba)) = capture_thumbnail_rgba(src, 272, 153) {
-            rgb_buf.clear();
-            rgb_buf.reserve((w * h * 3) as usize);
-            for px in rgba.chunks_exact(4) {
-                rgb_buf.push(px[0]);
-                rgb_buf.push(px[1]);
-                rgb_buf.push(px[2]);
-            }
             jpeg_buf.clear();
             let mut enc = Encoder::new(&mut jpeg_buf, 70);
             enc.set_sampling_factor(SamplingFactor::F_2_2);
-            if enc.encode(&rgb_buf, w as u16, h as u16, ColorType::Rgb).is_ok() {
+            if enc.encode(&rgba, w as u16, h as u16, ColorType::Rgba).is_ok() {
                 let data_url = format!("data:image/jpeg;base64,{}", base64_encode(&jpeg_buf));
                 entries.push(format!("{}:{}", json_str(&src.id), json_str(&data_url)));
             }
@@ -1440,15 +1434,16 @@ impl AppCore {
         let peers_json: Vec<String> = self
             .room_hub
             .as_ref()
-            .and_then(|h| h.peers.lock().ok())
-            .map(|map| {
+            .and_then(|h| h.peers.lock().ok().map(|map| (h, map)))
+            .map(|(h, map)| {
+                // Trava `remote_streams` uma única vez (antes: uma vez por peer).
+                // Ordem mantida: `peers` -> `remote_streams`, igual ao restante do código.
+                let streams_guard = h.remote_streams.lock().ok();
                 map.values()
                     .map(|p| {
-                        let (vol, muted, vw, vh, fps, mbps) = self
-                            .room_hub
+                        let (vol, muted, vw, vh, fps, mbps) = streams_guard
                             .as_ref()
-                            .and_then(|h| {
-                                h.remote_streams.lock().ok().and_then(|sm| {
+                            .and_then(|sm| {
                                     sm.get(&p.peer_id).map(|s| {
                                         (
                                             s.volume_percent.load(Ordering::Relaxed),
@@ -1460,7 +1455,6 @@ impl AppCore {
                                                 / 100.0,
                                         )
                                     })
-                                })
                             })
                             .unwrap_or((100, false, 0, 0, 0, 0.0));
                         format!(

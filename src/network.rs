@@ -1477,7 +1477,6 @@ impl RoomHub {
                         slot_writer.alive.store(false, Ordering::Relaxed);
                         return;
                     }
-                    let _ = write_stream.flush();
                 }
             }
         });

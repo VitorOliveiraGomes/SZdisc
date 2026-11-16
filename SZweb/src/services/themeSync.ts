@@ -13,7 +13,23 @@ export function rgbShift(rgb: RgbTuple, delta: number): string {
  * Converte as cores RGB e geometria do `UserCustomizationDto` (Rust)
  * diretamente para variáveis CSS do `shadcn/ui` em tempo real.
  */
+let lastThemeKey = ''
+
 export function applyCustomizationToCssVars(custom: UserCustomizationDto): void {
+  // Chamado a cada poll (500 ms): só reescreve as variáveis CSS (recalc de estilo do
+  // documento inteiro) quando algum valor de tema realmente mudou.
+  const themeKey = [
+    custom.accentRgb,
+    custom.bgSidebarRgb,
+    custom.bgStageRgb,
+    custom.bgCardRgb,
+    custom.textRgb,
+    custom.cornerRadius,
+    custom.borderStrokeWidth,
+  ].join('|')
+  if (themeKey === lastThemeKey) return
+  lastThemeKey = themeKey
+
   const root = document.documentElement
   const accent = rgbToCss(custom.accentRgb)
   const sidebar = rgbToCss(custom.bgSidebarRgb)

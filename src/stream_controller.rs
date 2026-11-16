@@ -1,5 +1,5 @@
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, Ordering};
-use std::sync::mpsc::sync_channel;
+use std::sync::mpsc::{sync_channel, TrySendError};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -186,6 +186,8 @@ impl AppCore {
 
         // Canal de 1 slot (Zero-Lag) entre Captura DXGI/GDI e Codificação JPEG + WebSocket
         let (encode_tx, encode_rx) = sync_channel::<(u32, u32, u8, u8, bool, bool, Vec<u8>)>(1);
+        // Canal de retorno: o encoder devolve o buffer RGB para a captura reaproveitar (zero alocação/frame)
+        let (recycle_tx, recycle_rx) = sync_channel::<Vec<u8>>(2);
 
         let cfg = Arc::clone(&self.stream_config);
         let bytes_per_sec = Arc::clone(&hub.bytes_sent_per_sec);
@@ -244,6 +246,7 @@ impl AppCore {
                                 );
                             }
                         }
+                        let _ = recycle_tx.try_send(rgb);
                     }
                     Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
                     Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
@@ -276,15 +279,19 @@ impl AppCore {
                 let has_peers = hub.has_connected_peers();
                 let has_ws = crate::bridge::has_ws_video_clients();
 
-                let app_focused = is_szdisc_in_foreground();
+                // Curto-circuito: só consulta a janela em foco (syscall) quando o resultado importa
                 let need_local_preview = has_ws
                     && !hide_preview
-                    && (!auto_eco || app_focused)
-                    && last_preview_sent.elapsed() >= Duration::from_millis(16);
+                    && last_preview_sent.elapsed() >= Duration::from_millis(16)
+                    && (!auto_eco || is_szdisc_in_foreground());
 
                 if !need_local_preview && !has_peers {
                     thread::sleep(Duration::from_millis(60));
                     continue;
+                }
+
+                while let Ok(buf) = recycle_rx.try_recv() {
+                    fast_capturer.recycle_rgb(buf);
                 }
 
                 let source_opt = cfg.active_source.lock().ok().and_then(|g| g.clone());
@@ -300,18 +307,19 @@ impl AppCore {
                             last_preview_sent = Instant::now();
                         }
 
-                        if has_peers || need_local_preview {
-                            let _ = encode_tx.try_send((
-                                raw.width,
-                                raw.height,
-                                fps,
-                                quality,
-                                has_peers,
-                                need_local_preview,
-                                raw.rgb,
-                            ));
-                        } else {
-                            cfg.encoded_frames_counter.fetch_add(1, Ordering::Relaxed);
+                        match encode_tx.try_send((
+                            raw.width,
+                            raw.height,
+                            fps,
+                            quality,
+                            has_peers,
+                            need_local_preview,
+                            raw.rgb,
+                        )) {
+                            Ok(()) => {}
+                            // Encoder ocupado: descarta o frame mas devolve o buffer ao pool
+                            Err(TrySendError::Full(frame)) => fast_capturer.recycle_rgb(frame.6),
+                            Err(TrySendError::Disconnected(_)) => break,
                         }
                     }
                 }

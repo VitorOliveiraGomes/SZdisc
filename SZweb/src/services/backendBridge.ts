@@ -109,6 +109,8 @@ export function createInitialMockSnapshot(): AppSnapshotDto {
 class BackendBridge {
   private mode: BridgeConnectionMode = 'mock'
   private mockState: AppSnapshotDto = createInitialMockSnapshot()
+  /** Último corpo bruto de /api/state, para deduplicar snapshots idênticos sem re-render. */
+  private lastStateText = ''
   private logs: RpcLogEntry[] = []
   private nextLogId = 1
   private logListeners = new Set<(logs: RpcLogEntry[], mode: BridgeConnectionMode) => void>()
@@ -145,11 +147,16 @@ class BackendBridge {
         signal: AbortSignal.timeout(800),
       })
       if (!res.ok) throw new Error(`HTTP ${res.status}`)
-      const data = (await res.json()) as AppSnapshotDto
+      const text = await res.text()
       this.mode = 'rust'
+      // Snapshot idêntico ao anterior: devolve o MESMO objeto para o React descartar o re-render
+      if (text === this.lastStateText) return this.mockState
+      const data = JSON.parse(text) as AppSnapshotDto
+      this.lastStateText = text
       this.mockState = data
       return data
     } catch {
+      this.lastStateText = ''
       if (this.mode !== 'mock') {
         this.mode = 'mock'
         this.pushLog({
@@ -413,6 +420,7 @@ class BackendBridge {
         break
     }
     this.mockState = s
+    this.lastStateText = ''
     return s
   }
 }
