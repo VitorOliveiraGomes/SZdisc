@@ -214,7 +214,7 @@ impl Disc2App {
         self.local_preview_rx = Some(preview_rx);
 
         // Canal de 1 slot (Zero-Lag) entre a Thread de Captura (DWM BitBlt) e a Thread de Codificação JPEG!
-        let (encode_tx, encode_rx) = sync_channel::<(u32, u32, u8, u8, Vec<u8>)>(1);
+        let (encode_tx, encode_rx) = sync_channel::<(u32, u32, u8, u8, bool, Vec<u8>)>(1);
 
         let cfg = Arc::clone(&self.stream_config);
         let bytes_per_sec = Arc::clone(&hub.bytes_sent_per_sec);
@@ -231,7 +231,7 @@ impl Disc2App {
 
             while !stop_for_encoder.load(Ordering::Relaxed) {
                 match encode_rx.recv_timeout(Duration::from_millis(60)) {
-                    Ok((width, height, fps, base_quality, rgb)) => {
+                    Ok((width, height, fps, base_quality, send_to_peers, rgb)) => {
                         let eff_quality =
                             ((base_quality as i16) - adaptive_penalty).clamp(40, 92) as u8;
                         jpeg_buf.clear();
@@ -252,12 +252,20 @@ impl Disc2App {
 
                             sec_bytes = sec_bytes.saturating_add(frame_bytes as u32);
                             encoded_counter.fetch_add(1, Ordering::Relaxed);
-                            hub_for_encoder.broadcast_my_video(
+                            crate::bridge::publish_video_frame(
+                                LOCAL_PREVIEW_TILE_ID,
                                 width as u16,
                                 height as u16,
-                                fps,
                                 &jpeg_buf,
                             );
+                            if send_to_peers {
+                                hub_for_encoder.broadcast_my_video(
+                                    width as u16,
+                                    height as u16,
+                                    fps,
+                                    &jpeg_buf,
+                                );
+                            }
                         }
                     }
                     Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
@@ -289,6 +297,7 @@ impl Disc2App {
                 let auto_eco = cfg.auto_game_eco.load(Ordering::Relaxed);
                 let draw_cursor = cfg.draw_cursor.load(Ordering::Relaxed);
                 let has_peers = hub.has_connected_peers();
+                let has_ws = crate::bridge::has_ws_video_clients();
 
                 // Quando você está focado dentro do jogo (SZdisc em 2º plano), pausa automaticamente
                 // a prévia local para usar 0% de GPU/OpenGL extra e mandar 100% do FPS para seus amigos!
@@ -297,7 +306,7 @@ impl Disc2App {
                     && (!auto_eco || app_focused)
                     && last_preview_sent.elapsed() >= Duration::from_millis(33);
 
-                if !need_local_preview && !has_peers {
+                if !need_local_preview && !has_peers && !has_ws {
                     thread::sleep(Duration::from_millis(60));
                     continue;
                 }
@@ -321,12 +330,13 @@ impl Disc2App {
                             ctx.request_repaint();
                         }
 
-                        if has_peers {
+                        if has_peers || has_ws {
                             let _ = encode_tx.try_send((
                                 raw.width,
                                 raw.height,
                                 fps,
                                 quality,
+                                has_peers,
                                 raw.rgb,
                             ));
                         } else {

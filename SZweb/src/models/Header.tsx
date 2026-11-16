@@ -1,7 +1,1 @@
-export const Header = () => {
-    return (
-        <div className="header">
-            
-        </div>
-    )
-}
+export { Header } from '@/components/Header'

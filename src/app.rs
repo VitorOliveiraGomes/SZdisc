@@ -6,6 +6,7 @@ use std::time::Instant;
 
 use eframe::egui::{self, ColorImage, Context, TextureHandle, TextureOptions};
 
+use crate::bridge::BridgeServer;
 use crate::capture::{get_process_ram_mb, list_capture_sources, CaptureSource, SourceCategory};
 use crate::network::{derive_persistent_peer_id, RoomHub};
 use crate::profile_theme::UserCustomization;
@@ -81,6 +82,9 @@ pub struct Disc2App {
 
     // Auto-Updater pelo GitHub
     pub(crate) update_status: Arc<Mutex<UpdateStatus>>,
+
+    // Ponte HTTP RPC + WebSocket local para o SZweb
+    pub(crate) bridge: Arc<BridgeServer>,
 }
 
 impl Disc2App {
@@ -143,6 +147,8 @@ impl Disc2App {
             active_source: Mutex::new(sources.first().cloned()),
         });
 
+        let bridge = BridgeServer::start(cc.egui_ctx.clone());
+
         Self {
             custom,
             user_avatar_tex,
@@ -190,6 +196,7 @@ impl Disc2App {
             last_metrics_tick: Instant::now(),
             status_toast: None,
             update_status,
+            bridge,
         }
     }
 
@@ -200,6 +207,8 @@ impl Disc2App {
 
 impl eframe::App for Disc2App {
     fn update(&mut self, ctx: &Context, _frame: &mut eframe::Frame) {
+        self.poll_bridge_and_sync_snapshot(ctx);
+
         if !self.custom.account_created {
             ui::modals::render_account_onboarding(self, ctx);
             return;

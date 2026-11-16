@@ -62,6 +62,7 @@ struct RawCompressedVideo {
 /// Possui uma thread decodificadora dedicada (Zero-Backpressure) para que a leitura do socket TCP
 /// nunca trave esperando decodificação JPEG e sempre processe o quadro mais recente em tempo real!
 pub struct RemotePeerStream {
+    pub peer_id: u32,
     pub latest_frame: Mutex<Option<DecodedRemoteFrame>>,
     raw_video_slot: Mutex<Option<RawCompressedVideo>>,
     raw_video_wakeup: Condvar,
@@ -72,12 +73,13 @@ pub struct RemotePeerStream {
 }
 
 impl RemotePeerStream {
-    fn new(ctx: Context) -> Arc<Self> {
+    fn new(peer_id: u32, ctx: Context) -> Arc<Self> {
         let volume_percent = Arc::new(AtomicU32::new(100));
         let muted = Arc::new(AtomicBool::new(false));
         let audio_player =
             StreamAudioPlayer::start(Arc::clone(&volume_percent), Arc::clone(&muted));
         let stream = Arc::new(Self {
+            peer_id,
             latest_frame: Mutex::new(None),
             raw_video_slot: Mutex::new(None),
             raw_video_wakeup: Condvar::new(),
@@ -135,6 +137,7 @@ impl RemotePeerStream {
     }
 
     fn push_compressed_video(&self, width: u32, height: u32, jpeg_bytes: Vec<u8>) {
+        crate::bridge::publish_video_frame(self.peer_id, width as u16, height as u16, &jpeg_bytes);
         if let Ok(mut slot) = self.raw_video_slot.lock() {
             *slot = Some(RawCompressedVideo {
                 width,
@@ -1790,7 +1793,7 @@ impl RoomHub {
                             Arc::clone(
                                 streams
                                     .entry(sender_id)
-                                    .or_insert_with(|| RemotePeerStream::new(ctx_clone)),
+                                    .or_insert_with(|| RemotePeerStream::new(sender_id, ctx_clone)),
                             )
                         };
 
@@ -1803,7 +1806,7 @@ impl RoomHub {
                         Arc::clone(
                             streams
                                 .entry(sender_id)
-                                .or_insert_with(|| RemotePeerStream::new(ctx_clone)),
+                                .or_insert_with(|| RemotePeerStream::new(sender_id, ctx_clone)),
                         )
                     };
                     let _ = stream_arc.audio_player.clone_sender().try_send(payload);

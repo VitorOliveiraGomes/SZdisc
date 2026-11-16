@@ -2,6 +2,7 @@
 
 mod app;
 mod audio;
+mod bridge;
 mod capture;
 mod network;
 mod profile_theme;
