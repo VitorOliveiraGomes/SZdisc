@@ -4,16 +4,44 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use eframe::egui::{self, ColorImage, Context, TextureOptions};
 use jpeg_encoder::{ColorType, Encoder, SamplingFactor};
 
-use crate::app::Disc2App;
+use crate::app::AppCore;
 use crate::audio::spawn_system_audio_loopback;
-use crate::capture::{
-    capture_thumbnail_rgba, is_szdisc_in_foreground, list_capture_sources, CaptureSource,
-    FastCapturer, SourceCategory,
-};
-use crate::ui::state::LOCAL_PREVIEW_TILE_ID;
+use crate::capture::{is_szdisc_in_foreground, list_capture_sources, CaptureSource, FastCapturer};
+
+pub const LOCAL_PREVIEW_TILE_ID: u32 = 0;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum ResolutionPreset {
+    P1080,
+    P900,
+    P720,
+    P480,
+    P360,
+}
+
+impl ResolutionPreset {
+    pub fn dimensions(self) -> (u32, u32) {
+        match self {
+            Self::P1080 => (1920, 1080),
+            Self::P900 => (1600, 900),
+            Self::P720 => (1280, 720),
+            Self::P480 => (854, 480),
+            Self::P360 => (640, 360),
+        }
+    }
+
+    pub fn short_label(self) -> &'static str {
+        match self {
+            Self::P1080 => "1080p",
+            Self::P900 => "900p",
+            Self::P720 => "720p",
+            Self::P480 => "480p",
+            Self::P360 => "360p",
+        }
+    }
+}
 
 pub struct LiveStreamConfig {
     pub target_w: AtomicU32,
@@ -26,63 +54,12 @@ pub struct LiveStreamConfig {
     pub share_system_audio: Arc<AtomicBool>,
     pub target_audio_pid: Arc<AtomicU32>,
     pub encoded_frames_counter: Arc<AtomicU32>,
+    pub local_video_w: Arc<AtomicU32>,
+    pub local_video_h: Arc<AtomicU32>,
     pub active_source: Mutex<Option<CaptureSource>>,
 }
 
-pub struct LocalPreviewFrame {
-    pub width: u32,
-    pub height: u32,
-    pub rgba: Vec<u8>,
-}
-
-impl Disc2App {
-    pub(crate) fn set_main_fullscreen(&mut self, ctx: &Context, target: Option<u32>) {
-        self.fullscreen_tile_id = target;
-        ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(target.is_some()));
-    }
-
-    pub(crate) fn open_share_picker(&mut self, ctx: &Context) {
-        self.refresh_sources_and_thumbnails(ctx);
-        if !self.sources.iter().any(|s| s.category == self.share_tab) {
-            self.share_tab = SourceCategory::Screen;
-        }
-        self.show_share_modal = true;
-    }
-
-    pub(crate) fn refresh_sources_and_thumbnails(&mut self, ctx: &Context) {
-        let prev_id = self.sources.get(self.selected_source_idx).map(|s| s.id.clone());
-        self.sources = list_capture_sources();
-        self.source_thumbnails.clear();
-
-        for src in &self.sources {
-            if let Some((w, h, rgba)) = capture_thumbnail_rgba(src, 272, 153) {
-                let img = ColorImage::from_rgba_unmultiplied([w as usize, h as usize], &rgba);
-                let tex =
-                    ctx.load_texture(format!("thumb_{}", src.id), img, TextureOptions::LINEAR);
-                self.source_thumbnails.insert(src.id.clone(), tex);
-            }
-        }
-
-        if let Some(id) = prev_id {
-            if let Some(pos) = self.sources.iter().position(|s| s.id == id) {
-                self.selected_source_idx = pos;
-                return;
-            }
-        }
-        if let Some(pos) = self.sources.iter().position(|s| s.category == self.share_tab) {
-            self.selected_source_idx = pos;
-        } else {
-            self.selected_source_idx = 0;
-        }
-    }
-
-    pub(crate) fn select_first_in_category(&mut self, cat: SourceCategory) {
-        self.share_tab = cat;
-        if let Some(pos) = self.sources.iter().position(|s| s.category == cat) {
-            self.selected_source_idx = pos;
-        }
-    }
-
+impl AppCore {
     pub(crate) fn current_res_status_label(&self) -> String {
         if self.is_sharing {
             let audio_tag = if self.share_audio_enabled { " 🔊" } else { "" };
@@ -141,9 +118,9 @@ impl Disc2App {
     }
 
     /// Inicia ou troca a janela transmitida SEM sair da sala!
-    pub(crate) fn start_or_switch_sharing(&mut self, ctx: Context) {
+    pub(crate) fn start_or_switch_sharing(&mut self) {
         if self.sources.is_empty() {
-            self.refresh_sources_and_thumbnails(&ctx);
+            self.sources = list_capture_sources();
         }
         if self.sources.is_empty() {
             self.show_toast("Nenhuma tela ou janela encontrada para capturar.");
@@ -170,8 +147,6 @@ impl Disc2App {
                         .unwrap_or_else(|| "Sala Geral".to_string());
                     hub.enter_server_room(&srv.server_id, &target_room);
                 } else {
-                    self.show_share_modal = false;
-                    self.show_server_modal = true;
                     self.show_toast("Crie ou entre em um Servidor primeiro para transmitir!");
                     return;
                 }
@@ -181,7 +156,6 @@ impl Disc2App {
         // Se já estamos transmitindo, apenas troca a janela/aplicativo em tempo real na MESMA sala!
         if self.is_sharing && self.capture_stop_flag.is_some() {
             self.sync_live_config();
-            self.show_share_modal = false;
             let src_name = self
                 .sources
                 .get(self.selected_source_idx)
@@ -210,19 +184,18 @@ impl Disc2App {
             hub_for_audio.broadcast_my_audio(pcm_bytes);
         });
 
-        let (preview_tx, preview_rx) = sync_channel::<LocalPreviewFrame>(1);
-        self.local_preview_rx = Some(preview_rx);
-
-        // Canal de 1 slot (Zero-Lag) entre a Thread de Captura (DWM BitBlt) e a Thread de Codificação JPEG!
-        let (encode_tx, encode_rx) = sync_channel::<(u32, u32, u8, u8, bool, Vec<u8>)>(1);
+        // Canal de 1 slot (Zero-Lag) entre Captura DXGI/GDI e Codificação JPEG + WebSocket
+        let (encode_tx, encode_rx) = sync_channel::<(u32, u32, u8, u8, bool, bool, Vec<u8>)>(1);
 
         let cfg = Arc::clone(&self.stream_config);
         let bytes_per_sec = Arc::clone(&hub.bytes_sent_per_sec);
         let encoded_counter = Arc::clone(&self.stream_config.encoded_frames_counter);
+        let video_w_atomic = Arc::clone(&self.stream_config.local_video_w);
+        let video_h_atomic = Arc::clone(&self.stream_config.local_video_h);
         let stop_for_encoder = Arc::clone(&stop_flag);
         let hub_for_encoder = Arc::clone(&hub);
 
-        // ESTÁGIO 2: Thread dedicada de Codificação JPEG + Controle Adaptativo de Bitrate (não bloqueia a captura!)
+        // ESTÁGIO 2: Thread dedicada de Codificação JPEG + Controle Adaptativo de Bitrate
         thread::spawn(move || {
             let mut sec_timer = Instant::now();
             let mut sec_bytes: u32 = 0;
@@ -231,7 +204,7 @@ impl Disc2App {
 
             while !stop_for_encoder.load(Ordering::Relaxed) {
                 match encode_rx.recv_timeout(Duration::from_millis(60)) {
-                    Ok((width, height, fps, base_quality, send_to_peers, rgb)) => {
+                    Ok((width, height, fps, base_quality, send_to_peers, send_to_ws, rgb)) => {
                         let eff_quality =
                             ((base_quality as i16) - adaptive_penalty).clamp(40, 92) as u8;
                         jpeg_buf.clear();
@@ -243,7 +216,6 @@ impl Disc2App {
                             .is_ok()
                         {
                             let frame_bytes = jpeg_buf.len();
-                            // Bitrate Adaptativo Inteligente: evita engasgar o túnel bore.pub
                             if fps >= 45 && frame_bytes > 26_000 {
                                 adaptive_penalty = (adaptive_penalty + 4).min(30);
                             } else if frame_bytes < 16_000 && adaptive_penalty > 0 {
@@ -252,12 +224,17 @@ impl Disc2App {
 
                             sec_bytes = sec_bytes.saturating_add(frame_bytes as u32);
                             encoded_counter.fetch_add(1, Ordering::Relaxed);
-                            crate::bridge::publish_video_frame(
-                                LOCAL_PREVIEW_TILE_ID,
-                                width as u16,
-                                height as u16,
-                                &jpeg_buf,
-                            );
+                            video_w_atomic.store(width, Ordering::Relaxed);
+                            video_h_atomic.store(height, Ordering::Relaxed);
+
+                            if send_to_ws {
+                                crate::bridge::publish_video_frame(
+                                    LOCAL_PREVIEW_TILE_ID,
+                                    width as u16,
+                                    height as u16,
+                                    &jpeg_buf,
+                                );
+                            }
                             if send_to_peers {
                                 hub_for_encoder.broadcast_my_video(
                                     width as u16,
@@ -299,14 +276,13 @@ impl Disc2App {
                 let has_peers = hub.has_connected_peers();
                 let has_ws = crate::bridge::has_ws_video_clients();
 
-                // Quando você está focado dentro do jogo (SZdisc em 2º plano), pausa automaticamente
-                // a prévia local para usar 0% de GPU/OpenGL extra e mandar 100% do FPS para seus amigos!
                 let app_focused = is_szdisc_in_foreground();
-                let need_local_preview = !hide_preview
+                let need_local_preview = has_ws
+                    && !hide_preview
                     && (!auto_eco || app_focused)
-                    && last_preview_sent.elapsed() >= Duration::from_millis(33);
+                    && last_preview_sent.elapsed() >= Duration::from_millis(16);
 
-                if !need_local_preview && !has_peers && !has_ws {
+                if !need_local_preview && !has_peers {
                     thread::sleep(Duration::from_millis(60));
                     continue;
                 }
@@ -317,26 +293,21 @@ impl Disc2App {
                         &source,
                         target_w,
                         target_h,
-                        need_local_preview,
+                        false,
                         draw_cursor,
                     ) {
-                        if need_local_preview && !raw.rgba.is_empty() {
+                        if need_local_preview {
                             last_preview_sent = Instant::now();
-                            let _ = preview_tx.try_send(LocalPreviewFrame {
-                                width: raw.width,
-                                height: raw.height,
-                                rgba: raw.rgba,
-                            });
-                            ctx.request_repaint();
                         }
 
-                        if has_peers || has_ws {
+                        if has_peers || need_local_preview {
                             let _ = encode_tx.try_send((
                                 raw.width,
                                 raw.height,
                                 fps,
                                 quality,
                                 has_peers,
+                                need_local_preview,
                                 raw.rgb,
                             ));
                         } else {
@@ -352,27 +323,22 @@ impl Disc2App {
             }
         });
 
-        self.show_share_modal = false;
         self.show_toast("Transmissão iniciada na sala!");
     }
 
     /// Para apenas a captura da nossa tela, mantendo você e seus amigos conectados na sala!
-    pub(crate) fn stop_sharing(&mut self, ctx: &Context) {
+    pub(crate) fn stop_sharing(&mut self) {
         if let Some(flag) = self.capture_stop_flag.take() {
             flag.store(true, Ordering::Relaxed);
         }
-        self.local_preview_rx = None;
         self.is_sharing = false;
-        self.local_video_texture = None;
         self.local_measured_fps = 0;
         self.local_measured_mbps = 0.0;
+        self.stream_config.local_video_w.store(0, Ordering::Relaxed);
+        self.stream_config.local_video_h.store(0, Ordering::Relaxed);
         self.popout_tiles.remove(&LOCAL_PREVIEW_TILE_ID);
-        self.popout_fullscreen.remove(&LOCAL_PREVIEW_TILE_ID);
         if self.focused_tile_id == Some(LOCAL_PREVIEW_TILE_ID) {
             self.focused_tile_id = None;
-        }
-        if self.fullscreen_tile_id == Some(LOCAL_PREVIEW_TILE_ID) {
-            self.set_main_fullscreen(ctx, None);
         }
         if let Some(hub) = &self.room_hub {
             hub.update_my_status(
@@ -384,37 +350,15 @@ impl Disc2App {
         }
     }
 
-    /// Sai completamente da sala de voz/transmissão atual (estilo botão Desconectar do Discord)
-    pub(crate) fn leave_room(&mut self, ctx: &Context) {
-        self.stop_sharing(ctx);
-        self.remote_tiles.clear();
+    /// Sai completamente da sala de voz/transmissão atual
+    pub(crate) fn leave_room(&mut self) {
+        self.stop_sharing();
         self.popout_tiles.clear();
-        self.popout_fullscreen.clear();
         self.focused_tile_id = None;
-        if self.fullscreen_tile_id.is_some() {
-            self.set_main_fullscreen(ctx, None);
-        }
+        self.tile_order.clear();
         if let Some(hub) = &self.room_hub {
             hub.leave_room_completely();
         }
         self.show_toast("Você saiu da sala.");
-    }
-
-    pub(crate) fn upload_local_rgba_to_gpu(
-        &mut self,
-        ctx: &Context,
-        width: u32,
-        height: u32,
-        rgba: Vec<u8>,
-    ) {
-        let image = ColorImage::from_rgba_unmultiplied([width as usize, height as usize], &rgba);
-        self.local_video_size = (width, height);
-        match &mut self.local_video_texture {
-            Some(tex) => tex.set(image, TextureOptions::LINEAR),
-            None => {
-                self.local_video_texture =
-                    Some(ctx.load_texture("local_stream_frame", image, TextureOptions::LINEAR));
-            }
-        }
     }
 }

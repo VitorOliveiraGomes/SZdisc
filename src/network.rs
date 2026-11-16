@@ -6,11 +6,6 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use eframe::egui::Context;
-use zune_jpeg::zune_core::colorspace::ColorSpace;
-use zune_jpeg::zune_core::options::DecoderOptions;
-use zune_jpeg::JpegDecoder;
-
 use crate::audio::StreamAudioPlayer;
 use crate::profile_theme::ServerProfile;
 
@@ -45,114 +40,53 @@ pub struct PeerInfo {
     pub last_seen: Instant,
 }
 
-pub struct DecodedRemoteFrame {
-    pub width: u32,
-    pub height: u32,
-    pub byte_len: usize,
-    pub rgba: Vec<u8>,
-}
-
-struct RawCompressedVideo {
-    width: u32,
-    height: u32,
-    jpeg_bytes: Vec<u8>,
-}
-
 /// Estado de recepção de vídeo e áudio de um participante específico na sala.
-/// Possui uma thread decodificadora dedicada (Zero-Backpressure) para que a leitura do socket TCP
-/// nunca trave esperando decodificação JPEG e sempre processe o quadro mais recente em tempo real!
+/// Encaminha os quadros JPEG direto ao WebSocket binário (Zero-Backpressure) e mantém telemetria atômica.
 pub struct RemotePeerStream {
     pub peer_id: u32,
-    pub latest_frame: Mutex<Option<DecodedRemoteFrame>>,
-    raw_video_slot: Mutex<Option<RawCompressedVideo>>,
-    raw_video_wakeup: Condvar,
-    stop_decoder: AtomicBool,
+    pub video_width: AtomicU32,
+    pub video_height: AtomicU32,
+    pub frame_counter: AtomicU32,
+    pub bytes_counter: AtomicU32,
+    pub measured_fps: AtomicU32,
+    pub measured_mbps_x100: AtomicU32,
     pub volume_percent: Arc<AtomicU32>,
     pub muted: Arc<AtomicBool>,
     pub audio_player: StreamAudioPlayer,
 }
 
 impl RemotePeerStream {
-    fn new(peer_id: u32, ctx: Context) -> Arc<Self> {
+    fn new(peer_id: u32) -> Arc<Self> {
         let volume_percent = Arc::new(AtomicU32::new(100));
         let muted = Arc::new(AtomicBool::new(false));
         let audio_player =
             StreamAudioPlayer::start(Arc::clone(&volume_percent), Arc::clone(&muted));
-        let stream = Arc::new(Self {
+        Arc::new(Self {
             peer_id,
-            latest_frame: Mutex::new(None),
-            raw_video_slot: Mutex::new(None),
-            raw_video_wakeup: Condvar::new(),
-            stop_decoder: AtomicBool::new(false),
+            video_width: AtomicU32::new(0),
+            video_height: AtomicU32::new(0),
+            frame_counter: AtomicU32::new(0),
+            bytes_counter: AtomicU32::new(0),
+            measured_fps: AtomicU32::new(0),
+            measured_mbps_x100: AtomicU32::new(0),
             volume_percent,
             muted,
             audio_player,
-        });
-
-        let stream_worker = Arc::clone(&stream);
-        thread::spawn(move || {
-            while !stream_worker.stop_decoder.load(Ordering::Relaxed) {
-                let raw_opt = {
-                    let mut guard = match stream_worker.raw_video_slot.lock() {
-                        Ok(g) => g,
-                        Err(_) => break,
-                    };
-                    if guard.is_none() {
-                        guard = match stream_worker
-                            .raw_video_wakeup
-                            .wait_timeout(guard, Duration::from_millis(40))
-                        {
-                            Ok((g, _)) => g,
-                            Err(_) => break,
-                        };
-                    }
-                    guard.take()
-                };
-
-                if let Some(raw) = raw_opt {
-                    let byte_len = raw.jpeg_bytes.len();
-                    let opts = DecoderOptions::default().jpeg_set_out_colorspace(ColorSpace::RGBA);
-                    let mut decoder = JpegDecoder::new_with_options(&raw.jpeg_bytes, opts);
-                    if let Ok(rgba) = decoder.decode() {
-                        let w = raw.width;
-                        let h = raw.height;
-                        let expected_len = (w * h * 4) as usize;
-                        if rgba.len() >= expected_len {
-                            if let Ok(mut latest) = stream_worker.latest_frame.lock() {
-                                *latest = Some(DecodedRemoteFrame {
-                                    width: w,
-                                    height: h,
-                                    byte_len,
-                                    rgba,
-                                });
-                            }
-                            ctx.request_repaint();
-                        }
-                    }
-                }
-            }
-        });
-
-        stream
+        })
     }
 
     fn push_compressed_video(&self, width: u32, height: u32, jpeg_bytes: Vec<u8>) {
+        self.video_width.store(width, Ordering::Relaxed);
+        self.video_height.store(height, Ordering::Relaxed);
+        self.frame_counter.fetch_add(1, Ordering::Relaxed);
+        self.bytes_counter
+            .fetch_add(jpeg_bytes.len() as u32, Ordering::Relaxed);
         crate::bridge::publish_video_frame(self.peer_id, width as u16, height as u16, &jpeg_bytes);
-        if let Ok(mut slot) = self.raw_video_slot.lock() {
-            *slot = Some(RawCompressedVideo {
-                width,
-                height,
-                jpeg_bytes,
-            });
-            self.raw_video_wakeup.notify_one();
-        }
     }
 }
 
 impl Drop for RemotePeerStream {
     fn drop(&mut self) {
-        self.stop_decoder.store(true, Ordering::Relaxed);
-        self.raw_video_wakeup.notify_all();
         self.audio_player.stop();
     }
 }
@@ -426,7 +360,6 @@ pub struct RoomHub {
     connections: Arc<Mutex<Vec<Arc<PeerConnectionSlot>>>>,
     next_conn_id: Arc<AtomicU64>,
     stop_flag: Arc<AtomicBool>,
-    ctx: Context,
 }
 
 impl RoomHub {
@@ -435,7 +368,6 @@ impl RoomHub {
         initial_name: String,
         initial_servers: &[ServerProfile],
         selected_server_id: &str,
-        ctx: Context,
     ) -> Result<Arc<Self>, String> {
         let mut bound_listener = None;
 
@@ -495,7 +427,6 @@ impl RoomHub {
             connections: Arc::new(Mutex::new(Vec::new())),
             next_conn_id: Arc::new(AtomicU64::new(1)),
             stop_flag: Arc::new(AtomicBool::new(false)),
-            ctx,
         });
 
         // 1. Thread que aceita conexões TCP de entrada
@@ -554,7 +485,6 @@ impl RoomHub {
                             streams.remove(&pid);
                         }
                     }
-                    hub_beacon.ctx.request_repaint();
                 }
 
                 // Expira membros do servidor (> 8s)
@@ -648,7 +578,6 @@ impl RoomHub {
         if let Ok(mut v) = self.viewed_server_id.lock() {
             *v = key;
         }
-        self.ctx.request_repaint();
     }
 
     pub fn remove_server(&self, server_id: &str) {
@@ -796,7 +725,6 @@ impl RoomHub {
                             } else if let Some(port) = parse_bore_hello_port(&s) {
                                 if port > 0 {
                                     self.holding_bore_port.store(port, Ordering::Relaxed);
-                                    self.ctx.request_repaint();
                                 }
                             } else if let Some(uuid) = parse_bore_connection_uuid(&s) {
                                 if !self.in_room.load(Ordering::Relaxed) {
@@ -1152,7 +1080,6 @@ impl RoomHub {
                                             });
                                         }
                                     }
-                                    self.ctx.request_repaint();
                                 }
                             }
                         }
@@ -1238,7 +1165,6 @@ impl RoomHub {
         let port = derive_room_port(&key, &clean);
         self.desired_bore_port.store(port, Ordering::Relaxed);
         self.in_room.store(true, Ordering::Relaxed);
-        self.ctx.request_repaint();
     }
 
     fn spawn_outbound_connect(self: &Arc<Self>, addr_str: String, is_silent_auto: bool) {
@@ -1267,7 +1193,6 @@ impl RoomHub {
             match TcpStream::connect_timeout(&sock_addr, Duration::from_secs(5)) {
                 Ok(stream) => {
                     hub.is_connecting_outbound.store(false, Ordering::SeqCst);
-                    hub.ctx.request_repaint();
                     hub.attach_bidirectional_stream(stream, true);
                 }
                 Err(e) => {
@@ -1277,7 +1202,6 @@ impl RoomHub {
                         }
                     }
                     hub.is_connecting_outbound.store(false, Ordering::SeqCst);
-                    hub.ctx.request_repaint();
                 }
             }
         });
@@ -1318,7 +1242,6 @@ impl RoomHub {
             ar.clear();
         }
         self.disconnect_all_connections();
-        self.ctx.request_repaint();
     }
 
     pub fn update_my_status(
@@ -1747,7 +1670,6 @@ impl RoomHub {
                                         }
                                     }
                                 }
-                                hub_reader.ctx.request_repaint();
                             }
                         }
                     }
@@ -1761,7 +1683,6 @@ impl RoomHub {
                     if let Ok(mut streams) = hub_reader.remote_streams.lock() {
                         streams.remove(&sender_id);
                     }
-                    hub_reader.ctx.request_repaint();
                 } else if &magic == MAGIC_LEFT_ROOM {
                     if let Ok(mut peers_map) = hub_reader.peers.lock() {
                         peers_map.remove(&sender_id);
@@ -1769,7 +1690,6 @@ impl RoomHub {
                     if let Ok(mut streams) = hub_reader.remote_streams.lock() {
                         streams.remove(&sender_id);
                     }
-                    hub_reader.ctx.request_repaint();
                 } else if &magic == MAGIC_VIDEO {
                     let w = width as u32;
                     let h = height as u32;
@@ -1789,11 +1709,10 @@ impl RoomHub {
 
                         let stream_arc = {
                             let mut streams = hub_reader.remote_streams.lock().unwrap();
-                            let ctx_clone = hub_reader.ctx.clone();
                             Arc::clone(
                                 streams
                                     .entry(sender_id)
-                                    .or_insert_with(|| RemotePeerStream::new(sender_id, ctx_clone)),
+                                    .or_insert_with(|| RemotePeerStream::new(sender_id)),
                             )
                         };
 
@@ -1802,11 +1721,10 @@ impl RoomHub {
                 } else if &magic == MAGIC_AUDIO {
                     let stream_arc = {
                         let mut streams = hub_reader.remote_streams.lock().unwrap();
-                        let ctx_clone = hub_reader.ctx.clone();
                         Arc::clone(
                             streams
                                 .entry(sender_id)
-                                .or_insert_with(|| RemotePeerStream::new(sender_id, ctx_clone)),
+                                .or_insert_with(|| RemotePeerStream::new(sender_id)),
                         )
                     };
                     let _ = stream_arc.audio_player.clone_sender().try_send(payload);
@@ -1847,8 +1765,6 @@ impl RoomHub {
                     }
                 }
             }
-
-            hub_reader.ctx.request_repaint();
         });
     }
 }

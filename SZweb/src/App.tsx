@@ -1,6 +1,8 @@
 import { useEffect, useMemo, useState } from 'react'
 import {
+  ArrowDownToLine,
   Copy,
+  Image,
   KeyRound,
   MonitorUp,
   PhoneOff,
@@ -13,11 +15,12 @@ import {
 
 import { BridgeInspectorDialog } from '@/components/BridgeInspectorDialog'
 import { Header } from '@/components/Header'
+import { ProfileCard } from '@/components/ProfileCard'
 import { ServerModal } from '@/components/ServerModal'
 import { SettingsDialog } from '@/components/SettingsDialog'
 import { SharePickerDialog } from '@/components/SharePickerDialog'
 import { StreamTile } from '@/components/StreamTile'
-import { Avatar, AvatarFallback } from '@/components/ui/avatar'
+import { Avatar, AvatarFallback, AvatarImage } from '@/components/ui/avatar'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card'
@@ -56,9 +59,13 @@ function App() {
     kbpsByTile: {},
   })
 
+  const [tileOrder, setTileOrder] = useState<number[]>([])
   const [focusedTileId, setFocusedTileId] = useState<number | null>(null)
+  const [showProfilePopup, setShowProfilePopup] = useState(false)
   const [newRoomName, setNewRoomName] = useState('')
   const [onboardingName, setOnboardingName] = useState('')
+  const [onboardingLogin, setOnboardingLogin] = useState('')
+  const [onboardingStatus, setOnboardingStatus] = useState('')
   const [serverModal, setServerModal] = useState<{ open: boolean; tab: 'create' | 'join' }>({
     open: false,
     tab: 'create',
@@ -139,25 +146,58 @@ function App() {
     return (
       <div className="flex h-screen w-screen items-center justify-center bg-background p-4">
         <Card className="w-full max-w-md border-primary/50">
-          <CardHeader>
-            <CardTitle className="text-xl">● Bem-vindo ao SZdisc (Web + Rust)</CardTitle>
+          <CardHeader className="text-center">
+            <CardTitle className="text-xl">● Bem-vindo ao SZdisc</CardTitle>
             <CardDescription>
-              Crie sua conta inicial — ela será salva pelo backend Rust em disco.
+              Crie sua conta para criar ou participar de Servidores com seus amigos.
             </CardDescription>
           </CardHeader>
           <CardContent className="space-y-4">
+            <div className="flex flex-col items-center gap-2">
+              <Avatar className="size-18 border-2 border-primary">
+                {snapshot.custom.avatarDataUrl && (
+                  <AvatarImage src={snapshot.custom.avatarDataUrl} alt="Avatar" />
+                )}
+                <AvatarFallback style={{ backgroundColor: rgbToCss(snapshot.custom.avatarBg) }}>
+                  {(onboardingName.trim()[0] ?? '?').toUpperCase()}
+                </AvatarFallback>
+              </Avatar>
+              <Button
+                size="sm"
+                variant="secondary"
+                onClick={() => void callRpc('pick_profile_image', { kind: 'avatar' })}
+              >
+                <Image className="size-3.5" /> Escolher Foto de Perfil (Opcional)
+              </Button>
+            </div>
             <Input
               value={onboardingName}
               onChange={(e) => setOnboardingName(e.target.value)}
-              placeholder="Seu nome de exibição (Ex: Pedro, Vitor...)"
+              placeholder="Seu nome de exibição * (Ex: Pedro, Vitor...)"
+            />
+            <Input
+              value={onboardingLogin}
+              onChange={(e) => setOnboardingLogin(e.target.value)}
+              placeholder="Nome de usuário @login (opcional)"
+            />
+            <Input
+              value={onboardingStatus}
+              onChange={(e) => setOnboardingStatus(e.target.value)}
+              placeholder="Status personalizado (Ex: Jogando Valorant)"
             />
             <Button
               variant="success"
               className="w-full"
               disabled={!onboardingName.trim()}
-              onClick={() => void callRpc('complete_onboarding', { displayName: onboardingName.trim() })}
+              onClick={() =>
+                void callRpc('complete_onboarding', {
+                  displayName: onboardingName.trim(),
+                  usernameLogin: onboardingLogin.trim(),
+                  customStatus: onboardingStatus.trim(),
+                })
+              }
             >
-              Criar Conta e Entrar
+              🚀 Criar Conta e Entrar no SZdisc
             </Button>
           </CardContent>
         </Card>
@@ -174,9 +214,10 @@ function App() {
   const includeLocalTile =
     stream.isSharing &&
     !stream.ecoHidePreview &&
+    !snapshot.popoutTiles.includes(0) &&
     (room.peers.filter((p) => p.isSharing).length === 0 || stream.showOwnPreviewInGrid)
 
-  const visibleTiles: Array<{
+  const rawTiles: Array<{
     tileId: number
     title: string
     subtitle: string
@@ -185,15 +226,15 @@ function App() {
   }> = []
 
   if (includeLocalTile) {
-    visibleTiles.push({
+    rawTiles.push({
       tileId: 0,
       title: `${custom.displayName} (Sua Tela)`,
       subtitle: `${telemetry.localVideoSize[0]}×${telemetry.localVideoSize[1]} • ${telemetry.localFps} FPS • ${telemetry.localMbps.toFixed(1)} Mbps`,
     })
   }
   for (const p of room.peers) {
-    if (p.isSharing) {
-      visibleTiles.push({
+    if (p.isSharing && !snapshot.popoutTiles.includes(p.peerId)) {
+      rawTiles.push({
         tileId: p.peerId,
         title: p.name,
         subtitle: `${p.videoSize[0]}×${p.videoSize[1]} • ${p.fps} FPS • ${p.mbps.toFixed(1)} Mbps`,
@@ -203,8 +244,30 @@ function App() {
     }
   }
 
+  const orderedIds = [
+    ...tileOrder.filter((id) => rawTiles.some((t) => t.tileId === id)),
+    ...rawTiles.map((t) => t.tileId).filter((id) => !tileOrder.includes(id)),
+  ]
+  const visibleTiles = orderedIds
+    .map((id) => rawTiles.find((t) => t.tileId === id))
+    .filter((t): t is NonNullable<typeof t> => t !== undefined)
+
+  const activeFocusId =
+    focusedTileId !== null && visibleTiles.some((t) => t.tileId === focusedTileId)
+      ? focusedTileId
+      : null
   const displayedTiles =
-    focusedTileId !== null ? visibleTiles.filter((t) => t.tileId === focusedTileId) : visibleTiles
+    activeFocusId !== null ? visibleTiles.filter((t) => t.tileId === activeFocusId) : visibleTiles
+
+  const moveTile = (tileId: number) => {
+    if (orderedIds.length < 2) return
+    const next = [...orderedIds]
+    const idx = next.indexOf(tileId)
+    if (idx === -1) return
+    const swapIdx = (idx + 1) % next.length
+    ;[next[idx], next[swapIdx]] = [next[swapIdx]!, next[idx]!]
+    setTileOrder(next)
+  }
 
   return (
     <div className="flex h-screen w-screen overflow-hidden bg-background text-foreground">
@@ -369,7 +432,9 @@ function App() {
                               })
                             }
                           >
-                            <Volume2 className={`size-3.5 ${isCurrent ? 'text-emerald-400' : 'text-muted-foreground'}`} />
+                            <Volume2
+                              className={`size-3.5 ${isCurrent ? 'text-emerald-400' : 'text-muted-foreground'}`}
+                            />
                             <span className="truncate">{roomName}</span>
                           </button>
 
@@ -475,8 +540,15 @@ function App() {
 
         {/* Rodapé do Usuário */}
         <div className="flex h-14 items-center justify-between border-t border-border bg-black/35 px-3">
-          <div className="flex min-w-0 items-center gap-2.5">
+          <button
+            type="button"
+            onClick={() => setShowProfilePopup((prev) => !prev)}
+            className="flex min-w-0 flex-1 items-center gap-2.5 text-left cursor-pointer"
+          >
             <Avatar className="size-9 border border-primary">
+              {custom.avatarDataUrl && (
+                <AvatarImage src={custom.avatarDataUrl} alt={custom.displayName} />
+              )}
               <AvatarFallback style={{ backgroundColor: rgbToCss(custom.avatarBg) }}>
                 {(custom.displayName.trim()[0] ?? '?').toUpperCase()}
               </AvatarFallback>
@@ -486,11 +558,15 @@ function App() {
                 {custom.displayName}
               </div>
               <div className="truncate text-[10px] text-muted-foreground">
-                {stream.isSharing ? `🔴 ${stream.resolution}` : room.inRoom ? `🟢 ${room.activeRoomName}` : '⚪ Online'}
+                {stream.isSharing
+                  ? `🔴 ${stream.resolution}`
+                  : room.inRoom
+                    ? `🟢 ${room.activeRoomName}`
+                    : '⚪ Fora das salas'}
               </div>
             </div>
-          </div>
-          <Button size="icon" variant="ghost" className="size-8" onClick={() => setSettingsOpen(true)}>
+          </button>
+          <Button size="icon" variant="ghost" className="size-8 shrink-0" onClick={() => setSettingsOpen(true)}>
             <Settings className="size-4" />
           </Button>
         </div>
@@ -502,10 +578,12 @@ function App() {
           snapshot={snapshot}
           mode={mode}
           wsStats={wsStats}
-          focusedTileId={focusedTileId}
+          focusedTileId={activeFocusId}
           onUnfocus={() => setFocusedTileId(null)}
+          onDockAllPopouts={() => void callRpc('set_popout', { clearAll: true })}
           onUpdateStream={(patch) => void callRpc('update_stream_settings', patch)}
           onActivateTurbo={() => void callRpc('activate_turbo_mode')}
+          onApplyUpdate={() => void callRpc('apply_update')}
           onOpenSettings={() => setSettingsOpen(true)}
           onOpenInspector={() => setInspectorOpen(true)}
         />
@@ -527,7 +605,7 @@ function App() {
                   tileId={tile.tileId}
                   title={tile.title}
                   subtitle={tile.subtitle}
-                  isFocused={focusedTileId === tile.tileId}
+                  isFocused={activeFocusId === tile.tileId}
                   wsFps={wsStats.fpsByTile[tile.tileId] ?? 0}
                   wsKbps={wsStats.kbpsByTile[tile.tileId] ?? 0}
                   volumePercent={tile.volumePercent}
@@ -544,10 +622,12 @@ function App() {
                   }
                   onToggleFocus={
                     visibleTiles.length > 1
-                      ? () => setFocusedTileId(focusedTileId === tile.tileId ? null : tile.tileId)
+                      ? () => setFocusedTileId(activeFocusId === tile.tileId ? null : tile.tileId)
                       : undefined
                   }
+                  onMoveTile={visibleTiles.length > 1 ? () => moveTile(tile.tileId) : undefined}
                   onPopout={() => {
+                    void callRpc('set_popout', { tileId: tile.tileId, popout: true })
                     window.open(
                       `${window.location.pathname}?popout=${tile.tileId}`,
                       `szdisc_popout_${tile.tileId}`,
@@ -557,20 +637,45 @@ function App() {
                 />
               ))}
             </div>
+          ) : snapshot.popoutTiles.length > 0 ? (
+            <div className="flex h-full flex-col items-center justify-center gap-3 text-center">
+              <div className="text-base font-semibold text-primary">
+                🖥️ Transmissões abertas em janelas separadas (Outro Monitor)
+              </div>
+              <Button onClick={() => void callRpc('set_popout', { clearAll: true })}>
+                <ArrowDownToLine className="size-4" /> Trazer Todas as Telas de Volta
+              </Button>
+            </div>
+          ) : stream.isSharing && stream.ecoHidePreview ? (
+            <div className="flex h-full flex-col items-center justify-center gap-3 text-center">
+              <div className="text-base font-bold text-emerald-400">
+                ● TRANSMITINDO AO VIVO NA SALA (MODO JOGO ATIVO)
+              </div>
+              <p className="text-xs text-muted-foreground">
+                A prévia local está oculta para economizar recursos enquanto você joga.
+              </p>
+              <Button onClick={() => void callRpc('update_stream_settings', { ecoHidePreview: false })}>
+                Mostrar Minha Tela Novamente
+              </Button>
+            </div>
           ) : (
             <div className="flex h-full flex-col items-center justify-center gap-5 text-center">
+              <ProfileCard custom={custom} isSharing={false} />
+
               <Card className="max-w-lg border-primary/40">
                 <CardHeader>
                   <CardTitle className="flex items-center justify-center gap-2 text-lg">
-                    Interface Web SZweb (shadcn/ui + Ponte Rust)
+                    {room.inRoom
+                      ? `Conectado na sala: ${room.activeRoomName}`
+                      : 'SZdisc — React + Vite + shadcn/ui'}
                     <Badge variant={mode === 'rust' ? 'success' : 'outline'}>
                       {mode === 'rust' ? 'Rust Conectado' : 'Mock Preview'}
                     </Badge>
                   </CardTitle>
                   <CardDescription>
                     {room.inRoom
-                      ? `Você está na sala "${room.activeRoomName}". Clique em Compartilhar Tela para transmitir em 60 FPS pelo WebSocket binário.`
-                      : 'Entre em uma sala à esquerda ou abra o Console de Teste da Ponte para inspecionar RPC + WebSocket.'}
+                      ? 'Clique em Compartilhar Tela para transmitir em 60 FPS pelo WebSocket binário.'
+                      : 'Entre em uma sala à esquerda ou crie/entre em um servidor para começar.'}
                   </CardDescription>
                 </CardHeader>
                 <CardContent className="flex flex-wrap justify-center gap-2">
@@ -588,8 +693,14 @@ function App() {
             </div>
           )}
 
+          {showProfilePopup && (
+            <div className="fixed bottom-16 left-20 z-40">
+              <ProfileCard custom={custom} isSharing={stream.isSharing} />
+            </div>
+          )}
+
           {snapshot.activeToast && (
-            <div className="pointer-events-none absolute right-4 bottom-4 rounded-lg border border-primary bg-card px-3.5 py-2 text-xs font-medium shadow-xl">
+            <div className="pointer-events-none fixed right-4 bottom-4 z-50 rounded-lg border border-primary bg-card px-3.5 py-2 text-xs font-medium shadow-xl">
               {snapshot.activeToast}
             </div>
           )}
@@ -620,6 +731,8 @@ function App() {
         custom={custom}
         stream={stream}
         onSaveProfile={(patch) => callRpc('save_profile', patch)}
+        onPickProfileImage={(kind) => callRpc('pick_profile_image', { kind })}
+        onClearProfileImage={(kind) => callRpc('clear_profile_image', { kind })}
         onApplyPreset={(presetCode) => callRpc('apply_theme_preset', { presetCode })}
         onSaveAppearance={(patch) => callRpc('save_appearance', patch)}
         onUpdateStream={(patch) => callRpc('update_stream_settings', patch)}

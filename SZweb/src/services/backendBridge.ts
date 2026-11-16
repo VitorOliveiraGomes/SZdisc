@@ -38,6 +38,8 @@ export function createInitialMockSnapshot(): AppSnapshotDto {
       customStatus: 'Testando ponte Rust ↔ Vite + shadcn/ui',
       bio: 'Rodando em modo preview local enquanto o executável Rust está fechado.',
       presenceCode: 0,
+      avatarDataUrl: '',
+      bannerDataUrl: '',
       avatarBg: [88, 101, 242],
       bannerBg: [59, 68, 182],
       bannerBg2: [139, 92, 246],
@@ -256,6 +258,38 @@ class BackendBridge {
         if (params.customStatus !== undefined) s.custom.customStatus = String(params.customStatus)
         if (params.bio !== undefined) s.custom.bio = String(params.bio)
         if (params.presenceCode !== undefined) s.custom.presenceCode = Number(params.presenceCode)
+        if (params.nameColorRgb) s.custom.nameColorRgb = params.nameColorRgb as RgbTuple
+        if (params.avatarBg) s.custom.avatarBg = params.avatarBg as RgbTuple
+        if (params.bannerBg) s.custom.bannerBg = params.bannerBg as RgbTuple
+        if (params.bannerBg2) s.custom.bannerBg2 = params.bannerBg2 as RgbTuple
+        if (params.avatarRingGlow !== undefined) s.custom.avatarRingGlow = Boolean(params.avatarRingGlow)
+        if (params.ringColorRgb) s.custom.ringColorRgb = params.ringColorRgb as RgbTuple
+        if (params.ringThickness !== undefined) s.custom.ringThickness = Number(params.ringThickness)
+        if (params.badgeCrown !== undefined) s.custom.badgeCrown = Boolean(params.badgeCrown)
+        if (params.badge1080p !== undefined) s.custom.badge1080p = Boolean(params.badge1080p)
+        if (params.badgeRust !== undefined) s.custom.badgeRust = Boolean(params.badgeRust)
+        if (params.badgeGamer !== undefined) s.custom.badgeGamer = Boolean(params.badgeGamer)
+        if (params.customBadgeEnabled !== undefined) {
+          s.custom.customBadgeEnabled = Boolean(params.customBadgeEnabled)
+        }
+        if (params.customBadgeText !== undefined) s.custom.customBadgeText = String(params.customBadgeText)
+        if (params.customBadgeRgb) s.custom.customBadgeRgb = params.customBadgeRgb as RgbTuple
+        break
+      case 'clear_profile_image':
+        if (params.kind === 'banner') s.custom.bannerDataUrl = ''
+        else s.custom.avatarDataUrl = ''
+        break
+      case 'set_popout':
+        if (params.clearAll) {
+          s.popoutTiles = []
+        } else if (params.tileId !== undefined) {
+          const tid = Number(params.tileId)
+          if (params.popout === false) {
+            s.popoutTiles = s.popoutTiles.filter((id) => id !== tid)
+          } else if (!s.popoutTiles.includes(tid)) {
+            s.popoutTiles.push(tid)
+          }
+        }
         break
       case 'apply_theme_preset': {
         const code = Number(params.presetCode ?? 0)

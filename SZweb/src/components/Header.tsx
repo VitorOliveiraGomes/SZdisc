@@ -1,4 +1,4 @@
-import { Activity, Monitor, Palette, Radio, Zap } from 'lucide-react'
+import { Activity, ArrowDownToLine, Download, Monitor, Palette, Radio, Zap } from 'lucide-react'
 
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
@@ -11,8 +11,10 @@ interface HeaderProps {
   wsStats: WsStreamStats
   focusedTileId: number | null
   onUnfocus: () => void
+  onDockAllPopouts: () => void
   onUpdateStream: (patch: Record<string, unknown>) => void
   onActivateTurbo: () => void
+  onApplyUpdate: () => void
   onOpenSettings: () => void
   onOpenInspector: () => void
 }
@@ -23,8 +25,10 @@ export function Header({
   wsStats,
   focusedTileId,
   onUnfocus,
+  onDockAllPopouts,
   onUpdateStream,
   onActivateTurbo,
+  onApplyUpdate,
   onOpenSettings,
   onOpenInspector,
 }: HeaderProps) {
@@ -97,9 +101,25 @@ export function Header({
             <Monitor className="size-3.5" /> Ver Telas Juntas
           </Button>
         )}
+
+        {snapshot.popoutTiles.length > 0 && (
+          <Button
+            size="sm"
+            variant="outline"
+            className="h-7 px-2.5 text-xs"
+            onClick={onDockAllPopouts}
+          >
+            <ArrowDownToLine className="size-3.5" /> Juntar Telas ({snapshot.popoutTiles.length})
+          </Button>
+        )}
       </div>
 
       <div className="flex items-center gap-2 shrink-0">
+        {snapshot.updateStatus.startsWith('UpdateAvailable:') && (
+          <Button size="sm" variant="success" className="h-7 px-2.5 text-xs" onClick={onApplyUpdate}>
+            <Download className="size-3.5" /> Atualizar (v{snapshot.updateStatus.split(':')[1]})
+          </Button>
+        )}
         <button
           type="button"
           onClick={onOpenInspector}

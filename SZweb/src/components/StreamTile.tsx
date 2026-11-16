@@ -1,5 +1,5 @@
 import { useEffect, useRef } from 'react'
-import { ExternalLink, Maximize2, Minimize2, Volume2, VolumeX } from 'lucide-react'
+import { ArrowLeftRight, ExternalLink, Maximize2, Minimize2, Volume2, VolumeX } from 'lucide-react'
 
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
@@ -18,6 +18,7 @@ interface StreamTileProps {
   muted?: boolean
   onAudioChange?: (volumePercent: number, muted: boolean) => void
   onToggleFocus?: () => void
+  onMoveTile?: () => void
   onPopout?: () => void
   onToggleFullscreen?: () => void
 }
@@ -34,6 +35,7 @@ export function StreamTile({
   muted,
   onAudioChange,
   onToggleFocus,
+  onMoveTile,
   onPopout,
   onToggleFullscreen,
 }: StreamTileProps) {
@@ -129,6 +131,18 @@ export function StreamTile({
               onClick={onToggleFocus}
             >
               {isFocused ? 'Ver Juntas' : 'Focar'}
+            </Button>
+          )}
+
+          {!isFocused && onMoveTile && (
+            <Button
+              size="sm"
+              variant="secondary"
+              className="h-7 px-2 text-xs"
+              onClick={onMoveTile}
+              title="Trocar a posição desta transmissão no palco"
+            >
+              <ArrowLeftRight className="size-3.5" /> Mover
             </Button>
           )}
 

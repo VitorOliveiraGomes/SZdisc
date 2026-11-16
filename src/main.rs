@@ -7,33 +7,73 @@ mod capture;
 mod network;
 mod profile_theme;
 mod stream_controller;
-mod ui;
 mod updater;
 
-use app::Disc2App;
-use eframe::egui;
-use updater::CURRENT_VERSION;
+use std::net::TcpStream;
+use std::process::Command;
+use std::sync::{Arc, Mutex};
+use std::thread;
+use std::time::Duration;
 
-fn main() -> eframe::Result<()> {
+use app::AppCore;
+use bridge::{BridgeServer, BRIDGE_PORT};
+
+fn launch_szweb_window(url: &str) {
+    #[cfg(windows)]
+    {
+        let app_arg = format!("--app={}", url);
+        let browsers = [
+            r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
+            r"C:\Program Files\Microsoft\Edge\Application\msedge.exe",
+            r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+            r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+        ];
+        for bin in browsers {
+            if std::path::Path::new(bin).is_file() {
+                if Command::new(bin).arg(&app_arg).spawn().is_ok() {
+                    return;
+                }
+            }
+        }
+        let _ = Command::new("cmd").args(["/C", "start", "", url]).spawn();
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        let _ = Command::new("open").arg(url).spawn();
+    }
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        let _ = Command::new("xdg-open").arg(url).spawn();
+    }
+}
+
+fn main() {
     #[cfg(windows)]
     unsafe {
         winapi::um::timeapi::timeBeginPeriod(1);
     }
 
-    let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_title(format!(
-                "SZdisc v{} — DXGI GPU Screen Share (Sem VPN)",
-                CURRENT_VERSION
-            ))
-            .with_inner_size([1280.0, 760.0])
-            .with_min_inner_size([960.0, 560.0]),
-        ..Default::default()
+    let core = Arc::new(Mutex::new(AppCore::new()));
+    let _bridge = BridgeServer::start(Arc::clone(&core));
+
+    // Em dev, se o Vite (porta 5173) já estiver rodando, abre direto nele; senão usa o dist servido pelo Rust
+    let dev_vite_up = TcpStream::connect_timeout(
+        &"127.0.0.1:5173".parse().unwrap(),
+        Duration::from_millis(120),
+    )
+    .is_ok();
+    let url = if dev_vite_up {
+        "http://localhost:5173".to_string()
+    } else {
+        format!("http://127.0.0.1:{}", BRIDGE_PORT)
     };
 
-    eframe::run_native(
-        "SZdisc",
-        options,
-        Box::new(|cc| Ok(Box::new(Disc2App::new(cc)))),
-    )
+    launch_szweb_window(&url);
+
+    // Mantém o processo nativo (captura, áudio, rede e bridge) ativo
+    loop {
+        thread::sleep(Duration::from_secs(1));
+    }
 }

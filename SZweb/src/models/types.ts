@@ -20,6 +20,8 @@ export interface UserCustomizationDto {
   customStatus: string
   bio: string
   presenceCode: number
+  avatarDataUrl: string
+  bannerDataUrl: string
   avatarBg: RgbTuple
   bannerBg: RgbTuple
   bannerBg2: RgbTuple

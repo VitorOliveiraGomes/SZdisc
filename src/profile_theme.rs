@@ -2,7 +2,19 @@ use std::fs;
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use eframe::egui::Color32;
+use jpeg_encoder::{ColorType, Encoder, SamplingFactor};
+#[cfg(windows)]
+use std::ffi::OsString;
+#[cfg(windows)]
+use std::mem::{size_of, zeroed};
+#[cfg(windows)]
+use std::os::windows::ffi::{OsStrExt, OsStringExt};
+#[cfg(windows)]
+use std::ptr::null_mut;
+#[cfg(windows)]
+use winapi::um::commdlg::{
+    GetOpenFileNameW, OFN_FILEMUSTEXIST, OFN_NOCHANGEDIR, OFN_PATHMUSTEXIST, OPENFILENAMEW,
+};
 
 fn get_user_config_path() -> PathBuf {
     let base = std::env::var("APPDATA").unwrap_or_else(|_| ".".to_string());
@@ -121,6 +133,67 @@ impl ServerProfile {
     }
 }
 
+/// Abre a janela nativa do sistema para escolher uma imagem (PNG, JPG, JPEG, BMP)
+#[cfg(windows)]
+pub fn pick_image_file_dialog() -> Option<String> {
+    unsafe {
+        let mut file_buf = [0u16; 1024];
+        let filter_str =
+            "Imagens (PNG, JPG, BMP)\0*.png;*.jpg;*.jpeg;*.bmp\0Todos os Arquivos\0*.*\0\0";
+        let filter_wide: Vec<u16> = OsString::from(filter_str).encode_wide().collect();
+        let title_wide: Vec<u16> = OsString::from("Escolher Imagem\0").encode_wide().collect();
+
+        let mut ofn: OPENFILENAMEW = zeroed();
+        ofn.lStructSize = size_of::<OPENFILENAMEW>() as u32;
+        ofn.hwndOwner = null_mut();
+        ofn.lpstrFile = file_buf.as_mut_ptr();
+        ofn.nMaxFile = file_buf.len() as u32;
+        ofn.lpstrFilter = filter_wide.as_ptr();
+        ofn.nFilterIndex = 1;
+        ofn.lpstrTitle = title_wide.as_ptr();
+        ofn.Flags = OFN_PATHMUSTEXIST | OFN_FILEMUSTEXIST | OFN_NOCHANGEDIR;
+
+        if GetOpenFileNameW(&mut ofn) != 0 {
+            let len = file_buf.iter().position(|&c| c == 0).unwrap_or(0);
+            if len > 0 {
+                return Some(
+                    OsString::from_wide(&file_buf[..len])
+                        .to_string_lossy()
+                        .to_string(),
+                );
+            }
+        }
+        None
+    }
+}
+
+#[cfg(not(windows))]
+pub fn pick_image_file_dialog() -> Option<String> {
+    rfd::FileDialog::new()
+        .add_filter("Imagens", &["png", "jpg", "jpeg", "bmp"])
+        .pick_file()
+        .map(|p| p.to_string_lossy().to_string())
+}
+
+/// Carrega uma imagem do disco, redimensiona para o tamanho alvo e retorna um Data URL JPEG base64.
+pub fn load_image_as_jpeg_data_url(path: &str, target_w: u32, target_h: u32) -> Option<String> {
+    if path.trim().is_empty() {
+        return None;
+    }
+    let img = image::open(path).ok()?;
+    let resized = img.resize_to_fill(target_w, target_h, image::imageops::FilterType::Triangle);
+    let rgb = resized.to_rgb8().into_raw();
+    let mut jpeg_buf = Vec::new();
+    let mut enc = Encoder::new(&mut jpeg_buf, 85);
+    enc.set_sampling_factor(SamplingFactor::F_2_2);
+    enc.encode(&rgb, target_w as u16, target_h as u16, ColorType::Rgb)
+        .ok()?;
+    Some(format!(
+        "data:image/jpeg;base64,{}",
+        crate::bridge::base64_encode(&jpeg_buf)
+    ))
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum PresenceStatus {
     Online,
@@ -130,24 +203,6 @@ pub enum PresenceStatus {
 }
 
 impl PresenceStatus {
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::Online => "Online",
-            Self::Idle => "Ausente",
-            Self::DoNotDisturb => "Não Perturbe",
-            Self::Invisible => "Invisível",
-        }
-    }
-
-    pub fn color(self) -> Color32 {
-        match self {
-            Self::Online => Color32::from_rgb(35, 165, 90),
-            Self::Idle => Color32::from_rgb(240, 178, 50),
-            Self::DoNotDisturb => Color32::from_rgb(242, 63, 67),
-            Self::Invisible => Color32::from_rgb(128, 132, 142),
-        }
-    }
-
     pub fn code(self) -> u8 {
         match self {
             Self::Online => 0,
@@ -179,18 +234,6 @@ pub enum ThemePreset {
 }
 
 impl ThemePreset {
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::DiscordDark => "Escuro Clássico (Discord)",
-            Self::MidnightOled => "Meia-Noite OLED (Preto Puro)",
-            Self::CyberpunkNeon => "Cyberpunk Neon (Roxo/Rosa)",
-            Self::EmeraldGamer => "Esmeralda Gamer (Verde)",
-            Self::CrimsonRuby => "Rubi Carmesim (Vermelho)",
-            Self::ArcticOcean => "Oceano Ártico (Azul)",
-            Self::Custom => "Personalizado (Livre)",
-        }
-    }
-
     pub fn code(self) -> u8 {
         match self {
             Self::DiscordDark => 0,
@@ -302,58 +345,6 @@ impl Default for UserCustomization {
 }
 
 impl UserCustomization {
-    pub fn accent_color(&self) -> Color32 {
-        Color32::from_rgb(self.accent_rgb[0], self.accent_rgb[1], self.accent_rgb[2])
-    }
-
-    pub fn sidebar_color(&self) -> Color32 {
-        Color32::from_rgb(
-            self.bg_sidebar_rgb[0],
-            self.bg_sidebar_rgb[1],
-            self.bg_sidebar_rgb[2],
-        )
-    }
-
-    pub fn stage_color(&self) -> Color32 {
-        Color32::from_rgb(
-            self.bg_stage_rgb[0],
-            self.bg_stage_rgb[1],
-            self.bg_stage_rgb[2],
-        )
-    }
-
-    pub fn card_color(&self) -> Color32 {
-        Color32::from_rgb(self.bg_card_rgb[0], self.bg_card_rgb[1], self.bg_card_rgb[2])
-    }
-
-    pub fn avatar_color(&self) -> Color32 {
-        Color32::from_rgb(self.avatar_bg[0], self.avatar_bg[1], self.avatar_bg[2])
-    }
-
-    pub fn banner_color(&self) -> Color32 {
-        Color32::from_rgb(self.banner_bg[0], self.banner_bg[1], self.banner_bg[2])
-    }
-
-    pub fn banner_color_2(&self) -> Color32 {
-        Color32::from_rgb(self.banner_bg_2[0], self.banner_bg_2[1], self.banner_bg_2[2])
-    }
-
-    pub fn name_color(&self) -> Color32 {
-        Color32::from_rgb(
-            self.name_color_rgb[0],
-            self.name_color_rgb[1],
-            self.name_color_rgb[2],
-        )
-    }
-
-    pub fn ring_color(&self) -> Color32 {
-        Color32::from_rgb(
-            self.ring_color_rgb[0],
-            self.ring_color_rgb[1],
-            self.ring_color_rgb[2],
-        )
-    }
-
     pub fn apply_preset_colors(&mut self, preset: ThemePreset) {
         self.theme_preset = preset;
         match preset {
@@ -619,33 +610,6 @@ impl UserCustomization {
             cfg.account_created = false;
         }
         cfg
-    }
-
-    pub fn active_badges(&self) -> Vec<(String, Color32)> {
-        let mut list = Vec::new();
-        if self.badge_crown {
-            list.push(("👑 Host".to_string(), Color32::from_rgb(245, 158, 11)));
-        }
-        if self.badge_1080p {
-            list.push(("⚡ 1080p60".to_string(), Color32::from_rgb(88, 101, 242)));
-        }
-        if self.badge_rust {
-            list.push(("🦀 Rust".to_string(), Color32::from_rgb(234, 88, 12)));
-        }
-        if self.badge_gamer {
-            list.push(("🎮 Pro".to_string(), Color32::from_rgb(16, 185, 129)));
-        }
-        if self.custom_badge_enabled && !self.custom_badge_text.trim().is_empty() {
-            list.push((
-                self.custom_badge_text.clone(),
-                Color32::from_rgb(
-                    self.custom_badge_rgb[0],
-                    self.custom_badge_rgb[1],
-                    self.custom_badge_rgb[2],
-                ),
-            ));
-        }
-        list
     }
 }
 

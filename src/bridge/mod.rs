@@ -1,21 +1,25 @@
 use std::collections::HashMap;
+use std::fs;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::thread;
 use std::time::Duration;
 
-use eframe::egui::Context;
 use jpeg_encoder::{ColorType, Encoder, SamplingFactor};
 
-use crate::app::Disc2App;
+use crate::app::AppCore;
 use crate::capture::{capture_thumbnail_rgba, list_capture_sources, SourceCategory};
-use crate::profile_theme::{generate_server_id, PresenceStatus, ServerProfile, ThemePreset};
-use crate::ui::state::{ResolutionPreset, RoomStatusSnapshot};
-use crate::ui::theme::apply_theme_to_egui;
-use crate::updater::{check_for_updates_async, UpdateStatus, CURRENT_VERSION};
+use crate::profile_theme::{
+    generate_server_id, load_image_as_jpeg_data_url, pick_image_file_dialog, PresenceStatus,
+    ServerProfile, ThemePreset,
+};
+use crate::stream_controller::ResolutionPreset;
+use crate::updater::{
+    check_for_updates_async, download_and_apply_update_async, UpdateStatus, CURRENT_VERSION,
+};
 
 pub const BRIDGE_PORT: u16 = 47839;
 
@@ -89,7 +93,7 @@ fn sha1_digest(data: &[u8]) -> [u8; 20] {
     out
 }
 
-fn base64_encode(input: &[u8]) -> String {
+pub(crate) fn base64_encode(input: &[u8]) -> String {
     const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::with_capacity(input.len().div_ceil(3) * 4);
     for chunk in input.chunks(3) {
@@ -288,7 +292,6 @@ impl<'a> JsonParser<'a> {
                     _ => out.push(esc as char),
                 }
             } else {
-                // Handle UTF-8 multi-byte characters cleanly
                 let start = self.pos - 1;
                 while self.pos < self.bytes.len() && (self.bytes[self.pos] & 0xC0) == 0x80 {
                     self.pos += 1;
@@ -473,7 +476,7 @@ fn write_ws_binary_frame(stream: &mut TcpStream, payload: &[u8]) -> std::io::Res
     let len = payload.len();
     let mut header = [0u8; 10];
     let header_len = if len < 126 {
-        header[0] = 0x82; // FIN + Binary
+        header[0] = 0x82;
         header[1] = len as u8;
         2
     } else if len <= 65535 {
@@ -514,7 +517,6 @@ fn serve_websocket_client(mut stream: TcpStream, key: &str, filter_tile_id: Opti
         b.client_count.store(clients.len(), Ordering::Relaxed);
     }
 
-    // Reader thread para detectar close/ping do navegador
     if let Ok(mut reader_stream) = stream.try_clone() {
         let slot_reader = Arc::clone(&slot);
         thread::spawn(move || {
@@ -538,7 +540,6 @@ fn serve_websocket_client(mut stream: TcpStream, key: &str, filter_tile_id: Opti
         });
     }
 
-    // Writer loop
     while slot.alive.load(Ordering::Relaxed) {
         let pending: Vec<Vec<u8>> = {
             let mut guard = match slot.slots.lock() {
@@ -570,30 +571,106 @@ fn serve_websocket_client(mut stream: TcpStream, key: &str, filter_tile_id: Opti
 }
 
 // ============================================================================
-// Bridge Command Queue & Snapshot Server
+// Static Asset Resolver for SZweb/dist (Production Single-Process Serving)
 // ============================================================================
 
-struct BridgeCommand {
-    method: String,
-    params: JsonVal,
-    reply_tx: SyncSender<Result<String, String>>,
+fn find_szweb_dist_dir() -> Option<PathBuf> {
+    let mut candidates = vec![
+        PathBuf::from("SZweb/dist"),
+        PathBuf::from("../SZweb/dist"),
+        PathBuf::from("../../SZweb/dist"),
+    ];
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            candidates.push(dir.join("SZweb/dist"));
+            candidates.push(dir.join("../../SZweb/dist"));
+            candidates.push(dir.join("../../../SZweb/dist"));
+        }
+    }
+    candidates.into_iter().find(|p| p.join("index.html").is_file())
 }
 
+fn content_type_for_path(p: &Path) -> &'static str {
+    match p.extension().and_then(|e| e.to_str()).unwrap_or("") {
+        "html" => "text/html; charset=utf-8",
+        "js" | "mjs" => "application/javascript; charset=utf-8",
+        "css" => "text/css; charset=utf-8",
+        "svg" => "image/svg+xml",
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "json" => "application/json; charset=utf-8",
+        "ico" => "image/x-icon",
+        _ => "application/octet-stream",
+    }
+}
+
+fn try_serve_static(stream: &mut TcpStream, req_path: &str, dist_dir: Option<&Path>) {
+    let clean_path = req_path.split('?').next().unwrap_or("/");
+    let Some(root) = dist_dir else {
+        let html = "<html><body style='background:#111214;color:#f2f3f5;font-family:sans-serif;padding:32px'><h2>SZdisc Backend Ativo (:47839)</h2><p>Rode <code>cd SZweb && npm run build</code> para servir o frontend estático aqui, ou acesse <code>http://localhost:5173</code> em modo dev.</p></body></html>";
+        let resp = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            html.len(),
+            html
+        );
+        let _ = stream.write_all(resp.as_bytes());
+        return;
+    };
+
+    let rel = clean_path.trim_start_matches('/');
+    let mut target = if rel.is_empty() {
+        root.join("index.html")
+    } else {
+        let candidate = root.join(rel);
+        if candidate.is_file() && candidate.starts_with(root) {
+            candidate
+        } else {
+            root.join("index.html")
+        }
+    };
+
+    if !target.is_file() {
+        target = root.join("index.html");
+    }
+
+    match fs::read(&target) {
+        Ok(bytes) => {
+            let ct = content_type_for_path(&target);
+            let header = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                ct,
+                bytes.len()
+            );
+            let _ = stream.write_all(header.as_bytes());
+            let _ = stream.write_all(&bytes);
+        }
+        Err(_) => {
+            let _ = stream.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+        }
+    }
+}
+
+// ============================================================================
+// Bridge HTTP RPC & Snapshot Server (Headless AppCore)
+// ============================================================================
+
 pub struct BridgeServer {
-    cmd_tx: SyncSender<BridgeCommand>,
-    cmd_rx: Mutex<Receiver<BridgeCommand>>,
+    app: Arc<Mutex<AppCore>>,
     latest_snapshot_json: Mutex<String>,
-    ctx: Context,
+    dist_dir: Option<PathBuf>,
 }
 
 impl BridgeServer {
-    pub fn start(ctx: Context) -> Arc<Self> {
-        let (cmd_tx, cmd_rx) = mpsc::sync_channel::<BridgeCommand>(64);
+    pub fn start(app: Arc<Mutex<AppCore>>) -> Arc<Self> {
+        let initial_json = app
+            .lock()
+            .map(|a| a.build_bridge_snapshot_json())
+            .unwrap_or_else(|_| "{}".to_string());
+
         let server = Arc::new(Self {
-            cmd_tx,
-            cmd_rx: Mutex::new(cmd_rx),
-            latest_snapshot_json: Mutex::new("{}".to_string()),
-            ctx: ctx.clone(),
+            app: Arc::clone(&app),
+            latest_snapshot_json: Mutex::new(initial_json),
+            dist_dir: find_szweb_dist_dir(),
         });
 
         let srv_listener = Arc::clone(&server);
@@ -608,11 +685,15 @@ impl BridgeServer {
             }
         });
 
-        // Garante que o snapshot e a fila de comandos sejam processados periodicamente mesmo sem interação no egui
-        let ctx_wakeup = ctx;
+        // Tick periódico (200ms): sincroniza RoomHub, limpa pop-outs órfãos e calcula telemetria 1s
+        let srv_ticker = Arc::clone(&server);
         thread::spawn(move || loop {
-            thread::sleep(Duration::from_millis(250));
-            ctx_wakeup.request_repaint();
+            thread::sleep(Duration::from_millis(200));
+            if let Ok(mut guard) = srv_ticker.app.lock() {
+                guard.tick();
+                let json = guard.build_bridge_snapshot_json();
+                srv_ticker.update_snapshot(json);
+            }
         });
 
         server
@@ -630,21 +711,6 @@ impl BridgeServer {
             .map(|g| g.clone())
             .unwrap_or_else(|_| "{}".to_string())
     }
-
-    fn dispatch_to_app(&self, method: String, params: JsonVal) -> Result<String, String> {
-        let (reply_tx, reply_rx) = mpsc::sync_channel(1);
-        self.cmd_tx
-            .try_send(BridgeCommand {
-                method,
-                params,
-                reply_tx,
-            })
-            .map_err(|_| "Fila de comandos cheia".to_string())?;
-        self.ctx.request_repaint();
-        reply_rx
-            .recv_timeout(Duration::from_millis(1200))
-            .map_err(|_| "Timeout aguardando ciclo da UI nativa (verifique se o app está aberto)".to_string())?
-    }
 }
 
 fn handle_http_connection(mut stream: TcpStream, bridge: Arc<BridgeServer>) {
@@ -652,7 +718,6 @@ fn handle_http_connection(mut stream: TcpStream, bridge: Arc<BridgeServer>) {
     let mut buf = Vec::with_capacity(4096);
     let mut tmp = [0u8; 2048];
 
-    // Lê até achar "\r\n\r\n"
     let header_end = loop {
         match stream.read(&mut tmp) {
             Ok(0) => return,
@@ -694,7 +759,6 @@ fn handle_http_connection(mut stream: TcpStream, bridge: Arc<BridgeServer>) {
         }
     }
 
-    // Upgrade WebSocket (/ws ou /ws?tileId=X)
     if is_upgrade && path.starts_with("/ws") {
         if let Some(key) = ws_key {
             let filter_tile_id = path
@@ -712,7 +776,11 @@ fn handle_http_connection(mut stream: TcpStream, bridge: Arc<BridgeServer>) {
         return;
     }
 
-    // Lê restante do corpo se houver Content-Length
+    if method == "GET" && !path.starts_with("/api/") {
+        try_serve_static(&mut stream, path, bridge.dist_dir.as_deref());
+        return;
+    }
+
     let body_start = header_end + 4;
     while buf.len() < body_start + content_len {
         match stream.read(&mut tmp) {
@@ -758,7 +826,16 @@ fn handle_rpc_request(bridge: &BridgeServer, body: &str) -> Result<String, Strin
         "get_state" => Ok(bridge.get_snapshot_json()),
         "list_capture_sources" => Ok(capture_sources_json()),
         "get_source_thumbnails" => Ok(capture_thumbnails_json()),
-        _ => bridge.dispatch_to_app(method, params),
+        _ => {
+            let mut app = bridge
+                .app
+                .lock()
+                .map_err(|_| "Falha ao travar estado do AppCore".to_string())?;
+            let res = app.execute_bridge_command(&method, &params)?;
+            let snap = app.build_bridge_snapshot_json();
+            bridge.update_snapshot(snap);
+            Ok(res)
+        }
     }
 }
 
@@ -817,30 +894,12 @@ fn capture_thumbnails_json() -> String {
 }
 
 // ============================================================================
-// Disc2App Integration: Command Processor & Snapshot Serialization
+// AppCore RPC Command Execution & Snapshot Serialization
 // ============================================================================
 
-impl Disc2App {
-    pub(crate) fn poll_bridge_and_sync_snapshot(&mut self, ctx: &Context) {
-        let mut drained = Vec::new();
-        if let Ok(rx) = self.bridge.cmd_rx.lock() {
-            while let Ok(cmd) = rx.try_recv() {
-                drained.push(cmd);
-            }
-        }
-
-        for cmd in drained {
-            let result = self.execute_bridge_command(ctx, &cmd.method, &cmd.params);
-            let _ = cmd.reply_tx.send(result);
-        }
-
-        let snap_json = self.build_bridge_snapshot_json();
-        self.bridge.update_snapshot(snap_json);
-    }
-
-    fn execute_bridge_command(
+impl AppCore {
+    pub(crate) fn execute_bridge_command(
         &mut self,
-        ctx: &Context,
         method: &str,
         params: &JsonVal,
     ) -> Result<String, String> {
@@ -883,6 +942,35 @@ impl Disc2App {
                 self.custom.save_to_disk();
                 self.sync_live_config();
                 self.show_toast(format!("Bem-vindo(a), {}!", self.custom.display_name));
+                Ok(self.build_bridge_snapshot_json())
+            }
+            "pick_profile_image" => {
+                let kind = params.get_str("kind").unwrap_or_else(|| "avatar".to_string());
+                if let Some(path) = pick_image_file_dialog() {
+                    if kind == "banner" {
+                        if let Some(data_url) = load_image_as_jpeg_data_url(&path, 480, 120) {
+                            self.custom.banner_image_path = path;
+                            self.banner_data_url = data_url;
+                            self.custom.save_to_disk();
+                        }
+                    } else if let Some(data_url) = load_image_as_jpeg_data_url(&path, 128, 128) {
+                        self.custom.avatar_image_path = path;
+                        self.avatar_data_url = data_url;
+                        self.custom.save_to_disk();
+                    }
+                }
+                Ok(self.build_bridge_snapshot_json())
+            }
+            "clear_profile_image" => {
+                let kind = params.get_str("kind").unwrap_or_else(|| "avatar".to_string());
+                if kind == "banner" {
+                    self.custom.banner_image_path.clear();
+                    self.banner_data_url.clear();
+                } else {
+                    self.custom.avatar_image_path.clear();
+                    self.avatar_data_url.clear();
+                }
+                self.custom.save_to_disk();
                 Ok(self.build_bridge_snapshot_json())
             }
             "save_profile" => {
@@ -948,7 +1036,7 @@ impl Disc2App {
                 Ok(self.build_bridge_snapshot_json())
             }
             "logout" => {
-                self.leave_room(ctx);
+                self.leave_room();
                 self.custom.account_created = false;
                 self.custom.save_to_disk();
                 Ok(self.build_bridge_snapshot_json())
@@ -956,7 +1044,6 @@ impl Disc2App {
             "apply_theme_preset" => {
                 let code = params.get_u8("presetCode").unwrap_or(0);
                 self.custom.apply_preset_colors(ThemePreset::from_code(code));
-                apply_theme_to_egui(&self.custom, ctx);
                 self.custom.save_to_disk();
                 Ok(self.build_bridge_snapshot_json())
             }
@@ -990,7 +1077,6 @@ impl Disc2App {
                 if let Some(s) = params.get_f32("uiScale") {
                     self.custom.ui_scale = s.clamp(0.90, 1.15);
                 }
-                apply_theme_to_egui(&self.custom, ctx);
                 self.custom.save_to_disk();
                 Ok(self.build_bridge_snapshot_json())
             }
@@ -1023,7 +1109,7 @@ impl Disc2App {
                 self.custom.selected_server_id = srv_id;
                 self.custom.saved_servers.push(new_srv);
                 self.custom.save_to_disk();
-                self.show_toast(format!("Servidor '{}' criado via SZweb!", name));
+                self.show_toast(format!("Servidor '{}' criado!", name));
                 Ok(self.build_bridge_snapshot_json())
             }
             "join_server" => {
@@ -1151,7 +1237,7 @@ impl Disc2App {
                 Ok(self.build_bridge_snapshot_json())
             }
             "leave_room" => {
-                self.leave_room(ctx);
+                self.leave_room();
                 Ok(self.build_bridge_snapshot_json())
             }
             "start_sharing" => {
@@ -1160,11 +1246,11 @@ impl Disc2App {
                 if let Some(idx) = self.sources.iter().position(|s| s.id == source_id) {
                     self.selected_source_idx = idx;
                 }
-                self.start_or_switch_sharing(ctx.clone());
+                self.start_or_switch_sharing();
                 Ok(self.build_bridge_snapshot_json())
             }
             "stop_sharing" => {
-                self.stop_sharing(ctx);
+                self.stop_sharing();
                 Ok(self.build_bridge_snapshot_json())
             }
             "update_stream_settings" => {
@@ -1211,7 +1297,7 @@ impl Disc2App {
                 self.jpeg_quality = 65;
                 self.auto_game_eco = true;
                 self.sync_live_config();
-                self.show_toast("⚡ Modo Turbo Jogos ativado pelo SZweb!");
+                self.show_toast("⚡ Modo Turbo Jogos ativado!");
                 Ok(self.build_bridge_snapshot_json())
             }
             "set_peer_audio" => {
@@ -1233,25 +1319,25 @@ impl Disc2App {
                 Ok(self.build_bridge_snapshot_json())
             }
             "set_popout" => {
-                let tile_id = params
-                    .get_u32("tileId")
-                    .ok_or_else(|| "tileId obrigatório".to_string())?;
-                let popout = params.get_bool("popout").unwrap_or(true);
-                if popout {
-                    if self.fullscreen_tile_id == Some(tile_id) {
-                        self.set_main_fullscreen(ctx, None);
+                if params.get_bool("clearAll") == Some(true) {
+                    self.popout_tiles.clear();
+                } else if let Some(tile_id) = params.get_u32("tileId") {
+                    let popout = params.get_bool("popout").unwrap_or(true);
+                    if popout {
+                        if self.focused_tile_id == Some(tile_id) {
+                            self.focused_tile_id = None;
+                        }
+                        self.popout_tiles.insert(tile_id);
+                    } else {
+                        self.popout_tiles.remove(&tile_id);
                     }
-                    self.popout_tiles.insert(tile_id);
-                } else {
-                    self.popout_tiles.remove(&tile_id);
-                    self.popout_fullscreen.remove(&tile_id);
                 }
                 Ok(self.build_bridge_snapshot_json())
             }
             "show_toast" => {
                 let msg = params
                     .get_str("message")
-                    .unwrap_or_else(|| "Ping recebido do SZweb!".to_string());
+                    .unwrap_or_else(|| "Notificação".to_string());
                 self.show_toast(msg);
                 Ok(self.build_bridge_snapshot_json())
             }
@@ -1259,12 +1345,30 @@ impl Disc2App {
                 check_for_updates_async(Arc::clone(&self.update_status));
                 Ok(self.build_bridge_snapshot_json())
             }
+            "apply_update" => {
+                download_and_apply_update_async(Arc::clone(&self.update_status));
+                Ok(self.build_bridge_snapshot_json())
+            }
             _ => Err(format!("Método RPC desconhecido: {}", method)),
         }
     }
 
-    fn build_bridge_snapshot_json(&self) -> String {
-        let room_snap = RoomStatusSnapshot::from_hub(&self.room_hub);
+    pub(crate) fn build_bridge_snapshot_json(&self) -> String {
+        let in_room = self
+            .room_hub
+            .as_ref()
+            .map(|h| h.in_room.load(Ordering::Relaxed))
+            .unwrap_or(false);
+        let connected_srv_id = self
+            .room_hub
+            .as_ref()
+            .and_then(|h| h.connected_server_id.lock().ok().map(|g| g.clone()))
+            .unwrap_or_default();
+        let active_room_name = self
+            .room_hub
+            .as_ref()
+            .and_then(|h| h.active_room_name.lock().ok().map(|g| g.clone()))
+            .unwrap_or_default();
 
         let servers_json: Vec<String> = self
             .custom
@@ -1287,6 +1391,7 @@ impl Disc2App {
             concat!(
                 r#"{{"accountCreated":{},"usernameLogin":{},"displayName":{},"userTag":{},"#,
                 r#""customStatus":{},"bio":{},"presenceCode":{},"#,
+                r#""avatarDataUrl":{},"bannerDataUrl":{},"#,
                 r#""avatarBg":{},"bannerBg":{},"bannerBg2":{},"nameColorRgb":{},"ringColorRgb":{},"#,
                 r#""avatarRingGlow":{},"ringThickness":{:.2},"#,
                 r#""badge1080p":{},"badgeRust":{},"badgeGamer":{},"badgeCrown":{},"#,
@@ -1302,6 +1407,8 @@ impl Disc2App {
             json_str(&self.custom.custom_status),
             json_str(&self.custom.bio),
             self.custom.presence.code(),
+            json_str(&self.avatar_data_url),
+            json_str(&self.banner_data_url),
             json_rgb(self.custom.avatar_bg),
             json_rgb(self.custom.banner_bg),
             json_rgb(self.custom.banner_bg_2),
@@ -1337,8 +1444,7 @@ impl Disc2App {
             .map(|map| {
                 map.values()
                     .map(|p| {
-                        let tile_opt = self.remote_tiles.get(&p.peer_id);
-                        let (vol, muted) = self
+                        let (vol, muted, vw, vh, fps, mbps) = self
                             .room_hub
                             .as_ref()
                             .and_then(|h| {
@@ -1347,14 +1453,16 @@ impl Disc2App {
                                         (
                                             s.volume_percent.load(Ordering::Relaxed),
                                             s.muted.load(Ordering::Relaxed),
+                                            s.video_width.load(Ordering::Relaxed),
+                                            s.video_height.load(Ordering::Relaxed),
+                                            s.measured_fps.load(Ordering::Relaxed),
+                                            s.measured_mbps_x100.load(Ordering::Relaxed) as f32
+                                                / 100.0,
                                         )
                                     })
                                 })
                             })
-                            .unwrap_or((100, false));
-                        let (vw, vh, fps, mbps) = tile_opt
-                            .map(|t| (t.video_size.0, t.video_size.1, t.measured_fps, t.measured_mbps))
-                            .unwrap_or((0, 0, 0, 0.0));
+                            .unwrap_or((100, false, 0, 0, 0, 0.0));
                         format!(
                             r#"{{"peerId":{},"name":{},"isSharing":{},"resLabel":{},"videoSize":[{},{}],"fps":{},"mbps":{:.2},"volumePercent":{},"muted":{}}}"#,
                             p.peer_id,
@@ -1396,9 +1504,9 @@ impl Disc2App {
 
         let room_json = format!(
             r#"{{"inRoom":{},"connectedServerId":{},"activeRoomName":{},"peers":[{}],"serverMembers":[{}]}}"#,
-            room_snap.in_room,
-            json_str(&room_snap.connected_srv_id),
-            json_str(&room_snap.active_room_name),
+            in_room,
+            json_str(&connected_srv_id),
+            json_str(&active_room_name),
             peers_json.join(","),
             members_json.join(","),
         );
@@ -1422,13 +1530,15 @@ impl Disc2App {
             json_str(active_source_id),
         );
 
+        let lw = self.stream_config.local_video_w.load(Ordering::Relaxed);
+        let lh = self.stream_config.local_video_h.load(Ordering::Relaxed);
         let telemetry_json = format!(
             r#"{{"ramMb":{:.1},"localFps":{},"localMbps":{:.2},"localVideoSize":[{},{}],"wsClients":{}}}"#,
             self.ram_mb,
             self.local_measured_fps,
             self.local_measured_mbps,
-            self.local_video_size.0,
-            self.local_video_size.1,
+            lw,
+            lh,
             ws_video_client_count(),
         );
 
