@@ -162,15 +162,9 @@ unsafe extern "system" fn monitor_enum_proc(
     TRUE
 }
 
-fn classify_window(
-    raw_title: &str,
-    exe_name: &str,
-    w: i32,
-    h: i32,
-    minimized: bool,
-) -> (String, String, SourceCategory) {
+fn is_browser_exe(exe_name: &str) -> bool {
     let exe_lower = exe_name.to_lowercase();
-    let is_browser_exe = matches!(
+    matches!(
         exe_lower.as_str(),
         "chrome.exe"
             | "msedge.exe"
@@ -183,7 +177,48 @@ fn classify_window(
             | "thorium.exe"
             | "arc.exe"
             | "zen.exe"
-    );
+    )
+}
+
+pub(super) fn is_szdisc_frontend_title(title: &str) -> bool {
+    let t = title.trim();
+    t == "SZdisc" || t.starts_with("SZdisc —")
+}
+
+pub(super) fn is_szdisc_window_match(title: &str, exe_name: &str) -> bool {
+    let t = title.trim();
+    if t.starts_with("SZdisc — Frontend") {
+        return true;
+    }
+    is_szdisc_frontend_title(t) && is_browser_exe(exe_name)
+}
+
+unsafe fn get_window_title(hwnd: HWND) -> Option<String> {
+    let mut buf = [0u16; 512];
+    let copied = GetWindowTextW(hwnd, buf.as_mut_ptr(), buf.len() as i32);
+    if copied <= 0 {
+        return None;
+    }
+    let title = OsString::from_wide(&buf[..copied as usize])
+        .to_string_lossy()
+        .trim()
+        .to_string();
+    if title.is_empty() {
+        None
+    } else {
+        Some(title)
+    }
+}
+
+fn classify_window(
+    raw_title: &str,
+    exe_name: &str,
+    w: i32,
+    h: i32,
+    minimized: bool,
+) -> (String, String, SourceCategory) {
+    let exe_lower = exe_name.to_lowercase();
+    let is_browser_exe = is_browser_exe(&exe_lower);
 
     let browser_suffixes = [
         (" - Google Chrome", "Google Chrome"),
@@ -360,7 +395,8 @@ pub fn capture_thumbnail_rgba(
     Some((frame.width, frame.height, frame.rgba))
 }
 
-/// Retorna `true` apenas quando a janela do SZdisc está em primeiro plano (focada pelo usuário).
+/// Retorna `true` apenas quando a janela do SZdisc (processo nativo ou janela do SZweb no navegador)
+/// está em primeiro plano (focada pelo usuário).
 /// Quando o jogador está dentro do jogo em tela cheia ou janela focada (`false`), o SZdisc
 /// pausa automaticamente a renderização da prévia local para usar 0% de GPU extra!
 pub fn is_szdisc_in_foreground() -> bool {
@@ -371,7 +407,19 @@ pub fn is_szdisc_in_foreground() -> bool {
         }
         let mut fg_pid: DWORD = 0;
         GetWindowThreadProcessId(fg, &mut fg_pid);
-        fg_pid != 0 && fg_pid == GetCurrentProcessId()
+        if fg_pid != 0 && fg_pid == GetCurrentProcessId() {
+            return true;
+        }
+        // Como o processo Rust é headless, a UI ativa roda no navegador (`SZweb`).
+        // Checa o título primeiro para evitar `OpenProcess` quando outra janela (ex: jogo) está em foco.
+        let Some(title) = get_window_title(fg) else {
+            return false;
+        };
+        if !is_szdisc_frontend_title(&title) {
+            return false;
+        }
+        let (_, exe_name) = get_window_pid_and_exe(fg);
+        is_szdisc_window_match(&title, &exe_name)
     }
 }
 
@@ -388,7 +436,6 @@ struct DxgiDuplicator {
     staging: *mut ID3D11Texture2D,
     staging_w: u32,
     staging_h: u32,
-    output_idx: usize,
     out_left: i32,
     out_top: i32,
     out_w: i32,
@@ -417,7 +464,20 @@ impl DxgiDuplicator {
         self.staging_h = 0;
     }
 
-    unsafe fn init_for_output(output_idx: usize) -> Option<Self> {
+    fn contains_rect(&self, src_left: i32, src_top: i32, src_w: i32, src_h: i32) -> bool {
+        src_left >= self.out_left
+            && src_top >= self.out_top
+            && src_left + src_w <= self.out_left + self.out_w
+            && src_top + src_h <= self.out_top + self.out_h
+    }
+
+    unsafe fn init_for_region(
+        src_left: i32,
+        src_top: i32,
+        src_w: i32,
+        src_h: i32,
+        fallback_idx: usize,
+    ) -> Option<Self> {
         let mut device: *mut ID3D11Device = null_mut();
         let mut context: *mut ID3D11DeviceContext = null_mut();
         let hr = D3D11CreateDevice(
@@ -456,10 +516,45 @@ impl DxgiDuplicator {
             return None;
         }
 
-        let mut output: *mut IDXGIOutput = null_mut();
-        let hr_out = (*adapter).EnumOutputs(output_idx as UINT, &mut output);
+        // Procura o output DXGI (0-based) que contém a região alvo; senão tenta o índice fallback.
+        let mut chosen_output: *mut IDXGIOutput = null_mut();
+        let mut fallback_output: *mut IDXGIOutput = null_mut();
+        let mut i: UINT = 0;
+        loop {
+            let mut cand: *mut IDXGIOutput = null_mut();
+            let hr_out = (*adapter).EnumOutputs(i, &mut cand);
+            if !SUCCEEDED(hr_out) || cand.is_null() {
+                break;
+            }
+            let mut desc = zeroed();
+            let _ = (*cand).GetDesc(&mut desc);
+            let r = desc.DesktopCoordinates;
+            let matches = src_left >= r.left
+                && src_top >= r.top
+                && src_left + src_w <= r.right
+                && src_top + src_h <= r.bottom;
+            if matches {
+                chosen_output = cand;
+                break;
+            } else if i as usize == fallback_idx && fallback_output.is_null() {
+                fallback_output = cand;
+            } else {
+                (*cand).Release();
+            }
+            i += 1;
+        }
         (*adapter).Release();
-        if !SUCCEEDED(hr_out) || output.is_null() {
+
+        let output = if !chosen_output.is_null() {
+            if !fallback_output.is_null() {
+                (*fallback_output).Release();
+            }
+            chosen_output
+        } else {
+            fallback_output
+        };
+
+        if output.is_null() {
             (*context).Release();
             (*device).Release();
             return None;
@@ -500,7 +595,6 @@ impl DxgiDuplicator {
             staging: null_mut(),
             staging_w: 0,
             staging_h: 0,
-            output_idx,
             out_left,
             out_top,
             out_w,
@@ -663,6 +757,8 @@ pub struct FastCapturer {
     dib_h: i32,
     dxgi: Option<DxgiDuplicator>,
     dxgi_bgra_buf: Vec<u8>,
+    dxgi_retry_after: Instant,
+    last_source_id: String,
     /// Buffer RGB reaproveitado entre frames (devolvido pelo encoder via `recycle_rgb`).
     spare_rgb: Vec<u8>,
     last_sent_at: Instant,
@@ -672,6 +768,7 @@ unsafe impl Send for FastCapturer {}
 
 impl FastCapturer {
     pub fn new() -> Self {
+        let past = Instant::now() - std::time::Duration::from_secs(2);
         Self {
             mem_dc: null_mut(),
             dib_bmp: null_mut(),
@@ -681,9 +778,16 @@ impl FastCapturer {
             dib_h: 0,
             dxgi: None,
             dxgi_bgra_buf: Vec::new(),
+            dxgi_retry_after: past,
+            last_source_id: String::new(),
             spare_rgb: Vec::new(),
-            last_sent_at: Instant::now() - std::time::Duration::from_secs(2),
+            last_sent_at: past,
         }
+    }
+
+    /// Força o envio do próximo quadro mesmo se o DXGI reportar tela estática (`Unchanged`).
+    pub fn force_next_frame(&mut self) {
+        self.last_sent_at = Instant::now() - std::time::Duration::from_secs(2);
     }
 
     /// Devolve um buffer RGB já usado para ser reaproveitado no próximo frame (zero alocação).
@@ -827,16 +931,36 @@ impl FastCapturer {
             let out_w = (((src_w as f32 * scale) as u32) & !1).max(64);
             let out_h = (((src_h as f32 * scale) as u32) & !1).max(64);
 
+            if self.last_source_id != source.id {
+                self.last_source_id = source.id.clone();
+                self.force_next_frame();
+                self.dxgi_retry_after = Instant::now() - std::time::Duration::from_secs(1);
+            }
+
             // Tenta primeiro via DXGI Desktop Duplication (GPU-side, sem travar DWM)
-            let desired_output = match source.kind {
-                CaptureSourceKind::Monitor { index, .. } => index,
+            let fallback_output = match source.kind {
+                CaptureSourceKind::Monitor { index, .. } => index.saturating_sub(1),
                 CaptureSourceKind::Window { .. } => 0,
             };
-            if self.dxgi.as_ref().map(|d| d.output_idx) != Some(desired_output) {
+            let need_reinit = self
+                .dxgi
+                .as_ref()
+                .map(|d| !d.contains_rect(src_left, src_top, src_w, src_h))
+                .unwrap_or(true);
+            if need_reinit && Instant::now() >= self.dxgi_retry_after {
                 if let Some(mut old) = self.dxgi.take() {
                     old.release_all();
                 }
-                self.dxgi = DxgiDuplicator::init_for_output(desired_output);
+                self.dxgi = DxgiDuplicator::init_for_region(
+                    src_left,
+                    src_top,
+                    src_w,
+                    src_h,
+                    fallback_output,
+                );
+                if self.dxgi.is_none() {
+                    self.dxgi_retry_after = Instant::now() + std::time::Duration::from_secs(3);
+                }
             }
 
             let mut used_dxgi = false;
@@ -862,6 +986,7 @@ impl FastCapturer {
                         if let Some(mut old) = self.dxgi.take() {
                             old.release_all();
                         }
+                        self.dxgi_retry_after = Instant::now() + std::time::Duration::from_secs(2);
                     }
                 }
             }
@@ -1519,7 +1644,7 @@ mod platform {
     }
 
     pub fn is_szdisc_in_foreground() -> bool {
-        false
+        true
     }
 
     pub struct FastCapturer;
@@ -1530,6 +1655,8 @@ mod platform {
         }
 
         pub fn recycle_rgb(&mut self, _buf: Vec<u8>) {}
+
+        pub fn force_next_frame(&mut self) {}
 
         pub fn capture_live_frame(
             &mut self,
@@ -1590,3 +1717,33 @@ mod platform {
 }
 
 pub use platform::*;
+
+#[cfg(all(test, windows))]
+mod tests {
+    use super::platform::{is_szdisc_frontend_title, is_szdisc_window_match};
+
+    #[test]
+    fn reconhece_janela_szweb_e_ignora_ide_ou_explorer() {
+        assert!(is_szdisc_window_match(
+            "SZdisc — Frontend Vite + shadcn/ui",
+            "msedge.exe"
+        ));
+        assert!(is_szdisc_window_match(
+            "SZdisc — Frontend Vite + shadcn/ui - Google Chrome",
+            "chrome.exe"
+        ));
+        assert!(is_szdisc_window_match(
+            "SZdisc — Frontend Vite + shadcn/ui",
+            "custom_webview.exe"
+        ));
+        assert!(!is_szdisc_frontend_title("SZdisc - Visual Studio Code"));
+        assert!(!is_szdisc_window_match(
+            "SZdisc - Visual Studio Code",
+            "Code.exe"
+        ));
+        assert!(!is_szdisc_window_match(
+            "C:\\Users\\Venti\\SZdisc",
+            "explorer.exe"
+        ));
+    }
+}
