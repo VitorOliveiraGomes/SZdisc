@@ -3,7 +3,7 @@ use std::fs;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::thread;
 use std::time::Duration;
@@ -437,6 +437,7 @@ pub struct VideoBroadcaster {
 }
 
 static GLOBAL_BROADCASTER: OnceLock<Arc<VideoBroadcaster>> = OnceLock::new();
+static WS_CONNECT_SEQ: AtomicU64 = AtomicU64::new(0);
 
 fn broadcaster() -> &'static Arc<VideoBroadcaster> {
     GLOBAL_BROADCASTER.get_or_init(|| {
@@ -453,6 +454,10 @@ pub fn has_ws_video_clients() -> bool {
 
 pub fn ws_video_client_count() -> usize {
     broadcaster().client_count.load(Ordering::Relaxed)
+}
+
+pub fn ws_connect_seq() -> u64 {
+    WS_CONNECT_SEQ.load(Ordering::Relaxed)
 }
 
 /// Publica um frame JPEG para todos os clientes WebSocket conectados (Zero-Backpressure).
@@ -518,6 +523,7 @@ fn serve_websocket_client(mut stream: TcpStream, key: &str, filter_tile_id: Opti
         clients.push(Arc::clone(&slot));
         b.client_count.store(clients.len(), Ordering::Relaxed);
     }
+    WS_CONNECT_SEQ.fetch_add(1, Ordering::Relaxed);
 
     if let Ok(mut reader_stream) = stream.try_clone() {
         let slot_reader = Arc::clone(&slot);
@@ -705,7 +711,7 @@ impl BridgeServer {
     pub fn start(app: Arc<Mutex<AppCore>>) -> Arc<Self> {
         let initial_json = app
             .lock()
-            .map(|a| a.build_bridge_snapshot_json())
+            .map(|mut a| a.build_bridge_snapshot_json())
             .unwrap_or_else(|_| "{}".to_string());
 
         let server = Arc::new(Self {
@@ -867,6 +873,35 @@ fn handle_rpc_request(bridge: &BridgeServer, body: &str) -> Result<String, Strin
         "get_state" => Ok(bridge.get_snapshot_json()),
         "list_capture_sources" => Ok(capture_sources_json()),
         "get_source_thumbnails" => Ok(capture_thumbnails_json()),
+        "pick_profile_image" => {
+            let kind = params
+                .get_str("kind")
+                .unwrap_or_else(|| "avatar".to_string());
+            // Abre o diálogo nativo e codifica o JPEG FORA do lock do AppCore para não congelar o tick e outros RPCs
+            let loaded = pick_image_file_dialog().and_then(|path| {
+                let (w, h) = if kind == "banner" { (480, 120) } else { (128, 128) };
+                load_image_as_jpeg_data_url(&path, w, h).map(|data_url| (path, data_url))
+            });
+
+            let mut app = bridge
+                .app
+                .lock()
+                .map_err(|_| "Falha ao travar estado do AppCore".to_string())?;
+            if let Some((path, data_url)) = loaded {
+                if kind == "banner" {
+                    app.custom.banner_image_path = path;
+                    app.banner_data_url = data_url;
+                } else {
+                    app.custom.avatar_image_path = path;
+                    app.avatar_data_url = data_url;
+                }
+                app.custom.save_to_disk();
+                app.cached_custom_json.clear();
+            }
+            let snap = app.build_bridge_snapshot_json();
+            bridge.update_snapshot(snap.clone());
+            Ok(snap)
+        }
         _ => {
             let mut app = bridge
                 .app
@@ -936,6 +971,7 @@ impl AppCore {
         method: &str,
         params: &JsonVal,
     ) -> Result<String, String> {
+        self.cached_custom_json.clear();
         match method {
             "complete_onboarding" => {
                 let display_name = params
@@ -975,23 +1011,6 @@ impl AppCore {
                 self.custom.save_to_disk();
                 self.sync_live_config();
                 self.show_toast(format!("Bem-vindo(a), {}!", self.custom.display_name));
-                Ok(self.build_bridge_snapshot_json())
-            }
-            "pick_profile_image" => {
-                let kind = params.get_str("kind").unwrap_or_else(|| "avatar".to_string());
-                if let Some(path) = pick_image_file_dialog() {
-                    if kind == "banner" {
-                        if let Some(data_url) = load_image_as_jpeg_data_url(&path, 480, 120) {
-                            self.custom.banner_image_path = path;
-                            self.banner_data_url = data_url;
-                            self.custom.save_to_disk();
-                        }
-                    } else if let Some(data_url) = load_image_as_jpeg_data_url(&path, 128, 128) {
-                        self.custom.avatar_image_path = path;
-                        self.avatar_data_url = data_url;
-                        self.custom.save_to_disk();
-                    }
-                }
                 Ok(self.build_bridge_snapshot_json())
             }
             "clear_profile_image" => {
@@ -1324,15 +1343,6 @@ impl AppCore {
                 self.sync_live_config();
                 Ok(self.build_bridge_snapshot_json())
             }
-            "activate_turbo_mode" => {
-                self.res_preset = ResolutionPreset::P720;
-                self.fps_preset = 60;
-                self.jpeg_quality = 65;
-                self.auto_game_eco = true;
-                self.sync_live_config();
-                self.show_toast("⚡ Modo Turbo Jogos ativado!");
-                Ok(self.build_bridge_snapshot_json())
-            }
             "set_peer_audio" => {
                 let peer_id = params
                     .get_u32("peerId")
@@ -1386,23 +1396,7 @@ impl AppCore {
         }
     }
 
-    pub(crate) fn build_bridge_snapshot_json(&self) -> String {
-        let in_room = self
-            .room_hub
-            .as_ref()
-            .map(|h| h.in_room.load(Ordering::Relaxed))
-            .unwrap_or(false);
-        let connected_srv_id = self
-            .room_hub
-            .as_ref()
-            .and_then(|h| h.connected_server_id.lock().ok().map(|g| g.clone()))
-            .unwrap_or_default();
-        let active_room_name = self
-            .room_hub
-            .as_ref()
-            .and_then(|h| h.active_room_name.lock().ok().map(|g| g.clone()))
-            .unwrap_or_default();
-
+    pub(crate) fn build_custom_json(&self) -> String {
         let servers_json: Vec<String> = self
             .custom
             .saved_servers
@@ -1420,7 +1414,7 @@ impl AppCore {
             })
             .collect();
 
-        let custom_json = format!(
+        format!(
             concat!(
                 r#"{{"accountCreated":{},"usernameLogin":{},"displayName":{},"userTag":{},"#,
                 r#""customStatus":{},"bio":{},"presenceCode":{},"#,
@@ -1468,7 +1462,30 @@ impl AppCore {
             self.custom.show_cursor_in_stream,
             json_str(&self.custom.selected_server_id),
             servers_json.join(","),
-        );
+        )
+    }
+
+    pub(crate) fn build_bridge_snapshot_json(&mut self) -> String {
+        let in_room = self
+            .room_hub
+            .as_ref()
+            .map(|h| h.in_room.load(Ordering::Relaxed))
+            .unwrap_or(false);
+        let connected_srv_id = self
+            .room_hub
+            .as_ref()
+            .and_then(|h| h.connected_server_id.lock().ok().map(|g| g.clone()))
+            .unwrap_or_default();
+        let active_room_name = self
+            .room_hub
+            .as_ref()
+            .and_then(|h| h.active_room_name.lock().ok().map(|g| g.clone()))
+            .unwrap_or_default();
+
+        if self.cached_custom_json.is_empty() {
+            self.cached_custom_json = self.build_custom_json();
+        }
+        let custom_json = &self.cached_custom_json;
 
         let peers_json: Vec<String> = self
             .room_hub

@@ -14,6 +14,7 @@ pub struct AppCore {
     pub(crate) custom: UserCustomization,
     pub(crate) avatar_data_url: String,
     pub(crate) banner_data_url: String,
+    pub(crate) cached_custom_json: String,
 
     pub(crate) sources: Vec<CaptureSource>,
     pub(crate) selected_source_idx: usize,
@@ -34,6 +35,8 @@ pub struct AppCore {
     pub(crate) is_sharing: bool,
     pub(crate) stream_config: Arc<LiveStreamConfig>,
     pub(crate) capture_stop_flag: Option<Arc<AtomicBool>>,
+    pub(crate) capture_alive: Option<Arc<AtomicBool>>,
+    pub(crate) encoder_alive: Option<Arc<AtomicBool>>,
 
     pub(crate) local_measured_fps: u32,
     pub(crate) local_measured_mbps: f32,
@@ -98,6 +101,7 @@ impl AppCore {
             custom,
             avatar_data_url,
             banner_data_url,
+            cached_custom_json: String::new(),
             sources,
             selected_source_idx: 0,
             res_preset: ResolutionPreset::P720,
@@ -114,6 +118,8 @@ impl AppCore {
             is_sharing: false,
             stream_config,
             capture_stop_flag: None,
+            capture_alive: None,
+            encoder_alive: None,
             local_measured_fps: 0,
             local_measured_mbps: 0.0,
             ram_mb: get_process_ram_mb(),
@@ -165,6 +171,7 @@ impl AppCore {
 
         if servers_dirty {
             self.custom.save_to_disk();
+            self.cached_custom_json.clear();
         }
         if let Some(msg) = hub_notice {
             self.show_toast(msg);
