@@ -17,7 +17,7 @@ use winapi::um::wininet::{
     INTERNET_FLAG_NO_CACHE_WRITE, INTERNET_FLAG_RELOAD, INTERNET_OPEN_TYPE_PRECONFIG,
 };
 
-pub const CURRENT_VERSION: &str = "2.11.0";
+pub const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 const VERSION_URL: &str =
     "https://raw.githubusercontent.com/VitorOliveiraGomes/SZdisc/main/VERSION.txt";
 const EXE_DOWNLOAD_URL: &str =
@@ -131,6 +131,13 @@ pub fn cleanup_old_exe() {
 
 /// Verifica em segundo plano se há uma versão mais recente no repositório GitHub usando WinInet nativo
 pub fn check_for_updates_async(status: Arc<Mutex<UpdateStatus>>) {
+    if cfg!(debug_assertions) || std::env::var_os("SZDISC_DISABLE_UPDATER").is_some() {
+        if let Ok(mut s) = status.lock() {
+            *s = UpdateStatus::UpToDate;
+        }
+        return;
+    }
+
     if let Ok(mut s) = status.lock() {
         *s = UpdateStatus::Checking;
     }
@@ -162,21 +169,41 @@ pub fn check_for_updates_async(status: Arc<Mutex<UpdateStatus>>) {
 
 /// Baixa o `DISC2.exe` mais recente direto do GitHub via WinInet nativo e reinicia o aplicativo
 pub fn download_and_apply_update_async(status: Arc<Mutex<UpdateStatus>>) {
+    if cfg!(debug_assertions) || std::env::var_os("SZDISC_DISABLE_UPDATER").is_some() {
+        if let Ok(mut s) = status.lock() {
+            *s = UpdateStatus::UpToDate;
+        }
+        return;
+    }
+
     if let Ok(mut s) = status.lock() {
         *s = UpdateStatus::Downloading;
     }
 
     thread::spawn(move || {
-        // Confirma primeiro se realmente existe versão mais nova no GitHub (nunca faz downgrade!)
+        // Confirma primeiro se realmente existe versão mais nova no GitHub (nunca faz downgrade nem baixa às cegas!)
         let ver_url = cache_busted_url(VERSION_URL);
-        if let Some(bytes) = fetch_https_bytes_wininet(&ver_url, 256) {
-            let remote_ver = String::from_utf8_lossy(&bytes).trim().to_string();
-            if !remote_ver.is_empty() && !is_remote_newer(&remote_ver, CURRENT_VERSION) {
-                if let Ok(mut s) = status.lock() {
-                    *s = UpdateStatus::UpToDate;
-                }
-                return;
+        let Some(bytes) = fetch_https_bytes_wininet(&ver_url, 256) else {
+            if let Ok(mut s) = status.lock() {
+                *s = UpdateStatus::Failed;
             }
+            return;
+        };
+        let remote_ver = String::from_utf8_lossy(&bytes).trim().to_string();
+        let valid_ver = !remote_ver.is_empty()
+            && remote_ver.len() <= 16
+            && remote_ver.chars().all(|c| c.is_ascii_digit() || c == '.');
+        if !valid_ver {
+            if let Ok(mut s) = status.lock() {
+                *s = UpdateStatus::Failed;
+            }
+            return;
+        }
+        if !is_remote_newer(&remote_ver, CURRENT_VERSION) {
+            if let Ok(mut s) = status.lock() {
+                *s = UpdateStatus::UpToDate;
+            }
+            return;
         }
 
         let current_exe: PathBuf = match std::env::current_exe() {
