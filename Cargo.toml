@@ -6,11 +6,8 @@ authors = ["Vitor Oliveira Gomes"]
 description = "SZdisc - Aplicativo nativo ultra-leve em Rust para transmissao de tela e audio em 1080p 60fps"
 
 [dependencies]
-eframe = { version = "0.29", default-features = false, features = ["glow", "default_fonts", "x11", "wayland"] }
-egui = "0.29"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "bmp"] }
 jpeg-encoder = { version = "0.6", features = ["simd"] }
-zune-jpeg = "0.4"
 [target.'cfg(windows)'.dependencies]
 winapi = { version = "0.3", features = [
   "winuser",
