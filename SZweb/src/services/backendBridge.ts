@@ -407,12 +407,6 @@ class BackendBridge {
           s.stream.showOwnPreviewInGrid = Boolean(params.showOwnPreviewInGrid)
         }
         break
-      case 'activate_turbo_mode':
-        s.stream.resolution = '720p'
-        s.stream.fps = 60
-        s.stream.jpegQuality = 65
-        s.stream.autoGameEco = true
-        break
       case 'show_toast':
         s.activeToast = String(params.message ?? 'Toast Mock')
         break

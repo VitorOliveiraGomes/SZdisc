@@ -582,7 +582,6 @@ function App() {
           onUnfocus={() => setFocusedTileId(null)}
           onDockAllPopouts={() => void callRpc('set_popout', { clearAll: true })}
           onUpdateStream={(patch) => void callRpc('update_stream_settings', patch)}
-          onActivateTurbo={() => void callRpc('activate_turbo_mode')}
           onApplyUpdate={() => void callRpc('apply_update')}
           onOpenSettings={() => setSettingsOpen(true)}
           onOpenInspector={() => setInspectorOpen(true)}
