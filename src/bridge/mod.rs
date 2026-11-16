@@ -606,8 +606,50 @@ fn content_type_for_path(p: &Path) -> &'static str {
     }
 }
 
+// `SZweb/dist` embutido no executável em tempo de compilação (ver build.rs).
+include!(concat!(env!("OUT_DIR"), "/embedded_web_assets.rs"));
+
+fn find_embedded_asset(rel: &str) -> Option<&'static [u8]> {
+    EMBEDDED_WEB_ASSETS
+        .iter()
+        .find(|(p, _)| *p == rel)
+        .map(|(_, bytes)| *bytes)
+}
+
+fn write_static_response(stream: &mut TcpStream, rel: &str, bytes: &[u8]) {
+    let ct = content_type_for_path(Path::new(rel));
+    // Arquivos em assets/ têm hash no nome (Vite): podem ficar em cache para sempre
+    let cache = if rel.starts_with("assets/") {
+        "public, max-age=31536000, immutable"
+    } else {
+        "no-cache"
+    };
+    let header = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: {}\r\nCache-Control: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        ct,
+        cache,
+        bytes.len()
+    );
+    let _ = stream.write_all(header.as_bytes());
+    let _ = stream.write_all(bytes);
+}
+
 fn try_serve_static(stream: &mut TcpStream, req_path: &str, dist_dir: Option<&Path>) {
     let clean_path = req_path.split('?').next().unwrap_or("/");
+
+    // 1) Interface embutida no executável (funciona sem nenhuma pasta ao lado do .exe)
+    if !EMBEDDED_WEB_ASSETS.is_empty() {
+        let rel = clean_path.trim_start_matches('/');
+        let (rel, bytes) = match find_embedded_asset(rel) {
+            Some(b) if !rel.is_empty() => (rel, b),
+            // Rota da SPA ou raiz: devolve o index.html
+            _ => ("index.html", find_embedded_asset("index.html").unwrap_or_default()),
+        };
+        write_static_response(stream, rel, bytes);
+        return;
+    }
+
+    // 2) Fallback: SZweb/dist no disco (build sem a interface embutida)
     let Some(root) = dist_dir else {
         let html = "<html><body style='background:#111214;color:#f2f3f5;font-family:sans-serif;padding:32px'><h2>SZdisc Backend Ativo (:47839)</h2><p>Rode <code>cd SZweb && npm run build</code> para servir o frontend estático aqui, ou acesse <code>http://localhost:5173</code> em modo dev.</p></body></html>";
         let resp = format!(
@@ -637,14 +679,11 @@ fn try_serve_static(stream: &mut TcpStream, req_path: &str, dist_dir: Option<&Pa
 
     match fs::read(&target) {
         Ok(bytes) => {
-            let ct = content_type_for_path(&target);
-            let header = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                ct,
-                bytes.len()
-            );
-            let _ = stream.write_all(header.as_bytes());
-            let _ = stream.write_all(&bytes);
+            let rel = target
+                .strip_prefix(root)
+                .map(|p| p.to_string_lossy().replace('\\', "/"))
+                .unwrap_or_default();
+            write_static_response(stream, &rel, &bytes);
         }
         Err(_) => {
             let _ = stream.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
@@ -1566,5 +1605,31 @@ impl AppCore {
             json_str(&upd_str),
             json_str(toast_str),
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn interface_szweb_embutida_no_executavel() {
+        let index = find_embedded_asset("index.html").expect("index.html deve estar embutido");
+        let html = std::str::from_utf8(index).unwrap();
+        // Todo asset referenciado pelo index.html precisa estar embutido também
+        for part in html.split('"').filter(|s| s.starts_with("/assets/")) {
+            assert!(
+                find_embedded_asset(part.trim_start_matches('/')).is_some(),
+                "asset ausente: {part}"
+            );
+        }
+        assert_eq!(content_type_for_path(Path::new("assets/x.js")), "application/javascript; charset=utf-8");
+    }
+
+    #[test]
+    fn json_str_escapa_e_tem_caminho_rapido() {
+        assert_eq!(json_str("abc+/="), "\"abc+/=\"");
+        assert_eq!(json_str(r#"a"b\c"#), r#""a\"b\\c""#);
+        assert_eq!(json_str("x\ny"), r#""x\ny""#);
     }
 }
