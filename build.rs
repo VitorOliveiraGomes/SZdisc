@@ -36,9 +36,24 @@ fn embed_szweb_dist() {
     let dist = szweb.join("dist");
 
     println!("cargo:rerun-if-changed=SZweb/dist");
+    println!("cargo:rerun-if-changed=SZweb/src");
+    println!("cargo:rerun-if-changed=SZweb/index.html");
+    println!("cargo:rerun-if-changed=SZweb/package.json");
     println!("cargo:rerun-if-env-changed=SZDISC_SKIP_WEB_BUILD");
 
-    if !dist.join("index.html").is_file()
+    let dist_index = dist.join("index.html");
+    let dist_mtime = fs::metadata(&dist_index).and_then(|m| m.modified()).ok();
+    let src_newer = match dist_mtime {
+        None => true,
+        Some(dm) => {
+            newest_mtime(&szweb.join("src")).is_some_and(|sm| sm > dm)
+                || fs::metadata(szweb.join("index.html"))
+                    .and_then(|m| m.modified())
+                    .is_ok_and(|im| im > dm)
+        }
+    };
+
+    if src_newer
         && szweb.join("node_modules").is_dir()
         && env::var_os("SZDISC_SKIP_WEB_BUILD").is_none()
     {
@@ -89,4 +104,21 @@ fn collect_files(root: &Path, dir: &Path, out: &mut Vec<(String, PathBuf)>) {
             out.push((rel, path.clone()));
         }
     }
+}
+
+fn newest_mtime(dir: &Path) -> Option<std::time::SystemTime> {
+    let entries = fs::read_dir(dir).ok()?;
+    let mut newest: Option<std::time::SystemTime> = None;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let cand = if path.is_dir() {
+            newest_mtime(&path)
+        } else {
+            fs::metadata(&path).and_then(|m| m.modified()).ok()
+        };
+        if let Some(t) = cand {
+            newest = Some(newest.map_or(t, |cur| cur.max(t)));
+        }
+    }
+    newest
 }

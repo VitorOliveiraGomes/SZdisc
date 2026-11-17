@@ -1,4 +1,4 @@
-import { Activity, ArrowDownToLine, Download, Monitor, Palette, Radio, Zap } from 'lucide-react'
+import { Activity, ArrowDownToLine, Download, Monitor, Palette, Radio } from 'lucide-react'
 
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
@@ -13,7 +13,6 @@ interface HeaderProps {
   onUnfocus: () => void
   onDockAllPopouts: () => void
   onUpdateStream: (patch: Record<string, unknown>) => void
-  onActivateTurbo: () => void
   onApplyUpdate: () => void
   onOpenSettings: () => void
   onOpenInspector: () => void
@@ -27,17 +26,11 @@ export function Header({
   onUnfocus,
   onDockAllPopouts,
   onUpdateStream,
-  onActivateTurbo,
   onApplyUpdate,
   onOpenSettings,
   onOpenInspector,
 }: HeaderProps) {
   const { stream, telemetry, room } = snapshot
-  const isTurbo =
-    stream.resolution === '720p' &&
-    stream.fps === 60 &&
-    stream.jpegQuality === 65 &&
-    stream.autoGameEco
 
   return (
     <header className="flex h-12 shrink-0 items-center justify-between gap-2 border-b border-border bg-card px-3">
@@ -82,19 +75,10 @@ export function Header({
           >
             <option value={90}>Ultra (90%)</option>
             <option value={75}>Alta (75%)</option>
-            <option value={65}>Turbo (65%)</option>
+            <option value={65}>Padrão (65%)</option>
             <option value={48}>Leve (48%)</option>
           </select>
         </div>
-
-        <Button
-          size="sm"
-          variant={isTurbo ? 'success' : 'secondary'}
-          className="h-7 px-2.5 text-xs"
-          onClick={onActivateTurbo}
-        >
-          <Zap className="size-3.5" /> Modo Turbo
-        </Button>
 
         {focusedTileId !== null && (
           <Button size="sm" variant="outline" className="h-7 px-2.5 text-xs" onClick={onUnfocus}>

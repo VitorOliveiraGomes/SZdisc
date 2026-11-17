@@ -153,8 +153,17 @@ impl AppCore {
             }
         }
 
-        // Se já estamos transmitindo, apenas troca a janela/aplicativo em tempo real na MESMA sala!
-        if self.is_sharing && self.capture_stop_flag.is_some() {
+        // Se já estamos transmitindo e ambas as threads seguem vivas, apenas troca a janela/aplicativo em tempo real na MESMA sala!
+        let threads_alive = self
+            .capture_alive
+            .as_ref()
+            .is_some_and(|f| f.load(Ordering::Relaxed))
+            && self
+                .encoder_alive
+                .as_ref()
+                .is_some_and(|f| f.load(Ordering::Relaxed));
+
+        if self.is_sharing && self.capture_stop_flag.is_some() && threads_alive {
             self.sync_live_config();
             let src_name = self
                 .sources
@@ -163,6 +172,11 @@ impl AppCore {
                 .unwrap_or_else(|| "Nova tela".to_string());
             self.show_toast(format!("Tela alterada para: {}", src_name));
             return;
+        }
+
+        // Caso uma das threads tenha morrido anteriormente, sinaliza parada para limpar recursos órfãos antes de recriar
+        if let Some(old_stop) = self.capture_stop_flag.take() {
+            old_stop.store(true, Ordering::Relaxed);
         }
 
         let Some(hub) = self.room_hub.as_ref().map(Arc::clone) else {
@@ -174,7 +188,11 @@ impl AppCore {
         self.sync_live_config();
 
         let stop_flag = Arc::new(AtomicBool::new(false));
+        let cap_alive = Arc::new(AtomicBool::new(true));
+        let enc_alive = Arc::new(AtomicBool::new(true));
         self.capture_stop_flag = Some(Arc::clone(&stop_flag));
+        self.capture_alive = Some(Arc::clone(&cap_alive));
+        self.encoder_alive = Some(Arc::clone(&enc_alive));
 
         let audio_stop = Arc::clone(&stop_flag);
         let audio_enabled = Arc::clone(&self.stream_config.share_system_audio);
@@ -197,8 +215,16 @@ impl AppCore {
         let stop_for_encoder = Arc::clone(&stop_flag);
         let hub_for_encoder = Arc::clone(&hub);
 
+        struct AliveGuard(Arc<AtomicBool>);
+        impl Drop for AliveGuard {
+            fn drop(&mut self) {
+                self.0.store(false, Ordering::Relaxed);
+            }
+        }
+
         // ESTÁGIO 2: Thread dedicada de Codificação JPEG + Controle Adaptativo de Bitrate
         thread::spawn(move || {
+            let _alive = AliveGuard(enc_alive);
             let mut sec_timer = Instant::now();
             let mut sec_bytes: u32 = 0;
             let mut jpeg_buf = Vec::with_capacity(196_608);
@@ -262,11 +288,19 @@ impl AppCore {
 
         // ESTÁGIO 1: Thread de Captura Ultra-Rápida (DXGI GPU + fallback GDI)
         thread::spawn(move || {
+            let _alive = AliveGuard(cap_alive);
             let mut fast_capturer = FastCapturer::new();
             let mut last_preview_sent = Instant::now() - Duration::from_secs(1);
+            let mut last_ws_seq = crate::bridge::ws_connect_seq();
 
             while !stop_flag.load(Ordering::Relaxed) {
                 let frame_start = Instant::now();
+                let ws_seq = crate::bridge::ws_connect_seq();
+                if ws_seq != last_ws_seq {
+                    last_ws_seq = ws_seq;
+                    fast_capturer.force_next_frame();
+                    last_preview_sent = Instant::now() - Duration::from_secs(1);
+                }
                 let fps = cfg.target_fps.load(Ordering::Relaxed).max(5);
                 let frame_interval = Duration::from_nanos(1_000_000_000 / fps as u64);
 
@@ -339,6 +373,8 @@ impl AppCore {
         if let Some(flag) = self.capture_stop_flag.take() {
             flag.store(true, Ordering::Relaxed);
         }
+        self.capture_alive = None;
+        self.encoder_alive = None;
         self.is_sharing = false;
         self.local_measured_fps = 0;
         self.local_measured_mbps = 0.0;
