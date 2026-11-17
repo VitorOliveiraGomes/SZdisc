@@ -1,7 +1,7 @@
-# Plano de Otimização de Performance — SZdisc
+# Plano de Otimização de Performance — ScreenZ
 
 Auditoria do pipeline de captura → codificação → rede → WebSocket → canvas e do
-loop de estado (snapshot JSON + polling do SZweb).
+loop de estado (snapshot JSON + polling do ScreenZWeb).
 
 ## Gargalos encontrados
 
@@ -14,7 +14,7 @@ loop de estado (snapshot JSON + polling do SZweb).
 | 5 | `bridge/mod.rs` `json_str` | Escape char-a-char de avatar/banner em data URL (dezenas de KB) a cada snapshot (200 ms) | Médio |
 | 6 | `bridge/mod.rs` snapshot | `remote_streams.lock()` adquirido uma vez **por peer** dentro do lock de `peers` | Baixo (contenção com threads de rede) |
 | 7 | `bridge/mod.rs` thumbnails | Conversão RGBA→RGB manual antes do JPEG; o encoder aceita RGBA direto | Baixo |
-| 8 | `stream_controller.rs` | `is_szdisc_in_foreground()` (syscall) chamado a cada frame mesmo quando o resultado não importa | Baixo |
+| 8 | `stream_controller.rs` | `is_screenz_in_foreground()` (syscall) chamado a cada frame mesmo quando o resultado não importa | Baixo |
 | 9 | `network.rs` writer | `flush()` em `TcpStream` após cada vídeo (no-op) | Trivial |
 | 10 | `videoStreamClient.ts` | `buffer.slice(8)` copia o JPEG; `getContext('2d')` a cada frame; um frame corrompido encerra o loop de drenagem | Médio no front |
 | 11 | `App.tsx` / `backendBridge.ts` | Poll de 500 ms sempre gera novo objeto → re-render completo do App e reescrita de 18 variáveis CSS (recalc de estilo do documento inteiro) mesmo sem mudança | Médio no front |
@@ -43,4 +43,4 @@ loop de estado (snapshot JSON + polling do SZweb).
 ## Verificação
 
 - `cargo build --release`, `cargo clippy`, `cargo test`
-- `npm run build` e `npm run lint` em `SZweb/`
+- `npm run build` e `npm run lint` em `ScreenZWeb/`
