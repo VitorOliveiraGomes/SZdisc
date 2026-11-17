@@ -26,6 +26,11 @@
 
 Escolha sua plataforma e entre na sua próxima sala.
 
+> [!WARNING]
+> **O ScreenZ ainda não possui assinatura digital no Windows.** Ao baixar ou abrir o aplicativo, o Windows pode exibir avisos como “Fornecedor desconhecido” ou “O Windows protegeu o computador”.
+>
+> Um aviso de reputação não é o mesmo que uma detecção de malware. Se o antivírus identificar uma ameaça, não ignore a detecção: [abra uma issue](https://github.com/VitorOliveiraGomes/ScreenZ/issues/new) com a versão do aplicativo e o nome da ameaça para investigação. Baixe somente pelas [releases oficiais deste repositório](https://github.com/VitorOliveiraGomes/ScreenZ/releases).
+
 | Windows | Linux | macOS |
 | :---: | :---: | :---: |
 | **[Baixar para Windows x64](https://github.com/VitorOliveiraGomes/ScreenZ/releases/latest/download/ScreenZ-Windows-x64.exe)** | **[Baixar para Linux x64](https://github.com/VitorOliveiraGomes/ScreenZ/releases/latest/download/ScreenZ-Linux-x64)** | **[Apple Silicon](https://github.com/VitorOliveiraGomes/ScreenZ/releases/latest/download/ScreenZ-macOS-arm64)** · **[Intel](https://github.com/VitorOliveiraGomes/ScreenZ/releases/latest/download/ScreenZ-macOS-x64)** |
