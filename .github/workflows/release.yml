@@ -1,4 +1,4 @@
-name: Build & Release (Windows, Linux, macOS)
+name: ScreenZ - Build & Release (Windows, Linux, macOS)
 
 on:
   push:
@@ -18,22 +18,22 @@ jobs:
         include:
           - name: Windows-x64
             os: windows-latest
-            bin: target/release/disc2.exe
-            asset: SZdisc-Windows-x64.exe
+            bin: target/release/screenz.exe
+            asset: ScreenZ-Windows-x64.exe
           - name: Linux-x64
             os: ubuntu-latest
-            bin: target/release/disc2
-            asset: SZdisc-Linux-x64
+            bin: target/release/screenz
+            asset: ScreenZ-Linux-x64
           - name: macOS-arm64
             os: macos-latest
             target: aarch64-apple-darwin
-            bin: target/aarch64-apple-darwin/release/disc2
-            asset: SZdisc-macOS-arm64
+            bin: target/aarch64-apple-darwin/release/screenz
+            asset: ScreenZ-macOS-arm64
           - name: macOS-x64
             os: macos-latest
             target: x86_64-apple-darwin
-            bin: target/x86_64-apple-darwin/release/disc2
-            asset: SZdisc-macOS-x64
+            bin: target/x86_64-apple-darwin/release/screenz
+            asset: ScreenZ-macOS-x64
 
     steps:
       - uses: actions/checkout@v4
@@ -42,16 +42,16 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y libxcb1-dev libxcb-randr0-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libxrandr-dev libxkbcommon-dev libwayland-dev libgl1-mesa-dev libegl1-mesa-dev libdbus-1-dev libasound2-dev libgtk-3-dev libpipewire-0.3-dev libspa-0.2-dev libgbm-dev libdrm-dev libclang-dev pkg-config
+          sudo apt-get install -y libxcb1-dev libxcb-randr0-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libxrandr-dev libxkbcommon-dev libwayland-dev libgl1-mesa-dev libegl1-mesa-dev libdbus-1-dev libasound2-dev libgtk-3-dev libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev libpipewire-0.3-dev libspa-0.2-dev libgbm-dev libdrm-dev libclang-dev pkg-config
 
-      - name: Setup Node.js and build SZweb
+      - name: Setup Node.js and build ScreenZWeb
         uses: actions/setup-node@v4
         with:
           node-version: "22"
 
-      - name: Build SZweb frontend
+      - name: Build ScreenZWeb frontend
         run: |
-          cd SZweb
+          cd ScreenZWeb
           npm ci --legacy-peer-deps
           npm run build
         shell: bash
@@ -110,6 +110,6 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: v${{ steps.ver.outputs.version }}
-          name: SZdisc v${{ steps.ver.outputs.version }}
+          name: ScreenZ v${{ steps.ver.outputs.version }}
           files: artifacts/*
           make_latest: true

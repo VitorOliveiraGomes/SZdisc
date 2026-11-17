@@ -4,68 +4,53 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 fn main() {
-    embed_szweb_dist();
-
-    #[cfg(target_os = "windows")]
-    {
-        println!("cargo:rerun-if-changed=app.rc");
-        println!("cargo:rerun-if-changed=app.manifest");
-
-        let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
-        let res_obj = out_dir.join("app_res.o");
-
-        let status = Command::new("windres")
-            .args(["app.rc", "-O", "coff", "-o"])
-            .arg(&res_obj)
-            .status();
-
-        if let Ok(s) = status {
-            if s.success() {
-                println!("cargo:rustc-link-arg-bins={}", res_obj.display());
-            }
-        }
-    }
+    embed_screenz_web_dist();
+    println!("cargo:rerun-if-changed=app.manifest");
+    let attributes = tauri_build::Attributes::new().windows_attributes(
+        tauri_build::WindowsAttributes::new().app_manifest(include_str!("app.manifest")),
+    );
+    tauri_build::try_build(attributes).expect("falha ao preparar o aplicativo Tauri");
 }
 
-/// Embute `SZweb/dist` dentro do executável para que o app abra a interface
-/// mesmo quando é executado sozinho (sem a pasta `SZweb/dist` ao lado).
+/// Embute `ScreenZWeb/dist` dentro do executável para que o app abra a interface
+/// mesmo quando é executado sozinho (sem a pasta `ScreenZWeb/dist` ao lado).
 /// Se o `dist` ainda não existir mas o `node_modules` sim, tenta gerar com `npm run build`.
-fn embed_szweb_dist() {
+fn embed_screenz_web_dist() {
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
-    let szweb = manifest_dir.join("SZweb");
-    let dist = szweb.join("dist");
+    let screenz_web = manifest_dir.join("ScreenZWeb");
+    let dist = screenz_web.join("dist");
 
-    println!("cargo:rerun-if-changed=SZweb/dist");
-    println!("cargo:rerun-if-changed=SZweb/src");
-    println!("cargo:rerun-if-changed=SZweb/index.html");
-    println!("cargo:rerun-if-changed=SZweb/package.json");
-    println!("cargo:rerun-if-env-changed=SZDISC_SKIP_WEB_BUILD");
+    println!("cargo:rerun-if-changed=ScreenZWeb/dist");
+    println!("cargo:rerun-if-changed=ScreenZWeb/src");
+    println!("cargo:rerun-if-changed=ScreenZWeb/index.html");
+    println!("cargo:rerun-if-changed=ScreenZWeb/package.json");
+    println!("cargo:rerun-if-env-changed=SCREENZ_SKIP_WEB_BUILD");
 
     let dist_index = dist.join("index.html");
     let dist_mtime = fs::metadata(&dist_index).and_then(|m| m.modified()).ok();
     let src_newer = match dist_mtime {
         None => true,
         Some(dm) => {
-            newest_mtime(&szweb.join("src")).is_some_and(|sm| sm > dm)
-                || fs::metadata(szweb.join("index.html"))
+            newest_mtime(&screenz_web.join("src")).is_some_and(|sm| sm > dm)
+                || fs::metadata(screenz_web.join("index.html"))
                     .and_then(|m| m.modified())
                     .is_ok_and(|im| im > dm)
         }
     };
 
     if src_newer
-        && szweb.join("node_modules").is_dir()
-        && env::var_os("SZDISC_SKIP_WEB_BUILD").is_none()
+        && screenz_web.join("node_modules").is_dir()
+        && env::var_os("SCREENZ_SKIP_WEB_BUILD").is_none()
     {
         let npm = if cfg!(windows) { "npm.cmd" } else { "npm" };
         let ok = Command::new(npm)
             .args(["run", "build"])
-            .current_dir(&szweb)
+            .current_dir(&screenz_web)
             .status()
             .map(|s| s.success())
             .unwrap_or(false);
         if !ok {
-            println!("cargo:warning=Falha ao gerar SZweb/dist automaticamente (rode `cd SZweb && npm run build`)");
+            println!("cargo:warning=Falha ao gerar ScreenZWeb/dist automaticamente (rode `cd ScreenZWeb && npm run build`)");
         }
     }
 
@@ -73,7 +58,9 @@ fn embed_szweb_dist() {
     if dist.join("index.html").is_file() {
         collect_files(&dist, &dist, &mut files);
     } else {
-        println!("cargo:warning=SZweb/dist não encontrado: o executável não terá a interface embutida");
+        println!(
+            "cargo:warning=ScreenZWeb/dist não encontrado: o executável não terá a interface embutida"
+        );
     }
     files.sort();
 

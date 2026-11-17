@@ -1,0 +1,33 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "ScreenZ",
+  "version": "2.11.0",
+  "identifier": "com.screenz.desktop",
+  "build": {
+    "beforeDevCommand": { "script": "npm run dev", "cwd": "ScreenZWeb" },
+    "beforeBuildCommand": { "script": "npm run build", "cwd": "ScreenZWeb" },
+    "devUrl": "http://localhost:5173",
+    "frontendDist": "ScreenZWeb/dist"
+  },
+  "app": {
+    "windows": [
+      {
+        "label": "main",
+        "title": "ScreenZ",
+        "width": 1280,
+        "height": 800,
+        "minWidth": 960,
+        "minHeight": 600
+      }
+    ],
+    "security": {
+      "csp": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; connect-src 'self' ipc: http://ipc.localhost http://127.0.0.1:47839 ws://127.0.0.1:47839; object-src 'none'; base-uri 'self'; frame-src 'none'",
+      "devCsp": "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; connect-src 'self' ipc: http://ipc.localhost http://localhost:5173 ws://localhost:5173 http://127.0.0.1:47839 ws://127.0.0.1:47839; object-src 'none'; base-uri 'self'; frame-src 'none'",
+      "capabilities": ["desktop"]
+    }
+  },
+  "bundle": {
+    "active": false,
+    "icon": ["icons/icon.png", "icons/icon.ico"]
+  }
+}
