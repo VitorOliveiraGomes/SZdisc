@@ -20,8 +20,7 @@ use winapi::um::wininet::{
 pub const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 const VERSION_URL: &str =
     "https://raw.githubusercontent.com/VitorOliveiraGomes/SZdisc/main/VERSION.txt";
-const EXE_DOWNLOAD_URL: &str =
-    "https://github.com/VitorOliveiraGomes/SZdisc/raw/main/DISC2.exe";
+const EXE_DOWNLOAD_URL: &str = "https://github.com/VitorOliveiraGomes/SZdisc/raw/main/ScreenZ.exe";
 
 fn parse_semver(ver: &str) -> (u32, u32, u32) {
     let mut parts = ver.trim().split('.');
@@ -56,7 +55,7 @@ pub enum UpdateStatus {
 #[cfg(windows)]
 fn fetch_https_bytes_wininet(url: &str, max_bytes: usize) -> Option<Vec<u8>> {
     unsafe {
-        let agent = CString::new("SZdisc-Desktop/2.5 (Windows NT 10.0; Win64; x64)").ok()?;
+        let agent = CString::new("ScreenZ-Desktop/2.11 (Windows NT 10.0; Win64; x64)").ok()?;
         let c_url = CString::new(url).ok()?;
 
         let h_inet = InternetOpenA(
@@ -126,12 +125,11 @@ pub fn cleanup_old_exe() {
         let old_path = curr.with_extension("old.exe");
         let _ = fs::remove_file(old_path);
     }
-    let _ = fs::remove_file("DISC2.old.exe");
 }
 
 /// Verifica em segundo plano se há uma versão mais recente no repositório GitHub usando WinInet nativo
 pub fn check_for_updates_async(status: Arc<Mutex<UpdateStatus>>) {
-    if cfg!(debug_assertions) || std::env::var_os("SZDISC_DISABLE_UPDATER").is_some() {
+    if cfg!(debug_assertions) || std::env::var_os("SCREENZ_DISABLE_UPDATER").is_some() {
         if let Ok(mut s) = status.lock() {
             *s = UpdateStatus::UpToDate;
         }
@@ -167,9 +165,9 @@ pub fn check_for_updates_async(status: Arc<Mutex<UpdateStatus>>) {
     });
 }
 
-/// Baixa o `DISC2.exe` mais recente direto do GitHub via WinInet nativo e reinicia o aplicativo
+/// Baixa o `ScreenZ.exe` mais recente direto do GitHub via WinInet nativo e reinicia o aplicativo
 pub fn download_and_apply_update_async(status: Arc<Mutex<UpdateStatus>>) {
-    if cfg!(debug_assertions) || std::env::var_os("SZDISC_DISABLE_UPDATER").is_some() {
+    if cfg!(debug_assertions) || std::env::var_os("SCREENZ_DISABLE_UPDATER").is_some() {
         if let Ok(mut s) = status.lock() {
             *s = UpdateStatus::UpToDate;
         }
@@ -259,7 +257,7 @@ pub fn download_and_apply_update_async(status: Arc<Mutex<UpdateStatus>>) {
             return;
         }
 
-        let _ = Command::new(&current_exe).spawn();
+        let _ = Command::new(&current_exe).arg("--wait-replace").spawn();
         std::process::exit(0);
     });
 }

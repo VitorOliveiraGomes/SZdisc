@@ -1,79 +1,79 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-mod app;
 mod audio;
 mod bridge;
 mod capture;
+mod config;
+mod core;
+mod desktop;
 mod network;
-mod profile_theme;
-mod stream_controller;
 mod updater;
 
-use std::net::TcpStream;
-use std::process::Command;
-use std::sync::{Arc, Mutex};
+use std::net::TcpListener;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use app::AppCore;
-use bridge::{BridgeServer, BRIDGE_PORT};
+use bridge::BRIDGE_PORT;
 
-fn launch_szweb_window(url: &str) {
-    #[cfg(windows)]
-    {
-        let app_arg = format!("--app={}", url);
-        let browsers = [
-            r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
-            r"C:\Program Files\Microsoft\Edge\Application\msedge.exe",
-            r"C:\Program Files\Google\Chrome\Application\chrome.exe",
-            r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
-        ];
-        for bin in browsers {
-            if std::path::Path::new(bin).is_file() {
-                if Command::new(bin).arg(&app_arg).spawn().is_ok() {
+#[cfg(windows)]
+fn init_windows_runtime() {
+    use winapi::um::libloaderapi::{GetModuleHandleA, GetProcAddress};
+    use winapi::um::timeapi::timeBeginPeriod;
+    use winapi::um::winuser::SetProcessDPIAware;
+
+    unsafe {
+        timeBeginPeriod(1);
+
+        let user32 = GetModuleHandleA(c"user32.dll".as_ptr());
+        if !user32.is_null() {
+            let proc = GetProcAddress(user32, c"SetProcessDpiAwarenessContext".as_ptr());
+            if !proc.is_null() {
+                let set_ctx: unsafe extern "system" fn(*mut std::ffi::c_void) -> i32 =
+                    std::mem::transmute(proc);
+                // DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 = -4
+                if set_ctx((-4isize) as *mut std::ffi::c_void) != 0 {
                     return;
                 }
             }
         }
-        let _ = Command::new("cmd").args(["/C", "start", "", url]).spawn();
+        SetProcessDPIAware();
     }
+}
 
-    #[cfg(target_os = "macos")]
-    {
-        let _ = Command::new("open").arg(url).spawn();
-    }
+#[cfg(not(windows))]
+fn init_windows_runtime() {}
 
-    #[cfg(all(unix, not(target_os = "macos")))]
-    {
-        let _ = Command::new("xdg-open").arg(url).spawn();
+fn wait_for_bridge_port_release(max_wait: Duration) {
+    let deadline = Instant::now() + max_wait;
+    while Instant::now() < deadline {
+        if TcpListener::bind(("127.0.0.1", BRIDGE_PORT)).is_ok() {
+            return;
+        }
+        thread::sleep(Duration::from_millis(100));
     }
 }
 
 fn main() {
-    #[cfg(windows)]
-    unsafe {
-        winapi::um::timeapi::timeBeginPeriod(1);
+    init_windows_runtime();
+
+    if std::env::args().any(|a| a == "--wait-replace") {
+        wait_for_bridge_port_release(Duration::from_secs(4));
     }
 
-    let core = Arc::new(Mutex::new(AppCore::new()));
-    let _bridge = BridgeServer::start(Arc::clone(&core));
-
-    // Em dev, se o Vite (porta 5173) já estiver rodando, abre direto nele; senão usa o dist servido pelo Rust
-    let dev_vite_up = TcpStream::connect_timeout(
-        &"127.0.0.1:5173".parse().unwrap(),
-        Duration::from_millis(120),
-    )
-    .is_ok();
-    let url = if dev_vite_up {
-        "http://localhost:5173".to_string()
-    } else {
-        format!("http://127.0.0.1:{}", BRIDGE_PORT)
-    };
-
-    launch_szweb_window(&url);
-
-    // Mantém o processo nativo (captura, áudio, rede e bridge) ativo
-    loop {
-        thread::sleep(Duration::from_secs(1));
+    if let Err(error) = desktop::run() {
+        eprintln!("Falha ao iniciar ScreenZ: {error}");
+        #[cfg(windows)]
+        unsafe {
+            use winapi::um::winuser::{MessageBoxW, MB_ICONERROR, MB_OK};
+            let message: Vec<u16> = format!("Falha ao iniciar ScreenZ:\n{error}\0")
+                .encode_utf16()
+                .collect();
+            MessageBoxW(
+                std::ptr::null_mut(),
+                message.as_ptr(),
+                "ScreenZ\0".encode_utf16().collect::<Vec<_>>().as_ptr(),
+                MB_OK | MB_ICONERROR,
+            );
+        }
     }
 }

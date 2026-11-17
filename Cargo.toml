@@ -1,13 +1,25 @@
 [package]
-name = "disc2"
+name = "screenz"
 version = "2.11.0"
 edition = "2021"
 authors = ["Vitor Oliveira Gomes"]
-description = "SZdisc - Aplicativo nativo ultra-leve em Rust para transmissao de tela e audio em 1080p 60fps"
+description = "ScreenZ - Estudio desktop para compartilhar telas e audio em boa companhia"
 
 [dependencies]
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "bmp"] }
 jpeg-encoder = { version = "0.6", features = ["simd"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tauri = { version = "2", features = [] }
+tauri-plugin-single-instance = "2"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[features]
+default = ["custom-protocol"]
+custom-protocol = ["tauri/custom-protocol"]
+
 [target.'cfg(windows)'.dependencies]
 winapi = { version = "0.3", features = [
   "winuser",
