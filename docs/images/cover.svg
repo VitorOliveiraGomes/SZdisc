@@ -1,0 +1,55 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="400" viewBox="0 0 1200 400" fill="none">
+  <title>ScreenZ — Sua tela, em boa companhia.</title>
+  <desc>Capa do ScreenZ em grafite e verde-lima, com o monograma SZ e telas sobrepostas.</desc>
+  <defs>
+    <linearGradient id="background" x1="0" y1="0" x2="1200" y2="400" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#101411"/>
+      <stop offset="1" stop-color="#202B1C"/>
+    </linearGradient>
+    <linearGradient id="screen" x1="800" y1="116" x2="1080" y2="310" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#35482A"/>
+      <stop offset="1" stop-color="#1C261A"/>
+    </linearGradient>
+  </defs>
+  <rect x="1" y="1" width="1198" height="398" rx="24" fill="url(#background)" stroke="#344030" stroke-width="2"/>
+  <g stroke="#D5F780" stroke-opacity=".09">
+    <circle cx="972" cy="206" r="116"/>
+    <circle cx="972" cy="206" r="172"/>
+    <circle cx="972" cy="206" r="228"/>
+  </g>
+  <g transform="translate(56 48)">
+    <rect width="64" height="64" rx="19" fill="#D5F780"/>
+    <g stroke="#17200B" stroke-width="5.5" stroke-linecap="square" stroke-linejoin="round">
+      <path d="M28 20H18a6 6 0 0 0 0 12h4a6 6 0 0 1 0 12H12"/>
+      <path d="M37 20h16L37 44h16"/>
+    </g>
+  </g>
+  <g font-family="Arial, Helvetica, sans-serif">
+    <text x="138" y="95" fill="#EEF2E9" font-size="48" font-weight="700" letter-spacing="-2">ScreenZ</text>
+    <text x="58" y="159" fill="#A8B99B" font-size="12" font-weight="700" letter-spacing="3">TELAS. SALAS. CONEXÕES.</text>
+    <text x="54" y="222" fill="#EEF2E9" font-size="54" font-weight="700" letter-spacing="-2">Sua tela,</text>
+    <text x="54" y="282" fill="#D5F780" font-size="54" font-weight="700" letter-spacing="-2">em boa companhia.</text>
+    <text x="58" y="341" fill="#B1BDAB" font-size="17">Um estúdio para compartilhar o que está acontecendo.</text>
+  </g>
+  <g transform="rotate(-8 900 200)">
+    <rect x="762" y="90" width="278" height="184" rx="16" fill="#131A12" stroke="#647B4E"/>
+    <path d="M762 125H1040" stroke="#647B4E" stroke-opacity=".6"/>
+    <circle cx="782" cy="108" r="3" fill="#91A47E"/>
+    <circle cx="794" cy="108" r="3" fill="#91A47E"/>
+    <circle cx="806" cy="108" r="3" fill="#91A47E"/>
+  </g>
+  <rect x="824" y="148" width="296" height="190" rx="16" fill="url(#screen)" stroke="#94B86B"/>
+  <path d="M824 183H1120" stroke="#94B86B" stroke-opacity=".4"/>
+  <circle cx="845" cy="166" r="4" fill="#D5F780"/>
+  <path d="M860 166H914" stroke="#9BB58A" stroke-width="4" stroke-linecap="round"/>
+  <g transform="translate(940 213) scale(1.2)">
+    <rect width="64" height="64" rx="19" fill="#D5F780"/>
+    <g stroke="#17200B" stroke-width="5.5" stroke-linecap="square" stroke-linejoin="round">
+      <path d="M28 20H18a6 6 0 0 0 0 12h4a6 6 0 0 1 0 12H12"/>
+      <path d="M37 20h16L37 44h16"/>
+    </g>
+  </g>
+  <rect x="1040" y="320" width="96" height="32" rx="16" fill="#D5F780"/>
+  <circle cx="1058" cy="336" r="4" fill="#17200B"/>
+  <text x="1070" y="341" fill="#17200B" font-family="Arial, Helvetica, sans-serif" font-size="12" font-weight="700">JUNTOS</text>
+</svg>
